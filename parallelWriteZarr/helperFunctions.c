@@ -222,6 +222,4 @@ void setJSONValues(char* fileName,uint64_t *chunkXSize,uint64_t *chunkYSize,uint
     free(fnFull);
     free(uuid);
     free(fileNameFinal);
-    
-    mexErrMsgIdAndTxt("zarr:inputError","TESTING\n");
 }
