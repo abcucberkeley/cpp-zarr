@@ -272,30 +272,36 @@ void mexFunction(int nlhs, mxArray *plhs[],
     char dtype[4];
     char order;
     
+    
+    mxClassID mDType = mxGetClassID(prhs[1]);
+    dtype[0] = '<';
+    if(mDType == mxUINT8_CLASS){
+        dtype[1] = 'u';
+        dtype[2] = '1';
+
+    }
+    else if(mDType == mxUINT16_CLASS){
+        dtype[1] = 'u';
+        dtype[2] = '2';
+
+    }
+    else if(mDType == mxSINGLE_CLASS){
+        dtype[1] = 'f';
+        dtype[2] = '4';
+
+    }
+    else if(mDType == mxDOUBLE_CLASS){
+        dtype[1] = 'f';
+        dtype[2] = '8';
+
+    }
+    dtype[3] = '\0';
+    chunkXSize = 256;
+    chunkYSize = 256;
+    chunkZSize = 256;
+    order = 'F';
+    
     if(!crop){
-        mxClassID mDType = mxGetClassID(prhs[1]);
-        dtype[0] = '<';
-        if(mDType == mxUINT8_CLASS){
-            dtype[1] = 'u';
-            dtype[2] = '1';
-
-        }
-        else if(mDType == mxUINT16_CLASS){
-            dtype[1] = 'u';
-            dtype[2] = '2';
-
-        }
-        else if(mDType == mxSINGLE_CLASS){
-            dtype[1] = 'f';
-            dtype[2] = '4';
-
-        }
-        else if(mDType == mxDOUBLE_CLASS){
-            dtype[1] = 'f';
-            dtype[2] = '8';
-
-        }
-        dtype[3] = '\0';
         uint64_t* dims = (uint64_t*)mxGetDimensions(prhs[1]);
         shapeX = dims[0];
         shapeY = dims[1];
@@ -303,7 +309,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
         chunkXSize = (uint64_t)*(mxGetPr(prhs[3])+1);
         chunkYSize = (uint64_t)*((mxGetPr(prhs[3])+1));
         chunkZSize = (uint64_t)*((mxGetPr(prhs[3])+2));
-        order = 'F';
         //FILE* file = fopen(folderName, "r");
         //if(file){
         DIR* dir = opendir(folderName);
@@ -319,6 +324,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
         
     }
     else{
+        shapeX = endX;
+        shapeY = endY;
+        shapeZ = endZ;
         DIR* dir = opendir(folderName);
         if(dir) closedir(dir);
         else {
