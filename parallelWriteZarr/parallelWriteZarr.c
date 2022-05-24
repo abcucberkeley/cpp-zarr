@@ -301,6 +301,17 @@ void mexFunction(int nlhs, mxArray *plhs[],
     chunkZSize = 256;
     order = 'F';
     
+    char* zArray = ".zarray";
+    char* fnFull = (char*)malloc(strlen(folderName)+9);
+    fnFull[0] = '\0';
+    char fileSepS[2];
+    fileSepS[0] = '/';
+    fileSepS[1] = '\0';
+
+    strcat(fnFull,folderName);
+    strcat(fnFull,fileSepS);
+    strcat(fnFull,zArray);
+    
     if(!crop){
         uint64_t* dims = (uint64_t*)mxGetDimensions(prhs[1]);
         shapeX = dims[0];
@@ -311,12 +322,13 @@ void mexFunction(int nlhs, mxArray *plhs[],
         chunkZSize = (uint64_t)*((mxGetPr(prhs[3])+2));
         //FILE* file = fopen(folderName, "r");
         //if(file){
-        DIR* dir = opendir(folderName);
-        if(dir) closedir(dir);
+        FILE* f = fopen(fnFull,"r");
+        if(f) fclose(f);
         else{
             mkdir(folderName, 0775);
             chmod(folderName, 0775);
         }
+        
 
         setJSONValues(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY, &shapeZ);
         setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
@@ -327,8 +339,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
         shapeX = endX;
         shapeY = endY;
         shapeZ = endZ;
-        DIR* dir = opendir(folderName);
-        if(dir) closedir(dir);
+        
+        FILE* f = fopen(fnFull,"r");
+        if(f) fclose(f);
         else {
             mkdir(folderName, 0775);
             chmod(folderName, 0775);
@@ -336,8 +349,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
     }
-    //setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
-    
+
+    free(fnFull);
     
     uint64_t origShapeX = shapeX;
     uint64_t origShapeY = shapeY;
