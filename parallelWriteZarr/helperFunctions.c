@@ -204,17 +204,18 @@ void setJSONValues(char* fileName,uint64_t *chunkXSize,uint64_t *chunkYSize,uint
     strcat(fnFull,fileName);
     strcat(fnFull,fileSepS);
     strcat(fnFull,zArrayS);
-    strcat(fnFull,uuid);
-    
     char* fileNameFinal = strndup(fnFull,strlen(fileName)+1+8);
+    strcat(fnFull,uuid);
     
     char* string = cJSON_Print(zArray);
 
     FILE *fileptr = fopen(fnFull, "w+");
+    if(!fileptr) printf("Cannot open %s\n",fnFull);
     fprintf(fileptr,"%s",string);
     fclose(fileptr);
     
-    rename(fileName,fileNameFinal);
+    
+    rename(fnFull,fileNameFinal);
     //file = fopen(fileNameFinal, "r");
     //if(!file) rename(fileName,fileNameFinal);
     

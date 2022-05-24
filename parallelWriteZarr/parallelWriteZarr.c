@@ -26,6 +26,7 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
     fileSepS[0] = fileSep;
     fileSepS[1] = '\0';
     //printf("%s startxyz: %d %d %d endxyz: %d %d %d chunkxyz: %d %d %d shapexyz: %d %d %d bits: %d\n",folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ,bits);
+
     
     uint64_t bytes = (bits/8);
     
@@ -44,6 +45,7 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
     uint64_t xRest = 0;
     uint64_t yRest = 0;
     uint64_t zRest = 0;
+    
     
     uuid_t binuuid;
     uuid_generate_random(binuuid);
@@ -271,32 +273,27 @@ void mexFunction(int nlhs, mxArray *plhs[],
     char order;
     
     if(!crop){
-        //FILE* file = fopen(folderName, "r");
-        //if(file){
-        DIR* dir = opendir(folderName);
-        if(dir) closedir(dir);
-        else mkdir(folderName, 0775);
         mxClassID mDType = mxGetClassID(prhs[1]);
         dtype[0] = '<';
         if(mDType == mxUINT8_CLASS){
             dtype[1] = 'u';
             dtype[2] = '1';
-            
+
         }
         else if(mDType == mxUINT16_CLASS){
             dtype[1] = 'u';
             dtype[2] = '2';
-            
+
         }
         else if(mDType == mxSINGLE_CLASS){
             dtype[1] = 'f';
             dtype[2] = '4';
-            
+
         }
         else if(mDType == mxDOUBLE_CLASS){
             dtype[1] = 'f';
             dtype[2] = '8';
-            
+
         }
         dtype[3] = '\0';
         uint64_t* dims = (uint64_t*)mxGetDimensions(prhs[1]);
@@ -307,9 +304,17 @@ void mexFunction(int nlhs, mxArray *plhs[],
         chunkYSize = (uint64_t)*((mxGetPr(prhs[3])+1));
         chunkZSize = (uint64_t)*((mxGetPr(prhs[3])+2));
         order = 'F';
+        //FILE* file = fopen(folderName, "r");
+        //if(file){
+        DIR* dir = opendir(folderName);
+        if(dir) closedir(dir);
+        else{
+            mkdir(folderName, 0775);
+            chmod(folderName, 0775);
+        }
 
         setJSONValues(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY, &shapeZ);
-        //setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
+        setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
         //}
         
     }
@@ -318,6 +323,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         if(dir) closedir(dir);
         else {
             mkdir(folderName, 0775);
+            chmod(folderName, 0775);
             setJSONValues(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY, &shapeZ);
         }
         setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
@@ -329,7 +335,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t origShapeY = shapeY;
     uint64_t origShapeZ = shapeZ;
     if(endX > shapeX || endY > shapeY || endZ > shapeZ) mexErrMsgIdAndTxt("zarr:inputError","Upper bound is invalid");
-    if(nrhs == 3){
+    if(!crop){
         endX = shapeX;
         endY = shapeY;
         endZ = shapeZ;

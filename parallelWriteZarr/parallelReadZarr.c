@@ -12,30 +12,30 @@
 void parallelReadZarr(void* zarr, char* folderName,uint64_t startX, uint64_t startY, uint64_t startZ, uint64_t endX, uint64_t endY,uint64_t endZ,uint64_t chunkXSize,uint64_t chunkYSize,uint64_t chunkZSize,uint64_t shapeX,uint64_t shapeY,uint64_t shapeZ, uint64_t bits, char order){
     char fileSepS[2];
     const char fileSep =
-    #ifdef _WIN32
-        '\\';
-    #else
-        '/';
-    #endif
-        
+#ifdef _WIN32
+            '\\';
+#else
+    '/';
+#endif
+    
     uint64_t bytes = (bits/8);
     fileSepS[0] = fileSep;
     fileSepS[1] = '\0';
-
+    
     /* Initialize the Blosc compressor */
     int32_t numWorkers = omp_get_max_threads();
-
+    
     struct chunkInfo cI = getChunkInfo(folderName, startX, startY, startZ, endX, endY, endZ,chunkXSize,chunkYSize,chunkZSize);
     //if(!cI.chunkNames) mexErrMsgIdAndTxt("zarr:inputError","File \"%s\" cannot be opened",folderName);
-
+    
     int32_t batchSize = (cI.numChunks-1)/numWorkers+1;
     uint64_t s = chunkXSize*chunkYSize*chunkZSize;
     uint64_t sB = s*bytes;
     int32_t w;
     int err = 0;
     char errString[10000];
-
-    #pragma omp parallel for //if(numWorkers<=cI.numChunks)
+    
+#pragma omp parallel for //if(numWorkers<=cI.numChunks)
     for(w = 0; w < numWorkers; w++){
         void* bufferDest = mallocDynamic(s,bits);
         uint64_t lastFileLen = 0;
@@ -43,17 +43,17 @@ void parallelReadZarr(void* zarr, char* folderName,uint64_t startX, uint64_t sta
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
             if(f>=cI.numChunks || err) break;
             struct chunkAxisVals cAV = getChunkAxisVals(cI.chunkNames[f]);
-
+            
             //malloc +2 for null term and filesep
             char *fileName = malloc(strlen(folderName)+strlen(cI.chunkNames[f])+2);
             fileName[0] = '\0';
             strcat(fileName,folderName);
             strcat(fileName,fileSepS);
             strcat(fileName,cI.chunkNames[f]);
-
+            
             FILE *fileptr = fopen(fileName, "rb");
             if(!fileptr){
-                #pragma omp critical
+#pragma omp critical
                 {
                 err = 1;
                 sprintf(errString,"Could not open file: %s\n",fileName);
@@ -61,7 +61,7 @@ void parallelReadZarr(void* zarr, char* folderName,uint64_t startX, uint64_t sta
                 break;
             }
             free(fileName);
-
+            
             fseek(fileptr, 0, SEEK_END);
             long filelen = ftell(fileptr);
             rewind(fileptr);
@@ -72,7 +72,7 @@ void parallelReadZarr(void* zarr, char* folderName,uint64_t startX, uint64_t sta
             }
             fread(buffer, filelen, 1, fileptr);
             fclose(fileptr);
-
+            
             // Decompress
             int dsize = -1;
             blosc2_context *dctx;
@@ -81,17 +81,17 @@ void parallelReadZarr(void* zarr, char* folderName,uint64_t startX, uint64_t sta
             
             dsize = blosc2_decompress_ctx(dctx, buffer, filelen,bufferDest, sB);
             blosc2_free_ctx(dctx);
-
-
+            
+            
             if(dsize < 0){
-                #pragma omp critical
+#pragma omp critical
                 {
                 err = 1;
                 sprintf(errString,"Decompression error. Error code: %d ChunkName: %s/%s\n",dsize,folderName,cI.chunkNames[f]);
                 }
                 break;
             }
-
+            
             //printf("ChunkName: %s\n",cI.chunkNames[f]);
             //printf("w: %d b: %d\n",w,f);
             if(order == 'F'){
@@ -113,7 +113,7 @@ void parallelReadZarr(void* zarr, char* folderName,uint64_t startX, uint64_t sta
                             }
                         }
                         else{
-                             memcpy((uint8_t*)zarr+((((cAV.x*chunkXSize)-startX)+((y-startY)*shapeX)+((z-startZ)*shapeX*shapeY))*bytes),(uint8_t*)bufferDest+((((y%chunkYSize)*chunkXSize)+((z%chunkZSize)*chunkXSize*chunkYSize))*bytes),chunkXSize*bytes);
+                            memcpy((uint8_t*)zarr+((((cAV.x*chunkXSize)-startX)+((y-startY)*shapeX)+((z-startZ)*shapeX*shapeY))*bytes),(uint8_t*)bufferDest+((((y%chunkYSize)*chunkXSize)+((z%chunkZSize)*chunkXSize*chunkYSize))*bytes),chunkXSize*bytes);
                         }
                     }
                 }
@@ -129,47 +129,48 @@ void parallelReadZarr(void* zarr, char* folderName,uint64_t startX, uint64_t sta
                             if(z>=endZ) break;
                             else if(z<startZ) continue;
                             ((uint8_t*)zarr)[((x-startX)+((y-startY)*shapeX)+((z-startZ)*shapeX*shapeY))*bytes] = ((uint8_t*)bufferDest)[((z%chunkZSize)+((y%chunkYSize)*chunkZSize)+((x%chunkXSize)*chunkZSize*chunkYSize))*bytes];
+                        }
                     }
                 }
-
+                
             }
-
+            
         }
         free(bufferDest);
         free(buffer);
     }
-    #pragma omp parallel for
+#pragma omp parallel for
     for(int i = 0; i < cI.numChunks; i++){
         free(cI.chunkNames[i]);
     }
     free(cI.chunkNames);
-
+    
     if(err){
         printf("zarr:threadError: %s\n",errString);
     }
 }
 uint64_t dTypeToBits(char* dtype){
-
-if(dtype[1] == 'u' && dtype[2] == '1'){
-    return 8;
-}
-else if(dtype[1] == 'u' && dtype[2] == '2'){
-    return 16;
-}
-else if(dtype[1] == 'f' && dtype[2] == '4'){
-    return 32;
-}
-else if(dtype[1] == 'f' && dtype[2] == '8'){
-    return 64;
-}
-else{
-    return 0;
-}
-
+    
+    if(dtype[1] == 'u' && dtype[2] == '1'){
+        return 8;
+    }
+    else if(dtype[1] == 'u' && dtype[2] == '2'){
+        return 16;
+    }
+    else if(dtype[1] == 'f' && dtype[2] == '4'){
+        return 32;
+    }
+    else if(dtype[1] == 'f' && dtype[2] == '8'){
+        return 64;
+    }
+    else{
+        return 0;
+    }
+    
 }
 
 void* parallelReadZarrWrapper(char* folderName,uint8_t crop, uint64_t startX, uint64_t startY, uint64_t startZ, uint64_t endX, uint64_t endY,uint64_t endZ){
-
+    
     uint64_t shapeX = 0;
     uint64_t shapeY = 0;
     uint64_t shapeZ = 0;
@@ -179,7 +180,7 @@ void* parallelReadZarrWrapper(char* folderName,uint8_t crop, uint64_t startX, ui
     char dtype[4];
     char order;
     setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
-
+    
     if(!crop){
         startX = 0;
         startY = 0;
@@ -194,10 +195,10 @@ void* parallelReadZarrWrapper(char* folderName,uint8_t crop, uint64_t startX, ui
         startZ--;
     }
     /*
-    if(endX > shapeX || endY > shapeY || endZ > shapeZ){
-        printf("Upper bound is invalid\n");
-        return NULL;
-    }*/
+     * if(endX > shapeX || endY > shapeY || endZ > shapeZ){
+     * printf("Upper bound is invalid\n");
+     * return NULL;
+     * }*/
     uint64_t dim[3];
     shapeX = endX-startX;
     shapeY = endY-startY;
@@ -205,7 +206,7 @@ void* parallelReadZarrWrapper(char* folderName,uint8_t crop, uint64_t startX, ui
     dim[0] = shapeX;
     dim[1] = shapeY;
     dim[2] = shapeZ;
-
+    
     if(dtype[1] == 'u' && dtype[2] == '1'){
         uint64_t bits = 8;
         uint8_t* zarr = (uint8_t*)malloc(sizeof(uint8_t)*shapeX*shapeY*shapeZ);
