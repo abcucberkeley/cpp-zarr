@@ -306,7 +306,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         shapeX = dims[0];
         shapeY = dims[1];
         shapeZ = dims[2];
-        chunkXSize = (uint64_t)*(mxGetPr(prhs[3])+1);
+        chunkXSize = (uint64_t)*(mxGetPr(prhs[3]));
         chunkYSize = (uint64_t)*((mxGetPr(prhs[3])+1));
         chunkZSize = (uint64_t)*((mxGetPr(prhs[3])+2));
         //FILE* file = fopen(folderName, "r");
