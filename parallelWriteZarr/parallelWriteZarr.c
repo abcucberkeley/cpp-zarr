@@ -59,7 +59,9 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
             if(f>=cI.numChunks) break;
             struct chunkAxisVals cAV = getChunkAxisVals(cI.chunkNames[f]);
             void* cRegion = NULL;
-            if(crop && ((((cAV.x)*chunkXSize) < startX || (cAV.x+1)*chunkXSize > endX) || (((cAV.y)*chunkYSize) < startY || (cAV.y+1)*chunkYSize > endY) || (((cAV.z)*chunkZSize) < startZ || (cAV.z+1)*chunkZSize > endZ))){
+            if(crop && ((((cAV.x)*chunkXSize) < startX || ((cAV.x+1)*chunkXSize > endX && endX < origShapeX))
+                || (((cAV.y)*chunkYSize) < startY || ((cAV.y+1)*chunkYSize > endY && endY < origShapeY))
+                || (((cAV.z)*chunkZSize) < startZ || ((cAV.z+1)*chunkZSize > endZ && endZ < origShapeZ)))){
                 cRegion = parallelReadZarrWrapper(folderName, crop, ((cAV.x)*chunkXSize)+1, ((cAV.y)*chunkYSize)+1, ((cAV.z)*chunkZSize)+1, (cAV.x+1)*chunkXSize, (cAV.y+1)*chunkYSize, (cAV.z+1)*chunkZSize);
             }
             if(order == 'F'){
