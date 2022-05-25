@@ -26,7 +26,7 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
     fileSepS[0] = fileSep;
     fileSepS[1] = '\0';
     //printf("%s startxyz: %d %d %d endxyz: %d %d %d chunkxyz: %d %d %d shapexyz: %d %d %d bits: %d\n",folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ,bits);
-
+    
     
     uint64_t bytes = (bits/8);
     
@@ -60,8 +60,8 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
             struct chunkAxisVals cAV = getChunkAxisVals(cI.chunkNames[f]);
             void* cRegion = NULL;
             if(crop && ((((cAV.x)*chunkXSize) < startX || ((cAV.x+1)*chunkXSize > endX && endX < origShapeX))
-                || (((cAV.y)*chunkYSize) < startY || ((cAV.y+1)*chunkYSize > endY && endY < origShapeY))
-                || (((cAV.z)*chunkZSize) < startZ || ((cAV.z+1)*chunkZSize > endZ && endZ < origShapeZ)))){
+            || (((cAV.y)*chunkYSize) < startY || ((cAV.y+1)*chunkYSize > endY && endY < origShapeY))
+            || (((cAV.z)*chunkZSize) < startZ || ((cAV.z+1)*chunkZSize > endZ && endZ < origShapeZ)))){
                 cRegion = parallelReadZarrWrapper(folderName, crop, ((cAV.x)*chunkXSize)+1, ((cAV.y)*chunkYSize)+1, ((cAV.z)*chunkZSize)+1, (cAV.x+1)*chunkXSize, (cAV.y+1)*chunkYSize, (cAV.z+1)*chunkZSize);
             }
             if(order == 'F'){
@@ -238,6 +238,7 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
 void mexFunction(int nlhs, mxArray *plhs[],
         int nrhs, const mxArray *prhs[])
 {
+    
     uint64_t startX = 0;
     uint64_t startY = 0;
     uint64_t startZ = 0;
@@ -273,6 +274,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t chunkZSize = 0;
     char dtype[4];
     char order;
+    void* zarrC = NULL;
     
     
     mxClassID mDType = mxGetClassID(prhs[1]);
@@ -280,22 +282,22 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(mDType == mxUINT8_CLASS){
         dtype[1] = 'u';
         dtype[2] = '1';
-
+        
     }
     else if(mDType == mxUINT16_CLASS){
         dtype[1] = 'u';
         dtype[2] = '2';
-
+        
     }
     else if(mDType == mxSINGLE_CLASS){
         dtype[1] = 'f';
         dtype[2] = '4';
-
+        
     }
     else if(mDType == mxDOUBLE_CLASS){
         dtype[1] = 'f';
         dtype[2] = '8';
-
+        
     }
     dtype[3] = '\0';
     chunkXSize = 256;
@@ -309,7 +311,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     char fileSepS[2];
     fileSepS[0] = '/';
     fileSepS[1] = '\0';
-
+    
     strcat(fnFull,folderName);
     strcat(fnFull,fileSepS);
     strcat(fnFull,zArray);
@@ -322,8 +324,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         chunkXSize = (uint64_t)*(mxGetPr(prhs[3]));
         chunkYSize = (uint64_t)*((mxGetPr(prhs[3])+1));
         chunkZSize = (uint64_t)*((mxGetPr(prhs[3])+2));
-        //FILE* file = fopen(folderName, "r");
-        //if(file){
+
         FILE* f = fopen(fnFull,"r");
         if(f) fclose(f);
         else{
@@ -331,7 +332,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             chmod(folderName, 0775);
         }
         
-
+        
         setJSONValues(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY, &shapeZ);
         setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
         //}
@@ -349,9 +350,125 @@ void mexFunction(int nlhs, mxArray *plhs[],
             chmod(folderName, 0775);
             setJSONValues(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY, &shapeZ);
         }
+        
+        char dtypeT[4];
+        for(int i = 0; i < 4; i++) dtypeT[i] = dtype[i];
+        
         setValuesFromJSON(folderName,&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
+        
+        if(dtypeT[2] != dtype[2]){
+            uint64_t size = (endX-startX)*(endY-startY)*(endZ-startZ);
+            
+            uint64_t bitsT = 0;
+            if(dtypeT[1] == 'u' && dtypeT[2] == '1') bitsT = 8;
+            else if(dtypeT[1] == 'u' && dtypeT[2] == '2') bitsT = 16;
+            else if(dtypeT[1] == 'f' && dtypeT[2] == '4') bitsT = 32;
+            else if(dtypeT[1] == 'f' && dtypeT[2] == '8') bitsT = 64;
+            else mexErrMsgIdAndTxt("tiff:dataTypeError","Cannont convert to passed in data type. Data type not suppported");
+            
+            
+            if(dtype[1] == 'u' && dtype[2] == '1'){
+                zarrC = malloc(size*sizeof(uint8_t));
+                if(bitsT == 16){
+                    uint16_t* zarrT = (uint16_t*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((uint8_t*)zarrC)[i] = (uint8_t)zarrT[i];
+                    }
+                }
+                else if(bitsT == 32){
+                    float* zarrT = (float*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((uint8_t*)zarrC)[i] = (uint8_t)zarrT[i];
+                    }
+                }
+                else if(bitsT == 64){
+                    double* zarrT = (double*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((uint8_t*)zarrC)[i] = (uint8_t)zarrT[i];
+                    }
+                }
+            }
+            else if(dtype[1] == 'u' && dtype[2] == '2'){
+                zarrC = malloc(size*sizeof(uint16_t));
+                if(bitsT == 8){
+                    uint8_t* zarrT = (uint8_t*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((uint16_t*)zarrC)[i] = (uint16_t)zarrT[i];
+                    }
+                }
+                else if (bitsT == 32){
+                    float* zarrT = (float*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((uint16_t*)zarrC)[i] = (uint16_t)zarrT[i];
+                    }
+                }
+                else if (bitsT == 64){
+                    double* zarrT = (double*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((uint16_t*)zarrC)[i] = (uint16_t)zarrT[i];
+                    }
+                }
+            }
+            else if(dtype[1] == 'f' && dtype[2] == '4'){
+                zarrC = malloc(size*sizeof(float));
+            	if(bitsT == 8){
+                    uint8_t* zarrT = (uint8_t*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((float*)zarrC)[i] = (float)zarrT[i];
+                    }
+                }
+                else if(bitsT == 16){
+                    uint16_t* zarrT = (uint16_t*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((float*)zarrC)[i] = (float)zarrT[i];
+                    }
+                }
+                else if(bitsT == 64){
+                    double* zarrT = (double*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((float*)zarrC)[i] = (float)zarrT[i];
+                    }
+                }
+            }
+            else if(dtype[1] == 'f' && dtype[2] == '8'){
+                zarrC = malloc(size*sizeof(double));
+                if(bitsT == 8){
+                    uint8_t* zarrT = (uint8_t*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((double*)zarrC)[i] = (double)zarrT[i];
+                    }
+                }
+                else if(bitsT == 16){
+                    uint16_t* zarrT = (uint16_t*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((double*)zarrC)[i] = (double)zarrT[i];
+                    }
+                }
+                else if(bitsT == 32){
+                    float* zarrT = (float*)mxGetPr(prhs[1]);
+                    #pragma omp parallel for
+                    for(uint64_t i = 0; i < size; i++){
+                        ((double*)zarrC)[i] = (double)zarrT[i];
+                    }
+                }
+            }
+            else{
+                mexErrMsgIdAndTxt("tiff:dataTypeError","Cannont convert to passed in data type. Data type not suppported");
+            }
+        }
     }
-
+    
     free(fnFull);
     
     uint64_t origShapeX = shapeX;
@@ -376,12 +493,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
     
     if(dtype[1] == 'u' && dtype[2] == '1'){
         uint64_t bits = 8;
-        uint8_t* zarr = (uint8_t*)mxGetPr(prhs[1]);
+        uint8_t* zarr;
+        if(zarrC) zarr = (uint8_t*)zarrC;
+        else zarr =  (uint8_t*)mxGetPr(prhs[1]);
         parallelWriteZarrMex((void*)zarr,folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ, origShapeX, origShapeY,origShapeZ, bits,order,useUuid,crop);
     }
     else if(dtype[1] == 'u' && dtype[2] == '2'){
         uint64_t bits = 16;
-        uint16_t* zarr = (uint16_t*)mxGetPr(prhs[1]);
+        uint16_t* zarr;
+        if(zarrC) zarr = (uint16_t*)zarrC;
+        else zarr = (uint16_t*)mxGetPr(prhs[1]);
         parallelWriteZarrMex((void*)zarr,folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ, origShapeX, origShapeY,origShapeZ, bits,order,useUuid,crop);
     }
     else if(dtype[1] == 'f' && dtype[2] == '4'){
