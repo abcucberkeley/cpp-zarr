@@ -210,7 +210,7 @@ void setJSONValues(char* fileName,uint64_t *chunkXSize,uint64_t *chunkYSize,uint
     char* string = cJSON_Print(zArray);
 
     FILE *fileptr = fopen(fnFull, "w+");
-    if(!fileptr) printf("Cannot open %s\n",fnFull);
+    if(!fileptr) mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s\n",fnFull);
     fprintf(fileptr,"%s",string);
     fclose(fileptr);
     
