@@ -329,7 +329,7 @@ void parallelReadZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t 
                 stream.opaque = Z_NULL;
                 stream.avail_in = (uInt)filelen;
                 stream.avail_out = (uInt)dsize;
-                while(stream.avail_out > 0){
+                while(stream.avail_in > 0){
 
                     dsize = sB;
 
