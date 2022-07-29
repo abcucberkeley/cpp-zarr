@@ -173,7 +173,7 @@ void setCnameFromJSON(cJSON *json, char** cname){
         }
         jsonItem = jsonItem->next;
     } 
-    mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname);
+    mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",*cname);
     
 }
 
