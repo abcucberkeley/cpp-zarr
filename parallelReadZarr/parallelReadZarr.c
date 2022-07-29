@@ -324,46 +324,47 @@ void parallelReadZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t 
             else{
                 dsize = sB;
                 z_stream stream;
-                //memset(&stream, 0, sizeof(stream));
                 stream.zalloc = Z_NULL;
                 stream.zfree = Z_NULL;
                 stream.opaque = Z_NULL;
-            
-                stream.next_in = (uint8_t*)buffer;
-                stream.next_out = (uint8_t*)bufferDest;
-            
-                stream.avail_in = filelen;
-                stream.avail_out = dsize;
-                uncErr = inflateInit2(&stream, MAX_WBITS + 16);
-                if(uncErr){
-                #pragma omp critical
-                {
-                err = 1;
-                sprintf(errString,"Decompression error. Error code: %d ChunkName: %s/%s\n",uncErr,folderName,cI.chunkNames[f]);
-                }
-                break;
-                }
+                stream.avail_in = (uInt)filelen;
+                stream.avail_out = (uInt)dsize;
+                while(stream.avail_out > 0){
 
-                uncErr = inflate(&stream, Z_FINISH);
+                    dsize = sB;
 
-                if(uncErr != Z_STREAM_END){
-                #pragma omp critical
-                {
-                err = 1;
-                sprintf(errString,"Decompression error. Error code: %d ChunkName: %s/%s\n",uncErr,folderName,cI.chunkNames[f]);
+                    stream.next_in = (uint8_t*)buffer+(filelen-stream.avail_in);
+                    stream.next_out = (uint8_t*)bufferDest+(sB-stream.avail_out);
+
+                    uncErr = inflateInit2(&stream, 32);
+                    if(uncErr){
+                    #pragma omp critical
+                    {
+                    err = 1;
+                    sprintf(errString,"Decompression error. Error code: %d ChunkName: %s/%s\n",uncErr,folderName,cI.chunkNames[f]);
+                    }
+                    break;
+                    }
+    
+                    uncErr = inflate(&stream, Z_NO_FLUSH);
+    
+                    if(uncErr != Z_STREAM_END){
+                    #pragma omp critical
+                    {
+                    err = 1;
+                    sprintf(errString,"Decompression error. Error code: %d ChunkName: %s/%s\n",uncErr,folderName,cI.chunkNames[f]);
+                    }
+                    break;
+                    }
                 }
-                break;
-                }
-     
                 if(inflateEnd(&stream)){
-                #pragma omp critical
-                {
-                err = 1;
-                sprintf(errString,"Decompression error. Error code: %d ChunkName: %s/%s\n",uncErr,folderName,cI.chunkNames[f]);
+                    #pragma omp critical
+                    {
+                    err = 1;
+                    sprintf(errString,"Decompression error. Error code: %d ChunkName: %s/%s\n",uncErr,folderName,cI.chunkNames[f]);
+                    }
+                    break;
                 }
-                break;
-                }
-                dsize = stream.total_out;
             }
             
             
