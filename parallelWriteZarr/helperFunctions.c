@@ -201,7 +201,7 @@ void setValuesFromJSON(char* fileName,uint64_t *chunkXSize,uint64_t *chunkYSize,
     fread(buffer, filelen, 1, fileptr);
     fclose(fileptr);
     cJSON *json = cJSON_ParseWithLength(buffer,filelen);
-    uint8_t flags[4] = {0,0,0,0};
+    uint8_t flags[5] = {0,0,0,0,0};
 
     while(!(flags[0] && flags[1] && flags[2] && flags[3] && flags[4])){
         if(!json->string){
