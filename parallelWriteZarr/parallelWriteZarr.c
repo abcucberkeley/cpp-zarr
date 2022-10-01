@@ -642,12 +642,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
     }
     else if(dtype[1] == 'f' && dtype[2] == '4'){
         uint64_t bits = 32;
-        float* zarr = (float*)mxGetPr(prhs[1]);
+        float* zarr;
+        if(zarrC) zarr = (float*)zarrC;
+        else zarr = (float*)mxGetPr(prhs[1]);
         parallelWriteZarrMex((void*)zarr,folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ, origShapeX, origShapeY,origShapeZ, bits,order,useUuid,crop,cname);
     }
     else if(dtype[1] == 'f' && dtype[2] == '8'){
         uint64_t bits = 64;
-        double* zarr = (double*)mxGetPr(prhs[1]);
+        double* zarr;
+        if(zarrC) zarr = (double*)zarrC;
+        else zarr = (double*)mxGetPr(prhs[1]);
         parallelWriteZarrMex((void*)zarr,folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ, origShapeX, origShapeY,origShapeZ, bits,order,useUuid,crop,cname);
     }
     else{
