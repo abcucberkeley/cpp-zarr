@@ -655,9 +655,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
         parallelWriteZarrMex((void*)zarr,folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ, origShapeX, origShapeY,origShapeZ, bits,order,useUuid,crop,cname);
     }
     else{
+        free(zarrC);
         mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
     }
     
-    
+    // zarrC is either a copy for data conversion or NULL
+    free(zarrC);
 }
 
