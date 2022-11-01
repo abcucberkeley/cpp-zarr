@@ -51,7 +51,6 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
     
     struct chunkInfo cI = getChunkInfo(folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize);
     //if(!cI.chunkNames) mexErrMsgIdAndTxt("zarr:inputError","File \"%s\" cannot be opened",folderName);
-    char** chunkNamesUuid = malloc(cI.numChunks*sizeof(char*));
     
     int32_t batchSize = (cI.numChunks-1)/numWorkers+1;
     uint64_t s = chunkXSize*chunkYSize*chunkZSize;
@@ -77,8 +76,6 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
     struct timeval cSeed;
     gettimeofday(&cSeed,NULL);
     int nChars = sprintf(seedArr,"%d%d",cSeed.tv_sec,cSeed.tv_usec);
-    //printf("%d\n",nChars);
-    //mexErrMsgIdAndTxt("tiff:dataTypeError","HERE");
     int aSeed = 0;
     char* ptr;
     if(nChars > 9)
@@ -86,6 +83,7 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
     else aSeed = strtol(seedArr, &ptr, 9);
     srand(aSeed);
     sprintf(uuid,"%.5d",rand() % 99999);
+    free(seedArr);
     #endif
     int err = 0;
     char errString[10000];
