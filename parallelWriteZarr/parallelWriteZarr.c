@@ -363,6 +363,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t endZ = 0;
     uint8_t crop = 0;
     char* cname = NULL;
+    uint64_t* iDims = NULL;
+
     if(nrhs < 3) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 3 arguments");
     else if(nrhs == 4 || nrhs == 5){
         if(mxGetN(prhs[3]) == 6){
@@ -374,9 +376,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
             endY = (uint64_t)*((mxGetPr(prhs[3])+4));
             endZ = (uint64_t)*((mxGetPr(prhs[3])+5));
 
-            uint64_t* tDims = (uint64_t*)mxGetDimensions(prhs[1]);
+            iDims = (uint64_t*)mxGetDimensions(prhs[1]);
             if(startX+1 < 1 || startY+1 < 1 || startZ+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
-            if(endX > tDims[0] || endY > tDims[1] || endZ > tDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
+            if(endX-startX > iDims[0] || endY-startY > iDims[1] || endZ-startZ > iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
             
             if(nrhs == 5){
                 cname = mxArrayToString(prhs[4]);
@@ -476,7 +478,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
         shapeZ = endZ;
         
         FILE* f = fopen(fnFull,"r");
-        if(f) fclose(f);
+        if(f){
+            fclose(f);
+            if(!iDims) mexErrMsgIdAndTxt("zarr:inputError","Unable to get input dimensions");
+            if(endX-startX != iDims[0] || endY-startY != iDims[1] || endZ-startZ != iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounding box size does not match the size of the input data");
+        }
         else {
             #ifdef __linux__
             mkdir(folderName, 0775);
