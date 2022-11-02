@@ -373,8 +373,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
             endX = (uint64_t)*((mxGetPr(prhs[3])+3));
             endY = (uint64_t)*((mxGetPr(prhs[3])+4));
             endZ = (uint64_t)*((mxGetPr(prhs[3])+5));
-            
+
+            uint64_t* tDims = (uint64_t*)mxGetDimensions(prhs[1]);
             if(startX+1 < 1 || startY+1 < 1 || startZ+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
+            if(endX > tDims[0] || endY > tDims[1] || endZ > tDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
+            
             if(nrhs == 5){
                 cname = mxArrayToString(prhs[4]);
             }
