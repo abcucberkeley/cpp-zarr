@@ -364,7 +364,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint8_t crop = 0;
     char* cname = NULL;
     uint64_t clevel = 5;
-    uint64_t* iDims = NULL;
+
+    // Dims are 1 by default
+    uint64_t iDims[3] = {1,1,1};
 
     if(nrhs < 3) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 3 arguments");
     else if(nrhs == 4 || nrhs == 5){
@@ -377,8 +379,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             endY = (uint64_t)*((mxGetPr(prhs[3])+4));
             endZ = (uint64_t)*((mxGetPr(prhs[3])+5));
             
-            // Dims are 1 by default
-            uint64_t iDims[3] = {1,1,1};
+            
             uint64_t* iDimsT = (uint64_t*)mxGetDimensions(prhs[1]);
             uint64_t niDims = (uint64_t) mxGetNumberOfDimensions(prhs[1]);
             for(uint64_t i = 0; i < niDims; i++) iDims[i] = iDimsT[i];
