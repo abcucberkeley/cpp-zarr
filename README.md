@@ -27,6 +27,9 @@ im = parallelReadZarr('path/to/file.zarr');
 
 #### parallelWriteTiff - Write an array out as a Zarr image
 im = rand(100,100,100);
+
 % The third input can always be 1 to use a uuid for the written blocks
+
 % The fourth input is the size of the blocks
+
 parallelWriteZarr('path/to/file.zarr',im, 1, [256,256,256]);
