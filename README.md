@@ -19,6 +19,7 @@ Note: For filepath separators, on Mac/Linux you can use / and on Windows you can
 
 #### createZarrFile - Create a custom .zarray metadata file
 % Note the created file is probably hidden by default on your system
+
 createZarrFile('path/to/file.zarr');
 
 #### parallelReadZarr - Read a Zarr image into an array
