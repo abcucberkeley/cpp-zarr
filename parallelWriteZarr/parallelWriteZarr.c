@@ -85,7 +85,7 @@ void parallelWriteZarrMex(void* zarr, char* folderName,uint64_t startX, uint64_t
     #endif
     int err = 0;
     char errString[10000];
-    //#pragma omp parallel for if(numWorkers<=cI.numChunks)
+    #pragma omp parallel for if(numWorkers<=cI.numChunks)
     for(w = 0; w < numWorkers; w++){
         void* chunkUnC = mallocDynamic(s,bits);
         void* chunkC = malloc(sB+BLOSC_MAX_OVERHEAD);
