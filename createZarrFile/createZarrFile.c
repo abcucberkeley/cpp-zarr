@@ -324,7 +324,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             shapeY = (uint64_t)*((mxGetPr(prhs[i+1])+1));
             shapeZ = (uint64_t)*((mxGetPr(prhs[i+1])+2));
         }
-        else if(!strcmp(currInput,"level")){
+        else if(!strcmp(currInput,"clevel")){
             if(!mxIsNumeric(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","level must be a numerical value\n");
             level = (uint64_t)*(mxGetPr(prhs[i+1]));
         }
