@@ -32,7 +32,7 @@ fill_value(""), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0})
 {
     if(!fileExists(fileName+"/.zarray")){
-        return;
+        mexErrMsgIdAndTxt("zarr:zarrayError","Metadata file in \"%s\" is missing. Does the file exist?",fileName.c_str());
     }
     std::ifstream f(fileName+"/.zarray");
     zarray = json::parse(f);

@@ -13,14 +13,14 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
 {
     const uint64_t bytes = (bits/8);
     
-    const int32_t numWorkers = omp_get_max_threads();
+    int32_t numWorkers = omp_get_max_threads();
 
     blosc_init();
-    if(numWorkers<=Zarr.get_numChunks() && Zarr.get_cname() != "zstd"){
-        blosc_set_nthreads(1);
+    if(numWorkers>Zarr.get_numChunks()){
+        blosc_set_nthreads(std::ceil(((double)numWorkers)/((double)Zarr.get_numChunks())));
+        numWorkers = Zarr.get_numChunks();
     }
-    else blosc_set_nthreads(numWorkers);
-    
+    else blosc_set_nthreads(1);
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
@@ -28,7 +28,8 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
 
     int err = 0;
     std::string errString;
-    #pragma omp parallel for if(numWorkers<=Zarr.get_numChunks())
+
+    #pragma omp parallel for
     for(int32_t w = 0; w < numWorkers; w++){
         void* bufferDest = mallocDynamic(s,bits);
         void* buffer = mallocDynamic(s,bits);
@@ -40,7 +41,7 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
             const std::string subfolderName = Zarr.get_subfoldersString(cAV);
 
             const std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
-            
+
             // If we cannot open the file then set to all zeros
             // Can make this better by checking the errno
             std::ifstream file(fileName, std::ios::binary);
@@ -80,7 +81,8 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                         }
                         break;
                         }
@@ -93,7 +95,8 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                         }
                         break;
                         }
@@ -104,7 +107,8 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                         }
                         break;
                     }
@@ -117,7 +121,8 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
                     err = 1;
                     errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                     }
                     break;
                 }
@@ -195,7 +200,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     std::vector<uint64_t> startCoords = {0,0,0};
     std::vector<uint64_t> endCoords = {0,0,0};
 
-    if(!nrhs) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least one argument");
+    if(!nrhs) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 1 argument");
     else if(nrhs == 2){
         if(mxGetN(prhs[1]) != 6) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6");
         startCoords[0] = (uint64_t)*(mxGetPr(prhs[1]))-1;

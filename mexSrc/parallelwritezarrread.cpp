@@ -18,8 +18,11 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
     uint64_t bytes = (bits/8);
     
     int32_t numWorkers = omp_get_max_threads();
-    
-    Zarr.set_chunkInfo(startCoords, endCoords);
+    uint32_t nBloscThreads = 1;
+    if(numWorkers>Zarr.get_numChunks()){
+        nBloscThreads = std::ceil(((double)numWorkers)/((double)Zarr.get_numChunks()));
+        numWorkers = Zarr.get_numChunks();
+    }
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
@@ -28,8 +31,7 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
     int err = 0;
     std::string errString;
 
-
-    #pragma omp parallel for if(numWorkers<=Zarr.get_numChunks())
+    #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
         void* bufferDest = mallocDynamic(s,bits);
         uint64_t lastFileLen = 0;
@@ -66,7 +68,7 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
                 int uncErr = 0;
                 if(Zarr.get_cname() != "gzip"){
                     blosc2_context *dctx;
-                    blosc2_dparams dparams = {(int16_t)numWorkers,NULL,NULL,NULL};
+                    blosc2_dparams dparams = {(int16_t)nBloscThreads,NULL,NULL,NULL};
                     dctx = blosc2_create_dctx(dparams);
                     dsize = blosc2_decompress_ctx(dctx,buffer, filelen, bufferDest, sB);
                     blosc2_free_ctx(dctx);
@@ -223,7 +225,8 @@ void* parallelReadZarrWrapper(zarr &Zarr, const bool &crop,
     std::vector<uint64_t> readShape = {endCoords[0]-startCoords[0],
                                        endCoords[1]-startCoords[1],
                                        endCoords[2]-startCoords[2]};
-    
+
+    Zarr.set_chunkInfo(startCoords, endCoords);
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
         uint8_t* zarrArr = (uint8_t*)malloc(sizeof(uint8_t)*readShape[0]*readShape[1]*readShape[2]);

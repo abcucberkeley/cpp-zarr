@@ -97,7 +97,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: chunks, cname, dtype, order, shape\n",currInput);
+            Currently Supported Names: chunks, cname, dtype, order, shape\n",currInput.c_str());
         }
     }
 

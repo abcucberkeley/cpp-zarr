@@ -12,6 +12,7 @@
 #endif
 #include <sys/stat.h>
 #include <fstream>
+#include <algorithm>
 #include "blosc.h"
 #include "mex.h"
 #include "helperfunctions.h"
@@ -41,9 +42,13 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
 
     const uint64_t bytes = (bits/8);
 
-    const int32_t numWorkers = omp_get_max_threads();
+    int32_t numWorkers = omp_get_max_threads();
 
-    Zarr.set_chunkInfo(startCoords, endCoords);
+    int32_t nBloscThreads = 1;
+    if(numWorkers>Zarr.get_numChunks()){
+        nBloscThreads = std::ceil(((double)numWorkers)/((double)Zarr.get_numChunks()));
+        numWorkers = Zarr.get_numChunks();
+    }
 
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
@@ -53,7 +58,8 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
 
     int err = 0;
     std::string errString;
-    #pragma omp parallel for if(numWorkers<=Zarr.get_numChunks())
+
+    #pragma omp parallel for
     for(int32_t w = 0; w < numWorkers; w++){
         void* chunkUnC = mallocDynamic(s,bits);
         void* chunkC = malloc(sB+BLOSC_MAX_OVERHEAD);
@@ -223,14 +229,17 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
 
             // Use the same blosc compress as Zarr
             //int64_t csize = blosc_compress(5, BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD);
+            const std::string subfolderName = Zarr.get_subfoldersString(cAV);
             int64_t csize = 0;
             if(Zarr.get_cname() != "gzip"){
+                /*
                 if(numWorkers<=Zarr.get_numChunks()){
                     csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,1);
                 }
                 else{
                     csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,numWorkers);
-                }
+                }*/
+                csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,nBloscThreads);
             }
             else{
                 //uint64_t sLength = sB;
@@ -255,7 +264,8 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Compression error. Error code: "+
                             std::to_string(cErr)+" ChunkName: "+
-                            Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                            Zarr.get_fileName()+"/"+subfolderName+"/"+
+                            Zarr.get_chunkNames(f)+"\n";
                     }
                     break;
                 }
@@ -268,7 +278,8 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Compression error. Error code: "+
                             std::to_string(cErr)+" ChunkName: "+
-                            Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";                }
+                            Zarr.get_fileName()+"/"+subfolderName+"/"+
+                            Zarr.get_chunkNames(f)+"\n";                }
                     break;
                 }
 
@@ -278,14 +289,16 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Compression error. Error code: "+
                             std::to_string(cErr)+" ChunkName: "+
-                            Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";                }
+                            Zarr.get_fileName()+"/"+subfolderName+"/"+
+                            Zarr.get_chunkNames(f)+"\n";
+                    }
                     break;
                 }
                 csize = csize - stream.avail_out;
             }
             //malloc +2 for null term and filesep
 
-            const std::string subfolderName = Zarr.get_subfoldersString(cAV);
+            
             std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
 
             //FILE *fileptr = fopen(fileName, "r+b");
@@ -300,7 +313,7 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
                     {
                         err = 1;
                         errString = "Check permissions or filepath. Cannot write to path: "+
-                            Zarr.get_fileName()+"\n";
+                            fileName+"\n";
                     }
                     break;
                 }
@@ -566,6 +579,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
                                       endCoords[1]-startCoords[1],
                                       endCoords[2]-startCoords[2]});
 
+    Zarr.set_chunkInfo(startCoords, endCoords);
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
         uint8_t* zarrArr;
