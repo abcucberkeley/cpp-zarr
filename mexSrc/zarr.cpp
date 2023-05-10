@@ -179,7 +179,7 @@ void zarr::set_jsonValues(){
         zarray["compressor"]["id"] = id;
         zarray["compressor"]["level"] = clevel;
     }
-    else mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname);
+    else mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname.c_str());
 
     // fill_value just 0 and filters null for now
     zarray["dtype"] = dtype;
@@ -209,7 +209,7 @@ void zarr::write_jsonValues(){
     const std::string fnFull(fileName+"/.zarray"+uuid);
 
     std::ofstream o(fnFull);
-    if(!o.good()) mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s\n",fnFull);
+    if(!o.good()) mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s\n",fnFull.c_str());
     o << std::setw(4) << zarray << std::endl;
 
     rename(fnFull.c_str(),fileNameFinal.c_str());
