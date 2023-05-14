@@ -388,8 +388,15 @@ void mexFunction(int nlhs, mxArray *plhs[],
     #ifndef _WIN32
     folderName = expandTilde(folderName.c_str());
     #endif
-
-    zarr Zarr(folderName);
+    
+    // Check if metadata exists that we can use or if we have to create new metadata
+    zarr Zarr;
+    if(!fileExists(folderName+"/.zarray")){
+        Zarr = zarr();
+        Zarr.set_fileName(folderName);
+    }
+    else Zarr = zarr(folderName);
+    
 
     if(nrhs >= 5){
         Zarr.set_cname(mxArrayToString(prhs[4]));
@@ -426,17 +433,17 @@ void mexFunction(int nlhs, mxArray *plhs[],
         uint64_t* dims = (uint64_t*)mxGetDimensions(prhs[1]);
         if(nDims == 3) Zarr.set_shape({dims[0],dims[1],dims[2]});
         else Zarr.set_shape({dims[0],dims[1],1});
-
-        Zarr.set_chunks({(uint64_t)*(mxGetPr(prhs[3])),
-                         (uint64_t)*((mxGetPr(prhs[3])+1)),
-                         (uint64_t)*((mxGetPr(prhs[3])+2))});
+        if(nrhs > 3){
+            Zarr.set_chunks({(uint64_t)*(mxGetPr(prhs[3])),
+                            (uint64_t)*((mxGetPr(prhs[3])+1)),
+                            (uint64_t)*((mxGetPr(prhs[3])+2))});
+        }
         Zarr.write_zarray();
     }
     else{
         Zarr.set_shape({endCoords[0],endCoords[1],endCoords[2]});
 
         if(fileExists(folderName+"/.zarray")){
-            if(!iDims) mexErrMsgIdAndTxt("zarr:inputError","Unable to get input dimensions");
             if(endCoords[0]-startCoords[0] != iDims[0] ||
                endCoords[1]-startCoords[1] != iDims[1] ||
                endCoords[2]-startCoords[2] != iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounding box size does not match the size of the input data");
