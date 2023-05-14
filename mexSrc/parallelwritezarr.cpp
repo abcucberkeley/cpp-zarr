@@ -296,12 +296,8 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
                 }
                 csize = csize - stream.avail_out;
             }
-            //malloc +2 for null term and filesep
-
             
             std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
-
-            //FILE *fileptr = fopen(fileName, "r+b");
 
             if(useUuid){
                 const std::string fileNameFinal(fileName);

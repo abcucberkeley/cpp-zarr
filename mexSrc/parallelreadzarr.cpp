@@ -21,10 +21,7 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
         numWorkers = Zarr.get_numChunks();
     }
     else {
-        if(Zarr.get_cname() == "lz4"){
-            blosc_set_nthreads(numWorkers);
-        }
-        else blosc_set_nthreads(1);
+        blosc_set_nthreads(numWorkers);
     }
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;

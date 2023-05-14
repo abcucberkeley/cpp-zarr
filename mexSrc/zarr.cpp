@@ -18,7 +18,7 @@
 // Create a blank zarr object with default values
 zarr::zarr() :
 fileName(""), chunks({256,256,256}), blocksize(0),
-clevel(5), cname("lz4"), id(""), shuffle(1), dtype("<u2"),
+clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
 fill_value(""), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0})
 {
@@ -27,7 +27,7 @@ zarr_format(2), subfolders({0,0,0})
 
 zarr::zarr(const std::string &fileName) :
 fileName(fileName), chunks({256,256,256}), blocksize(0),
-clevel(5), cname("lz4"), id(""), shuffle(1), dtype("<u2"),
+clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
 fill_value(""), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0})
 {
