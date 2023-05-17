@@ -16,6 +16,8 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
     int32_t numWorkers = omp_get_max_threads();
 
     blosc_init();
+    blosc_set_nthreads(numWorkers);
+    /*
     if(numWorkers>Zarr.get_numChunks()){
         blosc_set_nthreads(std::ceil(((double)numWorkers)/((double)Zarr.get_numChunks())));
         numWorkers = Zarr.get_numChunks();
@@ -23,6 +25,7 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
     else {
         blosc_set_nthreads(numWorkers);
     }
+    */
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
