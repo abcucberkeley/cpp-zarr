@@ -17,7 +17,7 @@
 #include "mex.h"
 #include "helperfunctions.h"
 #include "zarr.h"
-#include "parallelwritezarrread.h"
+#include "parallelreadzarrwrapper.h"
 #include "zlib.h"
 
 //compile

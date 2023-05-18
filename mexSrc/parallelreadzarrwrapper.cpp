@@ -1,77 +1,95 @@
-#include <stdio.h>
+#include <fstream>
 #include <stdint.h>
-#include <string.h>
 #include <omp.h>
-#include <stdlib.h>
-#include "parallelwritezarrread.h"
+#include "parallelreadzarrwrapper.h"
 #include "blosc2.h"
 #include "mex.h"
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "zlib.h"
 
-void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
+void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
                          const std::vector<uint64_t> &startCoords, 
                          const std::vector<uint64_t> &endCoords,
-                         const std::vector<uint64_t> &readShape, uint64_t bits)
+                         const std::vector<uint64_t> &readShape,
+                         const uint64_t bits,
+                         const bool useCtx)
 {
-    uint64_t bytes = (bits/8);
+    const uint64_t bytes = (bits/8);
     
     int32_t numWorkers = omp_get_max_threads();
+
+    // nBloscThreads used when using blosc_ctx
     uint32_t nBloscThreads = 1;
+    if(!useCtx){
+        blosc_init();
+        blosc_set_nthreads(numWorkers);
+    }
+
+    // no ctx
+    /*
+    if(numWorkers>Zarr.get_numChunks()){
+        blosc_set_nthreads(std::ceil(((double)numWorkers)/((double)Zarr.get_numChunks())));
+        numWorkers = Zarr.get_numChunks();
+    }
+    else {
+        blosc_set_nthreads(numWorkers);
+    }
+    */
+    
+    // ctx
+    /*
     if(numWorkers>Zarr.get_numChunks()){
         nBloscThreads = std::ceil(((double)numWorkers)/((double)Zarr.get_numChunks()));
         numWorkers = Zarr.get_numChunks();
     }
+    */
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
     const uint64_t sB = s*bytes;
-    int32_t w;
+
     int err = 0;
     std::string errString;
 
     #pragma omp parallel for
-    for(w = 0; w < numWorkers; w++){
+    for(int32_t w = 0; w < numWorkers; w++){
         void* bufferDest = mallocDynamic(s,bits);
-        uint64_t lastFileLen = 0;
-        char *buffer = NULL;
+        void *buffer = mallocDynamic(s,bits);
+        int64_t dsize = -1;
+        int uncErr = 0;
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
             if(f>=Zarr.get_numChunks() || err) break;
-            std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
+            const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
             const std::string subfolderName = Zarr.get_subfoldersString(cAV);
 
-            //malloc +2 for null term and filesep
             const std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
             
             // If we cannot open the file then set to all zeros
             // Can make this better by checking the errno
-            FILE *fileptr = fopen(fileName.c_str(), "rb");
-            if(!fileptr){
+            std::ifstream file(fileName, std::ios::binary);
+            if(!file.is_open()){
                 memset(bufferDest,0,sB);
             }
             else{
-                fseek(fileptr, 0, SEEK_END);
-                long filelen = ftell(fileptr);
-                rewind(fileptr);
-                if(lastFileLen < filelen){
-                    free(buffer);
-                    buffer = (char*) malloc(filelen);
-                    lastFileLen = filelen;
-                }
-                fread(buffer, filelen, 1, fileptr);
-                fclose(fileptr);
-    
+                file.seekg(0, std::ios::end);
+                const std::streamsize filelen = file.tellg();
+                file.seekg(0, std::ios::beg);
+                file.read(reinterpret_cast<char*>(buffer), filelen);
+                file.close();
                 
                 // Decompress
-                int64_t dsize = -1;
-                int uncErr = 0;
                 if(Zarr.get_cname() != "gzip"){
-                    blosc2_context *dctx;
-                    blosc2_dparams dparams = {(int16_t)nBloscThreads,NULL,NULL,NULL};
-                    dctx = blosc2_create_dctx(dparams);
-                    dsize = blosc2_decompress_ctx(dctx,buffer, filelen, bufferDest, sB);
-                    blosc2_free_ctx(dctx);
+                    if(!useCtx){
+                        dsize = blosc2_decompress(buffer, filelen, bufferDest, sB);
+                    }
+                    else{
+                        blosc2_context *dctx;
+                        blosc2_dparams dparams = {(int16_t)nBloscThreads,NULL,NULL,NULL};
+                        dctx = blosc2_create_dctx(dparams);
+                        dsize = blosc2_decompress_ctx(dctx, buffer, filelen, bufferDest, sB);
+                        blosc2_free_ctx(dctx);
+                    }
                 }
                 else{
                     dsize = sB;
@@ -95,7 +113,8 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                         }
                         break;
                         }
@@ -108,7 +127,8 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                         }
                         break;
                         }
@@ -119,7 +139,8 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
                         err = 1;
                         errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                         }
                         break;
                     }
@@ -132,7 +153,8 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
                     err = 1;
                     errString = "Decompression error. Error code: "+
                                      std::to_string(uncErr)+" ChunkName: "+
-                                     Zarr.get_fileName()+"/"+Zarr.get_chunkNames(f)+"\n";
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
                     }
                     break;
                 }
@@ -198,6 +220,9 @@ void parallelReadZarrMex(zarr &Zarr, void* zarrArr,
         free(bufferDest);
         free(buffer);
     }
+    if(!useCtx){
+        blosc_destroy();
+    }
     
     if(err) mexErrMsgIdAndTxt("zarr:threadError",errString.c_str());
 }
@@ -230,25 +255,25 @@ void* parallelReadZarrWrapper(zarr &Zarr, const bool &crop,
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
         uint8_t* zarrArr = (uint8_t*)malloc(sizeof(uint8_t)*readShape[0]*readShape[1]*readShape[2]);
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else if(Zarr.get_dtype() == "<u2"){
         uint64_t bits = 16;
         uint16_t* zarrArr = (uint16_t*)malloc((uint64_t)(sizeof(uint16_t)*readShape[0]*readShape[1]*readShape[2]));
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else if(Zarr.get_dtype() == "<f4"){
         uint64_t bits = 32;
         float* zarrArr = (float*)malloc(sizeof(float)*readShape[0]*readShape[1]*readShape[2]);
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else if(Zarr.get_dtype() == "<f8"){
         uint64_t bits = 64;
         double* zarrArr = (double*)malloc(sizeof(double)*readShape[0]*readShape[1]*readShape[2]);
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else{
