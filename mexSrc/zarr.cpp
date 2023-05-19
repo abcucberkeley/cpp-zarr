@@ -307,7 +307,6 @@ void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
     uint64_t xChunks = (xEndChunk-xStartChunk);
     uint64_t yChunks = (yEndChunk-yStartChunk);
     uint64_t zChunks = (zEndChunk-zStartChunk);
-    
     numChunks = xChunks*yChunks*zChunks;
     chunkNames = std::vector<std::string>(numChunks);
     #pragma omp parallel for collapse(3)

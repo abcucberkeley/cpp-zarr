@@ -22,8 +22,8 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
     // nBloscThreads used when using blosc_ctx
     uint32_t nBloscThreads = 1;
     if(!useCtx){
-        blosc_init();
-        blosc_set_nthreads(numWorkers);
+        blosc2_init();
+        blosc2_set_nthreads(numWorkers);
     }
 
     // no ctx
@@ -221,14 +221,14 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
         free(buffer);
     }
     if(!useCtx){
-        blosc_destroy();
+        blosc2_destroy();
     }
     
     if(err) mexErrMsgIdAndTxt("zarr:threadError",errString.c_str());
 }
 
 // TODO: FIX MEMORY LEAKS
-void* parallelReadZarrWrapper(zarr &Zarr, const bool &crop,
+void* parallelReadZarrWrapper(zarr Zarr, const bool &crop,
                               std::vector<uint64_t> startCoords, 
                               std::vector<uint64_t> endCoords){
    

@@ -8,7 +8,7 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
                          const uint64_t bits,
                          const bool useCtx=false);
 
-void* parallelReadZarrWrapper(zarr &Zarr, const bool &crop,
+void* parallelReadZarrWrapper(zarr Zarr, const bool &crop,
                               std::vector<uint64_t> startCoords, 
                               std::vector<uint64_t> endCoords);
 #endif
