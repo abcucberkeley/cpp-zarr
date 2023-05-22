@@ -20,7 +20,5 @@ std::string generateUUID();
 
 void mkdirRecursive(const char *dir);
 
-void* mallocDynamic(uint64_t x, uint64_t bits);
-
 bool fileExists(const std::string &fileName);
 #endif

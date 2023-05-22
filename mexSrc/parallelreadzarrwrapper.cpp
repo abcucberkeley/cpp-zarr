@@ -54,8 +54,11 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
 
     #pragma omp parallel for
     for(int32_t w = 0; w < numWorkers; w++){
-        void* bufferDest = mallocDynamic(s,bits);
-        void *buffer = mallocDynamic(s,bits);
+        //void* bufferDest = malloc(sB);
+        //void* buffer = malloc(sB);
+        void* bufferDest = operator new(sB);
+        std::streamsize lastFileLen = 0;
+        void* buffer = NULL;
         int64_t dsize = -1;
         int uncErr = 0;
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
@@ -73,21 +76,26 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
             }
             else{
                 file.seekg(0, std::ios::end);
-                const std::streamsize filelen = file.tellg();
+                const std::streamsize fileLen = file.tellg();
+                if(lastFileLen < fileLen){
+                    operator delete(buffer);
+                    buffer = operator new(fileLen);
+                    lastFileLen = fileLen;
+                }
                 file.seekg(0, std::ios::beg);
-                file.read(reinterpret_cast<char*>(buffer), filelen);
+                file.read(reinterpret_cast<char*>(buffer), fileLen);
                 file.close();
                 
                 // Decompress
                 if(Zarr.get_cname() != "gzip"){
                     if(!useCtx){
-                        dsize = blosc2_decompress(buffer, filelen, bufferDest, sB);
+                        dsize = blosc2_decompress(buffer, fileLen, bufferDest, sB);
                     }
                     else{
                         blosc2_context *dctx;
                         blosc2_dparams dparams = {(int16_t)nBloscThreads,NULL,NULL,NULL};
                         dctx = blosc2_create_dctx(dparams);
-                        dsize = blosc2_decompress_ctx(dctx, buffer, filelen, bufferDest, sB);
+                        dsize = blosc2_decompress_ctx(dctx, buffer, fileLen, bufferDest, sB);
                         blosc2_free_ctx(dctx);
                     }
                 }
@@ -97,13 +105,13 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
                     stream.zalloc = Z_NULL;
                     stream.zfree = Z_NULL;
                     stream.opaque = Z_NULL;
-                    stream.avail_in = (uInt)filelen;
+                    stream.avail_in = (uInt)fileLen;
                     stream.avail_out = (uInt)dsize;
                     while(stream.avail_in > 0){
     
                         dsize = sB;
     
-                        stream.next_in = (uint8_t*)buffer+(filelen-stream.avail_in);
+                        stream.next_in = (uint8_t*)buffer+(fileLen-stream.avail_in);
                         stream.next_out = (uint8_t*)bufferDest+(sB-stream.avail_out);
     
                         uncErr = inflateInit2(&stream, 32);
@@ -217,8 +225,10 @@ void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
             }
             
         }
-        free(bufferDest);
-        free(buffer);
+        operator delete(bufferDest);
+        operator delete(buffer);
+        //free(bufferDest);
+        //free(buffer);
     }
     if(!useCtx){
         blosc2_destroy();

@@ -61,7 +61,7 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
 
     #pragma omp parallel for
     for(int32_t w = 0; w < numWorkers; w++){
-        void* chunkUnC = mallocDynamic(s,bits);
+        void* chunkUnC = malloc(sB);
         void* chunkC = malloc(sB+BLOSC_MAX_OVERHEAD);
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
             if(f>=Zarr.get_numChunks()  || err) break;
