@@ -211,6 +211,7 @@ void zarr::write_jsonValues(){
     std::ofstream o(fnFull);
     if(!o.good()) mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s\n",fnFull.c_str());
     o << std::setw(4) << zarray << std::endl;
+    o.close();
 
     rename(fnFull.c_str(),fileNameFinal.c_str());
 }
