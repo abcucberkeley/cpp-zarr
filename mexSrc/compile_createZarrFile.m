@@ -22,4 +22,9 @@ elseif ismac
     system('chmod 777 createzarrfile.mexmaci64');
     mkdir('../cpp-zarr_mac');
     movefile('createzarrfile.mexmaci64','../cpp-zarr_mac/createZarrFile.mexmaci64');
+elseif ispc
+    mex CXX="C:/mingw64/bin/g++" -v CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2' -I'C:/Program Files (x86)/nlohmann_json/include' createzarrfile.cpp helperfunctions.cpp zarr.cpp
+    
+    mkdir('../cpp-zarr_windows');
+    movefile('createzarrfile.mexw64','../cpp-zarr_windows/createZarrFile.mexw64');
 end

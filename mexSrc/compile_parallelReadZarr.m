@@ -38,5 +38,9 @@ elseif ismac
     system('chmod 777 parallelreadzarr.mexmaci64');
     mkdir('../cpp-zarr_mac');
     movefile('parallelreadzarr.mexmaci64','../cpp-zarr_mac/parallelReadZarr.mexmaci64');
-
+elseif ispc
+    mex CXX="C:/mingw64/bin/g++" -v CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2' -I'C:/Program Files (x86)/nlohmann_json/include' -I'C:/Program Files (x86)/blosc2/include' '-LC:/Program Files (x86)/blosc2/lib' -I'C:/Program Files (x86)/zlib/include' '-LC:/Program Files (x86)/zlib/lib' -lblosc2.dll -lzlib.dll parallelreadzarr.cpp helperfunctions.cpp zarr.cpp parallelreadzarrwrapper.cpp
+    
+    mkdir('../cpp-zarr_windows');
+    movefile('parallelreadzarr.mexw64','../cpp-zarr_windows/parallelReadZarr.mexw64');
 end

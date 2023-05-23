@@ -36,10 +36,7 @@ void parallelWriteZarrMex(zarr &Zarr, void* zarrArr,
                           const std::vector<uint64_t> &endCoords,
                           const std::vector<uint64_t> &writeShape,
                           const uint64_t bits, const bool useUuid, const bool crop){
-
     //printf("%s startCoords[0]yz: %d %d %d endCoords[0]yz: %d %d %d chunkxyz: %d %d %d writeShape[0]yz: %d %d %d bits: %d\n",Zarr.get_fileName().c_str(),startCoords[0],startCoords[1],startCoords[2],endCoords[0],endCoords[1],endCoords[2],Zarr.get_chunks(0),Zarr.get_chunks(1),Zarr.get_chunks(2),writeShape[0],writeShape[1],writeShape[2],bits);
-
-
     const uint64_t bytes = (bits/8);
 
     int32_t numWorkers = omp_get_max_threads();

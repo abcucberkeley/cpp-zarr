@@ -31,11 +31,11 @@ const char* expandTilde(const char* path) {
 char* strndup (const char *s, size_t n)
 {
   size_t len = strnlen (s, n);
-  char *new = (char *) malloc (len + 1);
-  if (new == NULL)
+  char *newS = (char *) malloc (len + 1);
+  if (newS == NULL)
     return NULL;
-  new[len] = '\0';
-  return (char *) memcpy (new, s, len);
+  newS[len] = '\0';
+  return (char *) memcpy (newS, s, len);
 }
 int _vscprintf_so(const char * format, va_list pargs) {
     int retval;
@@ -49,7 +49,7 @@ int _vscprintf_so(const char * format, va_list pargs) {
 int vasprintf(char **strp, const char *fmt, va_list ap) {
     int len = _vscprintf_so(fmt, ap);
     if (len == -1) return -1;
-    char *str = malloc((size_t) len + 1);
+    char *str = (char*)malloc((size_t) len + 1);
     if (!str) return -1;
     int r = vsnprintf(str, len + 1, fmt, ap); /* "secure" version of vsprintf */
     if (r == -1) return free(str), -1;
@@ -70,7 +70,7 @@ std::string generateUUID(){
     #ifdef _WIN32
     // uuid of length 5 for windows
     char uuidC[6];
-    char *seedArr = malloc(1000);
+    char *seedArr = (char*)malloc(1000);
     struct timeval cSeed;
     gettimeofday(&cSeed,NULL);
     int nChars = sprintf(seedArr,"%d%d",cSeed.tv_sec,cSeed.tv_usec);
