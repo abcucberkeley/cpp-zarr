@@ -23,6 +23,11 @@ if isunix && ~ismac
     mkdir('../cpp-zarr_linux');
     movefile('parallelreadzarr.mexa64','../cpp-zarr_linux/parallelReadZarr.mexa64');
 elseif ismac
+    % Might have to do this part in terminal. First change the library
+    % linked to libstdc++
+    % system('install_name_tool -change @rpath/libgcc_s.1.1.dylib @loader_path/libgcc_s.1.1.0.dylib ../cpp-zarr_mac/libstdc++.6.0.30.dylib');
+    
+
     %mex -v CXX="/usr/local/bin/g++-12" CXXOPTIMFLAGS='-O2 -DNDEBUG' LDOPTIMFLAGS='-O2 -DNDEBUG' CXXFLAGS='$CXXFLAGS -O2 -fopenmp' LDFLAGS='$LDFLAGS -O2 -fopenmp' '-I/usr/local/include/' -L'/usr/local/lib/' -lstdc++ -lblosc2 -lz -luuid parallelreadzarr.cpp helperfunctions.cpp zarr.cpp
     mex -v CXX="/usr/local/bin/g++-12" CXXOPTIMFLAGS='-O2 -DNDEBUG' LDOPTIMFLAGS='-O2 -DNDEBUG' CXXFLAGS='-fno-common -arch x86_64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O2 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O2 -fopenmp' '-I/usr/local/include/' -lstdc++ -lblosc2 -lz -luuid parallelreadzarr.cpp helperfunctions.cpp zarr.cpp parallelreadzarrwrapper.cpp
 

@@ -16,6 +16,11 @@ if isunix && ~ismac
     mkdir('../cpp-zarr_linux');
     movefile('parallelwritezarr.mexa64','../cpp-zarr_linux/parallelWriteZarr.mexa64');
 elseif ismac
+    % Might have to do this part in terminal. First change the library
+    % linked to libstdc++
+    % system('install_name_tool -change @rpath/libgcc_s.1.1.dylib @loader_path/libgcc_s.1.1.0.dylib ../cpp-zarr_mac/libstdc++.6.0.30.dylib');
+    
+
     if debug
         %mex -v -g CXX="/usr/local/opt/llvm/bin/clang++" CXXOPTIMFLAGS="" LDOPTIMFLAGS='-g -O0 -Wall -Wextra' CXXFLAGS='$CXXFLAGS -g -O0 -Wall -Wextra -fopenmp' LDFLAGS='$LDFLAGS -g -O0 -fopenmp' '-I/usr/local/include/' -L'/usr/local/lib/' -lblosc -lblosc2 -lz -luuid parallelwritezarr.cpp helperfunctions.cpp zarr.cpp parallelwritezarrread.cpp
         %mex -v -g CXXOPTIMFLAGS='' LDOPTIMFLAGS='-g -O0' CXXFLAGS='$CXXFLAGS -O0 -Xpreprocessor -fopenmp' LDFLAGS='$LDFLAGS -g -O0 -Xpreprocessor -fopenmp' '-I/usr/local/opt/libomp/include' '-I/usr/include' '-I/usr/local/include/' -L'/usr/local/lib/' -L'/usr/local/opt/libomp/lib' -lomp -lblosc -lblosc2 -lz -luuid parallelwritezarr.cpp helperfunctions.cpp zarr.cpp parallelwritezarrread.cpp
