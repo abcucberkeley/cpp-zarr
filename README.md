@@ -1,4 +1,4 @@
-# c-zarr
+# cpp-zarr
 An efficient parallel Zarr reader/writer that utilizes c-blosc/c-blosc2 and OpenMP.
 
 ## Quick Start Guide (MATLAB)
@@ -7,7 +7,7 @@ An efficient parallel Zarr reader/writer that utilizes c-blosc/c-blosc2 and Open
 1. All neccessary libraries are included for the Linux and Windows version.
 
 ### Download and Install
-1. Download the latest release for your OS from here (windows.zip/linux.tar.gz): https://github.com/abcucberkeley/c-zarr/releases
+1. Download the latest release for your OS from here (windowsMatlab.zip/linuxMatlab.tar.gz): https://github.com/abcucberkeley/cpp-zarr/releases
 2. Unzip the folder
 3. You can now put the folders wherever you'd like and add them to your path if needed. Just keep the mex files with their associated dll files so the mex function can always run.
 
