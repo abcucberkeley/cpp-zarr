@@ -12,7 +12,6 @@ An efficient parallel Zarr reader/writer that utilizes c-blosc/c-blosc2 and Open
 3. You can now put the folders wherever you'd like and add them to your path if needed. Just keep the mex files with their associated dll files so the mex function can always run.
 
 ### Usage
-Note: For filepath separators, on Mac/Linux you can use / and on Windows you can use \
 
 #### createZarrFile - Create a custom .zarray metadata file
 % Note the created file is probably hidden by default on your system
