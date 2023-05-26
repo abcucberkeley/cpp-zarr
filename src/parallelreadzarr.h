@@ -1,7 +1,7 @@
-#ifndef PARALLELWRITEZARRREAD_H
-#define PARALLELWRITEZARRREAD_H
+#ifndef PARALLELREADZARR_H
+#define PARALLELREADZARR_H
 #include "zarr.h"
-void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
+void parallelReadZarr(const zarr &Zarr, void* zarrArr,
                          const std::vector<uint64_t> &startCoords, 
                          const std::vector<uint64_t> &endCoords,
                          const std::vector<uint64_t> &readShape,

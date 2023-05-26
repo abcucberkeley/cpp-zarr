@@ -1,14 +1,14 @@
 #include <fstream>
 #include <stdint.h>
 #include <omp.h>
-#include "parallelreadzarrwrapper.h"
+#include "parallelreadzarr.h"
 #include "blosc2.h"
 #include "mex.h"
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "zlib.h"
 
-void parallelReadZarrMex(const zarr &Zarr, void* zarrArr,
+void parallelReadZarr(const zarr &Zarr, void* zarrArr,
                          const std::vector<uint64_t> &startCoords, 
                          const std::vector<uint64_t> &endCoords,
                          const std::vector<uint64_t> &readShape,
@@ -265,25 +265,25 @@ void* parallelReadZarrWrapper(zarr Zarr, const bool &crop,
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
         uint8_t* zarrArr = (uint8_t*)malloc(sizeof(uint8_t)*readShape[0]*readShape[1]*readShape[2]);
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
+        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else if(Zarr.get_dtype() == "<u2"){
         uint64_t bits = 16;
         uint16_t* zarrArr = (uint16_t*)malloc((uint64_t)(sizeof(uint16_t)*readShape[0]*readShape[1]*readShape[2]));
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
+        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else if(Zarr.get_dtype() == "<f4"){
         uint64_t bits = 32;
         float* zarrArr = (float*)malloc(sizeof(float)*readShape[0]*readShape[1]*readShape[2]);
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
+        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else if(Zarr.get_dtype() == "<f8"){
         uint64_t bits = 64;
         double* zarrArr = (double*)malloc(sizeof(double)*readShape[0]*readShape[1]*readShape[2]);
-        parallelReadZarrMex(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
+        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         return (void*)zarrArr;
     }
     else{

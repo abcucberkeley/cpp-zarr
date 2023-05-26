@@ -13,8 +13,8 @@
 #endif
 #include <sys/stat.h>
 #include "mex.h"
-#include "zarr.h"
-#include "helperfunctions.h"
+#include "../src/zarr.h"
+#include "../src/helperfunctions.h"
 
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
