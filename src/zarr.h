@@ -40,7 +40,8 @@ public:
                              const std::vector<uint64_t> &endCoords);
     const std::string &get_chunkNames(const uint64_t &index) const;
     const uint64_t &get_numChunks() const;
-        //static
+    const std::string &get_errString() const;
+    void set_errString(const std::string &errString);
 private:
     void set_jsonValues();
     void write_jsonValues();
@@ -64,5 +65,7 @@ private:
 
     std::vector<std::string> chunkNames;
     uint64_t numChunks;
+
+    std::string errString;
 };
 #endif

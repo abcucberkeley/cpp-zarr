@@ -80,10 +80,22 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // Check if metadata exists that we can use or if we have to create new metadata
     zarr Zarr;
     if(!fileExists(folderName+"/.zarray")){
-        Zarr = zarr();
         Zarr.set_fileName(folderName);
     }
-    else Zarr = zarr(folderName);
+    else{
+        try{
+            Zarr = zarr(folderName);
+        }
+        catch(const std::string &e){
+            if(e.find("metadataFileMissing") != std::string::npos){
+                mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions or the file path.\n",e.substr(e.find(':')+1).c_str());
+            }
+            else if(e == "metadataIncomplete"){
+                mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
+            }
+            else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+        }
+    }
     
 
     if(nrhs >= 5){
@@ -126,7 +138,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
                             (uint64_t)*((mxGetPr(prhs[3])+1)),
                             (uint64_t)*((mxGetPr(prhs[3])+2))});
         }
-        Zarr.write_zarray();
+        try{
+            Zarr.write_zarray();
+        }
+        catch(const std::string &e){
+            if(e == "unsupportedCompressor"){
+                mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",Zarr.get_cname().c_str());
+            }
+            else if(e.find("cannotOpenZarray") != std::string::npos){
+                mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions and path.\n",e.substr(e.find(':')+1).c_str());
+            }
+            else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+        }
     }
     else{
         Zarr.set_shape({endCoords[0],endCoords[1],endCoords[2]});
@@ -137,11 +160,33 @@ void mexFunction(int nlhs, mxArray *plhs[],
                endCoords[2]-startCoords[2] != iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounding box size does not match the size of the input data");
         }
         else {
-            Zarr.write_zarray();
+            try{
+                Zarr.write_zarray();
+            }
+            catch(const std::string &e){
+                if(e == "unsupportedCompressor"){
+                    mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",Zarr.get_cname().c_str());
+                }
+                else if(e.find("cannotOpenZarray") != std::string::npos){
+                    mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions and path.\n",e.substr(e.find(':')+1).c_str());
+                }
+                else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+            }
         }
 
         const std::string dtypeT(Zarr.get_dtype());
-        Zarr = zarr(folderName);
+        try{
+            Zarr = zarr(folderName);
+        }
+        catch(const std::string &e){
+            if(e.find("metadataFileMissing") != std::string::npos){
+                mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions or the file path.\n",e.substr(e.find(':')+1).c_str());
+            }
+            else if(e == "metadataIncomplete"){
+                mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
+            }
+            else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+        }
         if(dtypeT != Zarr.get_dtype()){
             uint64_t size = (endCoords[0]-startCoords[0])*
                 (endCoords[1]-startCoords[1])*
@@ -272,33 +317,34 @@ void mexFunction(int nlhs, mxArray *plhs[],
     //printf("%s startCoords[0]yz: %d %d %d endCoords[0]yz: %d %d %d chunkxyz: %d %d %d writeShape[0]yz: %d %d %d\n",Zarr.get_fileName().c_str(),startCoords[0],startCoords[1],startCoords[2],endCoords[0],endCoords[1],endCoords[2],Zarr.get_chunks(0),Zarr.get_chunks(1),Zarr.get_chunks(2),writeShape[0],writeShape[1],writeShape[2]);
 
     Zarr.set_chunkInfo(startCoords, endCoords);
+    bool err = 0;
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
         uint8_t* zarrArr;
         if(zarrC) zarrArr = (uint8_t*)zarrC;
         else zarrArr =  (uint8_t*)mxGetPr(prhs[1]);
-        parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
     }
     else if(Zarr.get_dtype() == "<u2"){
         uint64_t bits = 16;
         uint16_t* zarrArr;
         if(zarrC) zarrArr = (uint16_t*)zarrC;
         else zarrArr = (uint16_t*)mxGetPr(prhs[1]);
-        parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
     }
     else if(Zarr.get_dtype() == "<f4"){
         uint64_t bits = 32;
         float* zarrArr;
         if(zarrC) zarrArr = (float*)zarrC;
         else zarrArr = (float*)mxGetPr(prhs[1]);
-        parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
     }
     else if(Zarr.get_dtype() == "<f8"){
         uint64_t bits = 64;
         double* zarrArr;
         if(zarrC) zarrArr = (double*)zarrC;
         else zarrArr = (double*)mxGetPr(prhs[1]);
-        parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
     }
     else{
         free(zarrC);
@@ -307,4 +353,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     // zarrC is either a copy for data conversion or NULL
     free(zarrC);
+
+    if(err) mexErrMsgIdAndTxt("zarr:writeError",Zarr.get_errString().c_str());
+    
 }

@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include "zarr.h"
 
-void parallelWriteZarr(zarr &Zarr, void* zarrArr,
+uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                           const std::vector<uint64_t> &startCoords,
                           const std::vector<uint64_t> &endCoords,
                           const std::vector<uint64_t> &writeShape,

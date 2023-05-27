@@ -14,14 +14,13 @@
 #include <fstream>
 #include <algorithm>
 #include "blosc.h"
-#include "mex.h"
 #include "parallelreadzarr.h"
 #include "parallelwritezarr.h"
 #include "helperfunctions.h"
 #include "zarr.h"
 #include "zlib.h"
 
-void parallelWriteZarr(zarr &Zarr, void* zarrArr,
+uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                           const std::vector<uint64_t> &startCoords,
                           const std::vector<uint64_t> &endCoords,
                           const std::vector<uint64_t> &writeShape,
@@ -58,13 +57,18 @@ void parallelWriteZarr(zarr &Zarr, void* zarrArr,
             if(crop && ((((cAV[0])*Zarr.get_chunks(0)) < startCoords[0] || ((cAV[0]+1)*Zarr.get_chunks(0) > endCoords[0] && endCoords[0] < Zarr.get_shape(0)))
                         || (((cAV[1])*Zarr.get_chunks(1)) < startCoords[1] || ((cAV[1]+1)*Zarr.get_chunks(1) > endCoords[1] && endCoords[1] < Zarr.get_shape(1)))
                         || (((cAV[2])*Zarr.get_chunks(2)) < startCoords[2] || ((cAV[2]+1)*Zarr.get_chunks(2) > endCoords[2] && endCoords[2] < Zarr.get_shape(2))))){
-                cRegion = parallelReadZarrWrapper(Zarr, crop,
+                cRegion = parallelReadZarrWriteWrapper(Zarr, crop,
                                                   {((cAV[0])*Zarr.get_chunks(0))+1,
                                                    ((cAV[1])*Zarr.get_chunks(1))+1,
                                                    ((cAV[2])*Zarr.get_chunks(2))+1},
                                                   {(cAV[0]+1)*Zarr.get_chunks(0),
                                                    (cAV[1]+1)*Zarr.get_chunks(1),
                                                    (cAV[2]+1)*Zarr.get_chunks(2)});
+                if(!cRegion){
+                    err = 1;
+                    errString = "Error in Writer Read. Chunk: "+Zarr.get_chunkNames(f)+"\n";
+                    break;
+                }
             }
             if(Zarr.get_order() == "F"){
                 for(int64_t z = cAV[2]*Zarr.get_chunks(2); z < (cAV[2]+1)*Zarr.get_chunks(2); z++){
@@ -325,5 +329,9 @@ void parallelWriteZarr(zarr &Zarr, void* zarrArr,
 
     }
 
-    if(err) mexErrMsgIdAndTxt("zarr:threadError",errString.c_str());
+    if(err) {
+        Zarr.set_errString(errString);
+        return 1;
+    }
+    else return 0;
 }

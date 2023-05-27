@@ -11,7 +11,6 @@
 #include <iomanip>
 #include <iostream>
 #include <fstream>
-#include "mex.h"
 #include "zarr.h"
 #include "helperfunctions.h"
 
@@ -32,7 +31,8 @@ fill_value(""), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0})
 {
     if(!fileExists(fileName+"/.zarray")){
-        mexErrMsgIdAndTxt("zarr:zarrayError","Metadata file in \"%s\" is missing. Does the file exist?",fileName.c_str());
+        throw std::string("metadataFileMissing:"+fileName);
+        //mexErrMsgIdAndTxt("zarr:zarrayError","Metadata file in \"%s\" is missing. Does the file exist?",fileName.c_str());
     }
     std::ifstream f(fileName+"/.zarray");
     zarray = json::parse(f);
@@ -63,7 +63,8 @@ zarr_format(2), subfolders({0,0,0})
         zarr_format = zarray.at("zarr_format");
     }
     catch(...){
-        mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
+        throw std::string("metadataIncomplete");
+        //mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
     }
     try{
         subfolders = zarray.at("subfolders").get<std::vector<uint64_t>>();
@@ -179,7 +180,8 @@ void zarr::set_jsonValues(){
         zarray["compressor"]["id"] = id;
         zarray["compressor"]["level"] = clevel;
     }
-    else mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname.c_str());
+    else throw std::string("unsupportedCompressor"); 
+        //mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname.c_str());
 
     // fill_value just 0 and filters null for now
     zarray["dtype"] = dtype;
@@ -209,7 +211,8 @@ void zarr::write_jsonValues(){
     const std::string fnFull(fileName+"/.zarray"+uuid);
 
     std::ofstream o(fnFull);
-    if(!o.good()) mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s\n",fnFull.c_str());
+    if(!o.good()) throw std::string("cannotOpenZarray:"+fnFull);
+        //mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s\n",fnFull.c_str());
     o << std::setw(4) << zarray << std::endl;
     o.close();
 
@@ -327,4 +330,12 @@ const std::string &zarr::get_chunkNames(const uint64_t &index) const{
 
 const uint64_t &zarr::get_numChunks() const{
     return numChunks;
+}
+
+const std::string &zarr::get_errString() const{
+    return errString;
+}
+
+void zarr::set_errString(const std::string &errString){
+    this->errString = errString;
 }

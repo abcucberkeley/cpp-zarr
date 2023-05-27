@@ -34,9 +34,19 @@ void mexFunction(int nlhs, mxArray *plhs[],
     #ifndef _WIN32
     folderName = expandTilde(folderName.c_str());
     #endif
-
-    zarr Zarr(folderName);
-    
+    zarr Zarr;
+    try{
+        Zarr = zarr(folderName);
+    }
+    catch(const std::string &e){
+        if(e.find("metadataFileMissing") != std::string::npos){
+            mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions or the file path.\n",e.substr(e.find(':')+1).c_str());
+        }
+        else if(e == "metadataIncomplete"){
+            mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
+        }
+        else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+    }
 
     if(endCoords[0] > Zarr.get_shape(0) || 
        endCoords[1] > Zarr.get_shape(1) || 
@@ -52,32 +62,36 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t dim[3] = {readShape[0],readShape[1],readShape[2]};
     
     Zarr.set_chunkInfo(startCoords, endCoords);
+
+    bool err = 0;
     if(Zarr.get_dtype().find("u1") != std::string::npos){
         uint64_t bits = 8;
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
         uint8_t* zarrArr = (uint8_t*)mxGetPr(plhs[0]);
-        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
     }
     else if(Zarr.get_dtype().find("u2") != std::string::npos){
         uint64_t bits = 16;
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
         uint16_t* zarrArr = (uint16_t*)mxGetPr(plhs[0]);
-        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
     }
     else if(Zarr.get_dtype().find("f4") != std::string::npos){
         uint64_t bits = 32;
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
         float* zarrArr = (float*)mxGetPr(plhs[0]);
-        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
     }
     else if(Zarr.get_dtype().find("f8") != std::string::npos){
         uint64_t bits = 64;
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
         double* zarrArr = (double*)mxGetPr(plhs[0]);
-        parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
     }
     else{
         mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
     }
+    
+    if(err) mexErrMsgIdAndTxt("zarr:readError",Zarr.get_errString().c_str());
 
 }

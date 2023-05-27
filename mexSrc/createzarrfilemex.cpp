@@ -101,5 +101,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
     }
 
-    Zarr.write_zarray();
+    try{
+        Zarr.write_zarray();
+    }
+    catch(const std::string &e){
+        if(e == "unsupportedCompressor"){
+            mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",Zarr.get_cname().c_str());
+        }
+        else if(e.find("cannotOpenZarray") != std::string::npos){
+            mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions and path.\n",e.substr(e.find(':')+1).c_str());
+        }
+        else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+    }
 }

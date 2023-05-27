@@ -11,7 +11,6 @@
 #include <uuid/uuid.h>
 #endif
 #include <sys/stat.h>
-#include "mex.h"
 #include "helperfunctions.h"
 
 #ifndef _WIN32
