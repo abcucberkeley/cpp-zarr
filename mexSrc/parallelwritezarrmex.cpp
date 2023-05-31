@@ -39,11 +39,15 @@ void mexFunction(int nlhs, mxArray *plhs[],
     std::vector<uint64_t> startCoords = {0,0,0};
     std::vector<uint64_t> endCoords = {0,0,0};
     bool crop = false;
+    bool useUuid = true;
+    uint8_t bboxIndex = 0;
+    bool sparse = true;
 
     // Dims are 1 by default
     uint64_t iDims[3] = {1,1,1};
 
-    if(nrhs < 3) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 3 arguments");
+    if(nrhs < 2) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 2 arguments");
+    /*
     else if(nrhs == 4 || nrhs == 5 || nrhs == 6){
         if(mxGetN(prhs[3]) == 6){
             crop = true;
@@ -70,6 +74,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(mxGetN(prhs[3]) != 3) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6 or 3");
     }
     else if (nrhs > 6) mexErrMsgIdAndTxt("zarr:inputError","Number of input arguments must be 4 or less");
+    */
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
     std::string folderName(mxArrayToString(prhs[0]));
     // Handle the tilde character in filenames on Linux/Mac
@@ -96,21 +101,61 @@ void mexFunction(int nlhs, mxArray *plhs[],
             else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
         }
     }
-    
 
-    if(nrhs >= 5){
-        Zarr.set_cname(mxArrayToString(prhs[4]));
+    for(int i = 2; i < nrhs; i+=2){
+        if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);
+        if(!mxIsChar(prhs[i])) mexErrMsgIdAndTxt("zarr:inputError","The argument in input location %d is not a string\n",i+1);
+        std::string currInput = mxArrayToString(prhs[i]);
+
+        if(currInput == "uuid"){
+            useUuid = (bool)*((mxGetPr(prhs[i+1])));
+        }
+        else if(currInput == "bbox"){
+            if(mxGetN(prhs[i+1]) == 6){
+                crop = true;
+                startCoords[0] = (uint64_t)*(mxGetPr(prhs[i+1]))-1;
+                startCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+1))-1;
+                startCoords[2] = (uint64_t)*((mxGetPr(prhs[i+1])+2))-1;
+                endCoords[0] = (uint64_t)*((mxGetPr(prhs[i+1])+3));
+                endCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+4));
+                endCoords[2] = (uint64_t)*((mxGetPr(prhs[i+1])+5));
+    
+    
+                uint64_t* iDimsT = (uint64_t*)mxGetDimensions(prhs[1]);
+                uint64_t niDims = (uint64_t) mxGetNumberOfDimensions(prhs[1]);
+                for(uint64_t i = 0; i < niDims; i++) iDims[i] = iDimsT[i];
+    
+                if(startCoords[0]+1 < 1 ||
+                   startCoords[1]+1 < 1 ||
+                   startCoords[2]+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
+    
+                if(endCoords[0]-startCoords[0] > iDims[0] ||
+                   endCoords[1]-startCoords[1] > iDims[1] ||
+                   endCoords[2]-startCoords[2] > iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
+            }
+            else if(mxGetN(prhs[i+1]) == 3) bboxIndex = i+1; 
+            else mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6 or 3");
+        }
+        else if(currInput == "cname"){
+            if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","cname must be a string\n");
+            Zarr.set_cname(mxArrayToString(prhs[i+1]));
+        }
+        else if(currInput == "subfolders"){
+            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","subfolders must be an array of 3 numbers\n");
+            Zarr.set_subfolders({(uint64_t)*(mxGetPr(prhs[i+1])),
+                               (uint64_t)*((mxGetPr(prhs[i+1])+1)),
+                               (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+        }
+        else if(currInput == "sparse"){
+            sparse = (bool)*((mxGetPr(prhs[i+1])));
+        }
+        else{
+            mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
+            Currently Supported Names: uuid, bbox, cname, subfolders, sparse\n",currInput.c_str());
+        }
     }
-    if(nrhs == 6){
-        if(mxGetN(prhs[5]) != 3) mexErrMsgIdAndTxt("zarr:inputError","subfolders must be an array of 3 numbers\n");
-        Zarr.set_subfolders({(uint64_t)*(mxGetPr(prhs[5])),
-                             (uint64_t)*((mxGetPr(prhs[5])+1)),
-                             (uint64_t)*((mxGetPr(prhs[5])+2))});
-    }
-    bool useUuid = (bool)*(mxGetPr(prhs[2]));
 
     void* zarrC = NULL;
-
 
     mxClassID mDType = mxGetClassID(prhs[1]);
     if(mDType == mxUINT8_CLASS){
@@ -133,10 +178,10 @@ void mexFunction(int nlhs, mxArray *plhs[],
         uint64_t* dims = (uint64_t*)mxGetDimensions(prhs[1]);
         if(nDims == 3) Zarr.set_shape({dims[0],dims[1],dims[2]});
         else Zarr.set_shape({dims[0],dims[1],1});
-        if(nrhs > 3){
-            Zarr.set_chunks({(uint64_t)*(mxGetPr(prhs[3])),
-                            (uint64_t)*((mxGetPr(prhs[3])+1)),
-                            (uint64_t)*((mxGetPr(prhs[3])+2))});
+        if(bboxIndex){
+            Zarr.set_chunks({(uint64_t)*(mxGetPr(prhs[bboxIndex])),
+                            (uint64_t)*((mxGetPr(prhs[bboxIndex])+1)),
+                            (uint64_t)*((mxGetPr(prhs[bboxIndex])+2))});
         }
         try{
             Zarr.write_zarray();
@@ -323,28 +368,28 @@ void mexFunction(int nlhs, mxArray *plhs[],
         uint8_t* zarrArr;
         if(zarrC) zarrArr = (uint8_t*)zarrC;
         else zarrArr =  (uint8_t*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
     }
     else if(Zarr.get_dtype() == "<u2"){
         uint64_t bits = 16;
         uint16_t* zarrArr;
         if(zarrC) zarrArr = (uint16_t*)zarrC;
         else zarrArr = (uint16_t*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
     }
     else if(Zarr.get_dtype() == "<f4"){
         uint64_t bits = 32;
         float* zarrArr;
         if(zarrC) zarrArr = (float*)zarrC;
         else zarrArr = (float*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
     }
     else if(Zarr.get_dtype() == "<f8"){
         uint64_t bits = 64;
         double* zarrArr;
         if(zarrC) zarrArr = (double*)zarrC;
         else zarrArr = (double*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop);
+        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
     }
     else{
         free(zarrC);

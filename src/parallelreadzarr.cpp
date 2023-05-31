@@ -52,16 +52,6 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
     const uint64_t sB = s*bytes;
     
-    /*
-    void* zeroChunkCompr = NULL;
-    int64_t csize = 0;
-    if(sparse){
-        void* zeroChunkUnc = calloc(s,bytes);
-        zeroChunkCompr = calloc(sB+BLOSC_MAX_OVERHEAD,1);
-        csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, zeroChunkUnc, zeroChunkCompr, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,numWorkers);
-        free(zeroChunkUnc);
-    }
-    */
     void* zeroChunkUnc = NULL;
     if(sparse){
         zeroChunkUnc = calloc(s,bytes);
@@ -189,10 +179,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             if(sparse){
                 // If the chunk is all zeros (memcmp == 0) then we skip it
                 const bool allZeros = memcmp(zeroChunkUnc,bufferDest,sB);
-                //std::cout << allZeros << std::endl;
                 if(!allZeros) continue;
-                //std::cout << sB << std::endl;
-                //std::cout << dsize << std::endl;
             }
             
             if(Zarr.get_order() == "F"){
@@ -298,7 +285,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     uint8_t err = 0;
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
-        uint8_t* zarrArr = (uint8_t*)malloc(sizeof(uint8_t)*readShape[0]*readShape[1]*readShape[2]);
+        uint8_t* zarrArr = (uint8_t*)calloc(readShape[0]*readShape[1]*readShape[2],sizeof(uint8_t));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);
@@ -308,7 +295,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<u2"){
         uint64_t bits = 16;
-        uint16_t* zarrArr = (uint16_t*)malloc((uint64_t)(sizeof(uint16_t)*readShape[0]*readShape[1]*readShape[2]));
+        uint16_t* zarrArr = (uint16_t*)calloc(readShape[0]*readShape[1]*readShape[2],(uint64_t)(sizeof(uint16_t)));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);
@@ -318,7 +305,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<f4"){
         uint64_t bits = 32;
-        float* zarrArr = (float*)malloc(sizeof(float)*readShape[0]*readShape[1]*readShape[2]);
+        float* zarrArr = (float*)calloc(readShape[0]*readShape[1]*readShape[2],sizeof(float));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);
@@ -328,7 +315,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<f8"){
         uint64_t bits = 64;
-        double* zarrArr = (double*)malloc(sizeof(double)*readShape[0]*readShape[1]*readShape[2]);
+        double* zarrArr = (double*)calloc(readShape[0]*readShape[1]*readShape[2],sizeof(double));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);

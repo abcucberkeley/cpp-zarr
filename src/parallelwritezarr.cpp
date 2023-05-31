@@ -24,7 +24,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                           const std::vector<uint64_t> &startCoords,
                           const std::vector<uint64_t> &endCoords,
                           const std::vector<uint64_t> &writeShape,
-                          const uint64_t bits, const bool useUuid, const bool crop){
+                          const uint64_t bits, const bool useUuid,
+                          const bool crop, const bool sparse){
     //printf("%s startCoords[0]yz: %d %d %d endCoords[0]yz: %d %d %d chunkxyz: %d %d %d writeShape[0]yz: %d %d %d bits: %d\n",Zarr.get_fileName().c_str(),startCoords[0],startCoords[1],startCoords[2],endCoords[0],endCoords[1],endCoords[2],Zarr.get_chunks(0),Zarr.get_chunks(1),Zarr.get_chunks(2),writeShape[0],writeShape[1],writeShape[2],bits);
     const uint64_t bytes = (bits/8);
 
@@ -42,6 +43,11 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
 
     const std::string uuid(generateUUID());
 
+    void* zeroChunkUnc = NULL;
+    if(sparse){
+        zeroChunkUnc = calloc(s,bytes);
+    }
+
     int err = 0;
     std::string errString;
 
@@ -49,10 +55,11 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     for(int32_t w = 0; w < numWorkers; w++){
         void* chunkUnC = malloc(sB);
         void* chunkC = malloc(sB+BLOSC_MAX_OVERHEAD);
+        void* cRegion = nullptr;
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
             if(f>=Zarr.get_numChunks()  || err) break;
             const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
-            void* cRegion = nullptr;
+            cRegion = nullptr;
 
             if(crop && ((((cAV[0])*Zarr.get_chunks(0)) < startCoords[0] || ((cAV[0]+1)*Zarr.get_chunks(0) > endCoords[0] && endCoords[0] < Zarr.get_shape(0)))
                         || (((cAV[1])*Zarr.get_chunks(1)) < startCoords[1] || ((cAV[1]+1)*Zarr.get_chunks(1) > endCoords[1] && endCoords[1] < Zarr.get_shape(1)))
@@ -215,6 +222,14 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     }
                 }
             }
+
+            if(sparse){
+                const bool allZeros = memcmp(zeroChunkUnc,chunkUnC,sB);
+                if(!allZeros){
+                    free(cRegion);
+                    continue;
+                }
+            }
             //char* compressor = blosc_get_compressor();
             //printf("Thread: %d Compressor: %s\n",w,compressor);
 
@@ -328,6 +343,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         free(chunkC);
 
     }
+    free(zeroChunkUnc);
 
     if(err) {
         Zarr.set_errString(errString);
