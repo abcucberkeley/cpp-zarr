@@ -111,7 +111,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
             useUuid = (bool)*((mxGetPr(prhs[i+1])));
         }
         else if(currInput == "bbox"){
-            if(mxGetN(prhs[i+1]) == 6){
+            // Skip bbox if it is empty
+            if(!mxGetN(prhs[i+1])) continue;
+            else if(mxGetN(prhs[i+1]) == 6){
                 crop = true;
                 startCoords[0] = (uint64_t)*(mxGetPr(prhs[i+1]))-1;
                 startCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+1))-1;

@@ -39,7 +39,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
         std::string currInput = mxArrayToString(prhs[i]);
 
         if(currInput == "bbox"){
-            if(mxGetN(prhs[i+1]) != 6) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6");
+            // Skip bbox if it is empty
+            if(!mxGetN(prhs[i+1])) continue;
+            else if(mxGetN(prhs[i+1]) != 6) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6");
             bbox = true;
             startCoords[0] = (uint64_t)*(mxGetPr(prhs[i+1]))-1;
             startCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+1))-1;
