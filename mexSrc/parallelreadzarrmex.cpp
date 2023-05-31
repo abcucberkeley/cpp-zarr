@@ -13,6 +13,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
 {
     std::vector<uint64_t> startCoords = {0,0,0};
     std::vector<uint64_t> endCoords = {0,0,0};
+    bool bbox = false;
     bool sparse = false;
     if(!nrhs) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 1 argument");
     /*
@@ -34,11 +35,12 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     for(int i = 1; i < nrhs; i+=2){
         if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);
-        if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The argument in input location %d is not a string\n",i+1);
+        if(!mxIsChar(prhs[i])) mexErrMsgIdAndTxt("zarr:inputError","The argument in input location %d is not a string\n",i+1);
         std::string currInput = mxArrayToString(prhs[i]);
 
         if(currInput == "bbox"){
             if(mxGetN(prhs[i+1]) != 6) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6");
+            bbox = true;
             startCoords[0] = (uint64_t)*(mxGetPr(prhs[i+1]))-1;
             startCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+1))-1;
             startCoords[2] = (uint64_t)*((mxGetPr(prhs[i+1])+2))-1;
@@ -79,7 +81,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(endCoords[0] > Zarr.get_shape(0) || 
        endCoords[1] > Zarr.get_shape(1) || 
        endCoords[2] > Zarr.get_shape(2)) mexErrMsgIdAndTxt("zarr:inputError","Upper bound is invalid");
-    if(nrhs == 1){
+    if(!bbox){
         endCoords[0] = Zarr.get_shape(0);
         endCoords[1] = Zarr.get_shape(1);
         endCoords[2] = Zarr.get_shape(2);

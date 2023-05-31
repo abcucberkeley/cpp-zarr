@@ -28,7 +28,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     for(int i = 1; i < nrhs; i+=2){
         if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);
-        if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The argument in input location %d is not a string\n",i+1);
+        if(!mxIsChar(prhs[i])) mexErrMsgIdAndTxt("zarr:inputError","The argument in input location %d is not a string\n",i+1);
         std::string currInput = mxArrayToString(prhs[i]);
 
         if(currInput == "chunks"){
@@ -97,7 +97,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: chunks, cname, dtype, order, shape\n",currInput.c_str());
+            Currently Supported Names: chunks, cname, dtype, order, shape, clevel, subfolders\n",currInput.c_str());
         }
     }
 
