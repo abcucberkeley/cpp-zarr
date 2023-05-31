@@ -3,16 +3,20 @@
 #include <omp.h>
 #include "parallelreadzarr.h"
 #include "blosc2.h"
+#include "blosc.h"
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "zlib.h"
+#include <iostream>
 
+// zarrArr should be initialized to all zeros if you have empty chunks
 uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const std::vector<uint64_t> &startCoords, 
                          const std::vector<uint64_t> &endCoords,
                          const std::vector<uint64_t> &readShape,
                          const uint64_t bits,
-                         const bool useCtx)
+                         const bool useCtx,
+                         const bool sparse)
 {
     const uint64_t bytes = (bits/8);
     
@@ -47,6 +51,21 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
     const uint64_t sB = s*bytes;
+    
+    /*
+    void* zeroChunkCompr = NULL;
+    int64_t csize = 0;
+    if(sparse){
+        void* zeroChunkUnc = calloc(s,bytes);
+        zeroChunkCompr = calloc(sB+BLOSC_MAX_OVERHEAD,1);
+        csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, zeroChunkUnc, zeroChunkCompr, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,numWorkers);
+        free(zeroChunkUnc);
+    }
+    */
+    void* zeroChunkUnc = NULL;
+    if(sparse){
+        zeroChunkUnc = calloc(s,bytes);
+    }
 
     int err = 0;
     std::string errString;
@@ -71,7 +90,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             // Can make this better by checking the errno
             std::ifstream file(fileName, std::ios::binary);
             if(!file.is_open()){
-                memset(bufferDest,0,sB);
+                continue;
+                //memset(bufferDest,0,sB);
             }
             else{
                 file.seekg(0, std::ios::end);
@@ -166,6 +186,14 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     break;
                 }
             }
+            if(sparse){
+                // If the chunk is all zeros (memcmp == 0) then we skip it
+                const bool allZeros = memcmp(zeroChunkUnc,bufferDest,sB);
+                //std::cout << allZeros << std::endl;
+                if(!allZeros) continue;
+                //std::cout << sB << std::endl;
+                //std::cout << dsize << std::endl;
+            }
             
             if(Zarr.get_order() == "F"){
                 for(int64_t z = cAV[2]*Zarr.get_chunks(2); z < (cAV[2]+1)*Zarr.get_chunks(2); z++){
@@ -232,7 +260,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     if(!useCtx){
         blosc2_destroy();
     }
-    
+    free(zeroChunkUnc);
+
     if(err){
         Zarr.set_errString(errString);
         return 1;

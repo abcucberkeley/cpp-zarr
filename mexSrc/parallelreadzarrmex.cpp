@@ -13,8 +13,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
 {
     std::vector<uint64_t> startCoords = {0,0,0};
     std::vector<uint64_t> endCoords = {0,0,0};
-
+    bool sparse = false;
     if(!nrhs) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 1 argument");
+    /*
     else if(nrhs == 2){
         if(mxGetN(prhs[1]) != 6) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6");
         startCoords[0] = (uint64_t)*(mxGetPr(prhs[1]))-1;
@@ -27,8 +28,35 @@ void mexFunction(int nlhs, mxArray *plhs[],
         if(startCoords[0]+1 < 1 || startCoords[1]+1 < 1 || startCoords[2]+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
     }
     else if (nrhs > 2) mexErrMsgIdAndTxt("zarr:inputError","Number of input arguments must be 1 or 2");
+    */
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
     std::string folderName(mxArrayToString(prhs[0]));
+
+    for(int i = 1; i < nrhs; i+=2){
+        if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);
+        if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The argument in input location %d is not a string\n",i+1);
+        std::string currInput = mxArrayToString(prhs[i]);
+
+        if(currInput == "bbox"){
+            if(mxGetN(prhs[i+1]) != 6) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6");
+            startCoords[0] = (uint64_t)*(mxGetPr(prhs[i+1]))-1;
+            startCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+1))-1;
+            startCoords[2] = (uint64_t)*((mxGetPr(prhs[i+1])+2))-1;
+            endCoords[0] = (uint64_t)*((mxGetPr(prhs[i+1])+3));
+            endCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+4));
+            endCoords[2] = (uint64_t)*((mxGetPr(prhs[i+1])+5));
+            
+            if(startCoords[0]+1 < 1 || startCoords[1]+1 < 1 || startCoords[2]+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
+        
+        }
+        else if(currInput == "sparse"){
+            sparse = (bool)*((mxGetPr(prhs[i+1])));
+        }
+        else{
+            mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
+            Currently Supported Names: bbox, sparse\n",currInput.c_str());
+        }
+    }
     
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
@@ -66,27 +94,28 @@ void mexFunction(int nlhs, mxArray *plhs[],
     bool err = 0;
     if(Zarr.get_dtype().find("u1") != std::string::npos){
         uint64_t bits = 8;
+        // if sparse else use mxCreateUninitNumericArray
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
         uint8_t* zarrArr = (uint8_t*)mxGetPr(plhs[0]);
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else if(Zarr.get_dtype().find("u2") != std::string::npos){
         uint64_t bits = 16;
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
         uint16_t* zarrArr = (uint16_t*)mxGetPr(plhs[0]);
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else if(Zarr.get_dtype().find("f4") != std::string::npos){
         uint64_t bits = 32;
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
         float* zarrArr = (float*)mxGetPr(plhs[0]);
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else if(Zarr.get_dtype().find("f8") != std::string::npos){
         uint64_t bits = 64;
         plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
         double* zarrArr = (double*)mxGetPr(plhs[0]);
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else{
         mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
