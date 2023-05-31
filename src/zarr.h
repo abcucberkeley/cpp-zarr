@@ -14,7 +14,7 @@ public:
     zarr(const std::string &fileName, const std::vector<uint64_t> &chunks,
          uint64_t blocksize, uint64_t clevel, const std::string &cname,
          const std::string &id, uint64_t shuffle, const std::string &dtype,
-         const std::string &fill_value, const std::vector<std::string> &filters,
+         const int64_t &fill_value, const std::vector<std::string> &filters,
          const std::string &order, const std::vector<uint64_t> &shape,
          uint64_t zarr_format, const std::vector<uint64_t> subfolders);
     ~zarr();
@@ -29,6 +29,8 @@ public:
     void set_cname(const std::string &cname);
     const std::string &get_dtype() const;
     void set_dtype(const std::string &dtype);
+    const int64_t &get_fill_value() const;
+    void set_fill_value(const int64_t &fill_value);
     const std::string &get_order() const;
     void set_order(const std::string &order);
     const uint64_t &get_shape(const uint64_t &index) const;
@@ -56,7 +58,7 @@ private:
     std::string id;
     uint64_t shuffle;
     std::string dtype;
-    std::string fill_value;
+    int64_t fill_value;
     std::vector<std::string> filters;
     std::string order;
     std::vector<uint64_t> shape;

@@ -18,7 +18,7 @@
 zarr::zarr() :
 fileName(""), chunks({256,256,256}), blocksize(0),
 clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
-fill_value(""), filters({}), order("F"), shape({0,0,0}),
+fill_value(0), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0})
 {
     set_jsonValues();
@@ -27,7 +27,7 @@ zarr_format(2), subfolders({0,0,0})
 zarr::zarr(const std::string &fileName) :
 fileName(fileName), chunks({256,256,256}), blocksize(0),
 clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
-fill_value(""), filters({}), order("F"), shape({0,0,0}),
+fill_value(0), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0})
 {
     if(!fileExists(fileName+"/.zarray")){
@@ -56,7 +56,8 @@ zarr_format(2), subfolders({0,0,0})
             shuffle = 0;
         }
         dtype = zarray.at("dtype");
-        //fill_value = "";
+        if(zarray.at("fill_value").empty()) fill_value = 0;
+        else fill_value = zarray.at("fill_value");
         //filters = "";
         order = zarray.at("order");
         shape = zarray.at("shape").get<std::vector<uint64_t>>();
@@ -78,7 +79,7 @@ zarr_format(2), subfolders({0,0,0})
 zarr::zarr(const std::string &fileName, const std::vector<uint64_t> &chunks,
            uint64_t blocksize, uint64_t clevel, const std::string &cname,
            const std::string &id, uint64_t shuffle, const std::string &dtype,
-           const std::string &fill_value, const std::vector<std::string> &filters,
+           const int64_t &fill_value, const std::vector<std::string> &filters,
            const std::string &order, const std::vector<uint64_t> &shape,
            uint64_t zarr_format, const std::vector<uint64_t> subfolders) :
 fileName(fileName), chunks(chunks), blocksize(blocksize),
@@ -148,6 +149,14 @@ void zarr::set_dtype(const std::string &dtype){
     this->dtype = dtype;
 }
 
+const int64_t &zarr::get_fill_value() const{
+    return fill_value;
+}
+
+void zarr::set_fill_value(const int64_t &fill_value){
+    this->fill_value = fill_value;
+}
+
 const std::string &zarr::get_order() const{
     return order;
 }
@@ -183,9 +192,9 @@ void zarr::set_jsonValues(){
     else throw std::string("unsupportedCompressor"); 
         //mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname.c_str());
 
-    // fill_value just 0 and filters null for now
+    // filters null for now
     zarray["dtype"] = dtype;
-    zarray["fill_value"] = 0;
+    zarray["fill_value"] = fill_value;
     zarray["filters"] = nullptr;
     zarray["order"] = order;
 

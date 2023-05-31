@@ -96,29 +96,61 @@ void mexFunction(int nlhs, mxArray *plhs[],
     Zarr.set_chunkInfo(startCoords, endCoords);
 
     bool err = 0;
+    uint64_t readSize = readShape[0]*readShape[1]*readShape[2];
     if(Zarr.get_dtype().find("u1") != std::string::npos){
         uint64_t bits = 8;
-        // if sparse else use mxCreateUninitNumericArray
-        plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
-        uint8_t* zarrArr = (uint8_t*)mxGetPr(plhs[0]);
+        uint8_t* zarrArr;
+        if(Zarr.get_fill_value()){
+            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
+            zarrArr = (uint8_t*)mxGetPr(plhs[0]);
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(uint8_t));
+        }
+        else{
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
+            zarrArr = (uint8_t*)mxGetPr(plhs[0]);
+        }
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else if(Zarr.get_dtype().find("u2") != std::string::npos){
         uint64_t bits = 16;
-        plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
-        uint16_t* zarrArr = (uint16_t*)mxGetPr(plhs[0]);
+        uint16_t* zarrArr;
+        if(Zarr.get_fill_value()){
+            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
+            zarrArr = (uint16_t*)mxGetPr(plhs[0]);
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(uint16_t));
+        }
+        else{
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
+            zarrArr = (uint16_t*)mxGetPr(plhs[0]);
+        }
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else if(Zarr.get_dtype().find("f4") != std::string::npos){
         uint64_t bits = 32;
-        plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
-        float* zarrArr = (float*)mxGetPr(plhs[0]);
+        float* zarrArr;
+        if(Zarr.get_fill_value()){
+            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
+            zarrArr = (float*)mxGetPr(plhs[0]);
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(float));
+        }
+        else{
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
+            zarrArr = (float*)mxGetPr(plhs[0]);
+        }
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else if(Zarr.get_dtype().find("f8") != std::string::npos){
         uint64_t bits = 64;
-        plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
-        double* zarrArr = (double*)mxGetPr(plhs[0]);
+        double* zarrArr;
+        if(Zarr.get_fill_value()){
+            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
+            zarrArr = (double*)mxGetPr(plhs[0]);
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(double));
+        }
+        else{
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
+            zarrArr = (double*)mxGetPr(plhs[0]);
+        }
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,false,sparse);
     }
     else{

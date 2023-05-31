@@ -283,9 +283,15 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
 
     Zarr.set_chunkInfo(startCoords, endCoords);
     uint8_t err = 0;
+    uint64_t readSize = readShape[0]*readShape[1]*readShape[2];
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
-        uint8_t* zarrArr = (uint8_t*)calloc(readShape[0]*readShape[1]*readShape[2],sizeof(uint8_t));
+        uint8_t* zarrArr;
+        if(Zarr.get_fill_value()){
+            zarrArr = (uint8_t*)malloc(readSize*sizeof(uint8_t));
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(uint8_t));
+        }
+        else zarrArr = (uint8_t*)calloc(readSize,sizeof(uint8_t));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);
@@ -295,7 +301,12 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<u2"){
         uint64_t bits = 16;
-        uint16_t* zarrArr = (uint16_t*)calloc(readShape[0]*readShape[1]*readShape[2],(uint64_t)(sizeof(uint16_t)));
+        uint16_t* zarrArr;
+        if(Zarr.get_fill_value()){
+            zarrArr = (uint16_t*)malloc(readSize*(uint64_t)(sizeof(uint16_t)));
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(uint16_t));
+        }
+        else zarrArr = (uint16_t*)calloc(readSize,(uint64_t)(sizeof(uint16_t)));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);
@@ -305,7 +316,12 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<f4"){
         uint64_t bits = 32;
-        float* zarrArr = (float*)calloc(readShape[0]*readShape[1]*readShape[2],sizeof(float));
+        float* zarrArr;
+        if(Zarr.get_fill_value()){
+            zarrArr = (float*)malloc(readSize*(sizeof(float)));
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(float));
+        }
+        else zarrArr = (float*)calloc(readSize,(sizeof(float)));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);
@@ -315,7 +331,12 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<f8"){
         uint64_t bits = 64;
-        double* zarrArr = (double*)calloc(readShape[0]*readShape[1]*readShape[2],sizeof(double));
+        double* zarrArr;
+        if(Zarr.get_fill_value()){
+            zarrArr = (double*)malloc(readSize*(sizeof(double)));
+            memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(double));
+        }
+        else zarrArr = (double*)calloc(readSize,(sizeof(double)));
         err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
         if(err){
             free(zarrArr);
