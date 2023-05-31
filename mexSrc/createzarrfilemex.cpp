@@ -27,7 +27,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     Zarr.set_fileName(mxArrayToString(prhs[0]));
 
     for(int i = 1; i < nrhs; i+=2){
-        if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n");
+        if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);
         if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The argument in input location %d is not a string\n",i+1);
         std::string currInput = mxArrayToString(prhs[i]);
 
