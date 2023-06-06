@@ -3,12 +3,22 @@ cmake_minimum_required(VERSION 3.9)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(CMAKE_CXX_FLAGS "-Wall -Wextra")
+set(CMAKE_CXX_FLAGS_DEBUG "-g")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+
 project(
   cpp-zarr
-  VERSION 1.1.0
+  VERSION 1.1.1
   LANGUAGES CXX)
 
+# OpenMP is Required
 find_package(OpenMP REQUIRED)
+
 if (UNIX)
     include(ExternalProject)
         
@@ -34,7 +44,6 @@ endif()
 
 # Add c-blosc
 set(CBLOSC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc-1.21.0")
-#set(BLOSC_INSTALL ON CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -100,9 +109,12 @@ target_include_directories(cppZarr_shared PRIVATE
 
 # Link against the blosc and blosc2 libraries
 target_link_libraries(cppZarr_shared PRIVATE
-    -Wl,--exclude-libs,${CMAKE_BINARY_DIR}/dependencies/c-blosc-1.21.0/blosc/libblosc.a
+    "-Wl,--allow-multiple-definition"  
+    ${CMAKE_BINARY_DIR}/dependencies/c-blosc-1.21.0/blosc/libblosc.a
     ${CMAKE_BINARY_DIR}/dependencies/c-blosc2-2.8.0/blosc/libblosc2.a
     ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.13/libz.a
+    -static-libgcc
+    -static-libstdc++
     OpenMP::OpenMP_CXX
 )
 
