@@ -18,8 +18,8 @@
 zarr::zarr() :
 fileName(""), chunks({256,256,256}), blocksize(0),
 clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
-fill_value(0), filters({}), order("F"), shape({0,0,0}),
-zarr_format(2), subfolders({0,0,0})
+dimension_separator("."), fill_value(0), filters({}), order("F"), 
+shape({0,0,0}), zarr_format(2), subfolders({0,0,0})
 {
     set_jsonValues();
 }
@@ -55,6 +55,16 @@ zarr_format(2), subfolders({0,0,0})
             id = "";
             shuffle = 0;
         }
+        // If dimension_separator does not exist then assume it is "."
+        try{
+            dimension_separator = zarray.at("dimension_separator");
+            if(dimension_separator != "/" && dimension_separator != "."){
+                throw std::string("metadataIncomplete:dimension_separatorIncorrect");
+            }
+        }
+        catch(...){
+            dimension_separator = ".";
+        }
         dtype = zarray.at("dtype");
         if(zarray.at("fill_value").empty()) fill_value = 0;
         else fill_value = zarray.at("fill_value");
@@ -78,13 +88,13 @@ zarr_format(2), subfolders({0,0,0})
 // Create a new zarr file with .zarray metadata file (no actual data)
 zarr::zarr(const std::string &fileName, const std::vector<uint64_t> &chunks,
            uint64_t blocksize, uint64_t clevel, const std::string &cname,
-           const std::string &id, uint64_t shuffle, const std::string &dtype,
+           const std::string &id, uint64_t shuffle, const std::string &dimension_separator, const std::string &dtype,
            const int64_t &fill_value, const std::vector<std::string> &filters,
            const std::string &order, const std::vector<uint64_t> &shape,
            uint64_t zarr_format, const std::vector<uint64_t> subfolders) :
-fileName(fileName), chunks(chunks), blocksize(blocksize),
-clevel(clevel), cname(cname), id(id), shuffle(shuffle), dtype(dtype),
-fill_value(fill_value), filters(filters), order(order), shape(shape),
+fileName(fileName), chunks(chunks), blocksize(blocksize), clevel(clevel),
+cname(cname), id(id), shuffle(shuffle), dimension_separator(dimension_separator),
+dtype(dtype), fill_value(fill_value), filters(filters), order(order), shape(shape),
 zarr_format(zarr_format), subfolders(subfolders)
 {
     // Handle the tilde character in filenames on Linux/Mac
@@ -139,6 +149,14 @@ const std::string &zarr::get_cname() const{
 
 void zarr::set_cname(const std::string &cname){
     this->cname = cname;
+}
+
+const std::string &zarr::get_dimension_separator() const{
+    return dimension_separator;
+}
+
+void zarr::set_dimension_separator(const std::string &dimension_separator){
+    this->dimension_separator = dimension_separator;
 }
 
 const std::string &zarr::get_dtype() const{
@@ -327,7 +345,7 @@ void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
         for(uint64_t y = yStartChunk; y < yEndChunk; y++){
             for(uint64_t z = zStartChunk; z < zEndChunk; z++){
                 uint64_t currFile = (z-zStartChunk)+((y-yStartChunk)*zChunks)+((x-xStartChunk)*yChunks*zChunks);
-                chunkNames[currFile] = std::to_string(x)+"."+std::to_string(y)+"."+std::to_string(z);
+                chunkNames[currFile] = std::to_string(x)+dimension_separator+std::to_string(y)+dimension_separator+std::to_string(z);
             }
         }
     }
