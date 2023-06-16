@@ -16,20 +16,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
     bool bbox = false;
     bool sparse = false;
     if(!nrhs) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 1 argument");
-    /*
-    else if(nrhs == 2){
-        if(mxGetN(prhs[1]) != 6) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6");
-        startCoords[0] = (uint64_t)*(mxGetPr(prhs[1]))-1;
-        startCoords[1] = (uint64_t)*((mxGetPr(prhs[1])+1))-1;
-        startCoords[2] = (uint64_t)*((mxGetPr(prhs[1])+2))-1;
-        endCoords[0] = (uint64_t)*((mxGetPr(prhs[1])+3));
-        endCoords[1] = (uint64_t)*((mxGetPr(prhs[1])+4));
-        endCoords[2] = (uint64_t)*((mxGetPr(prhs[1])+5));
-        
-        if(startCoords[0]+1 < 1 || startCoords[1]+1 < 1 || startCoords[2]+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
-    }
-    else if (nrhs > 2) mexErrMsgIdAndTxt("zarr:inputError","Number of input arguments must be 1 or 2");
-    */
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
     std::string folderName(mxArrayToString(prhs[0]));
 
@@ -92,6 +78,17 @@ void mexFunction(int nlhs, mxArray *plhs[],
                                              endCoords[1]-startCoords[1],
                                              endCoords[2]-startCoords[2]};
     uint64_t dim[3] = {readShape[0],readShape[1],readShape[2]};
+    // TESTING
+    /*
+    if(Zarr.get_order() == "C"){
+        //Zarr.set_order("F");
+        dim[0] = readShape[2];
+        dim[2] = readShape[0];
+        
+    }
+    */
+    
+    
     
     Zarr.set_chunkInfo(startCoords, endCoords);
 

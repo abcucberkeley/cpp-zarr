@@ -7,7 +7,7 @@
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "zlib.h"
-#include <iostream>
+//#include <iostream>
 
 // zarrArr should be initialized to all zeros if you have empty chunks
 uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
@@ -18,6 +18,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool useCtx,
                          const bool sparse)
 {
+    void* zarrArrC;
     const uint64_t bytes = (bits/8);
     
     int32_t numWorkers = omp_get_max_threads();
@@ -51,6 +52,9 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
     const uint64_t sB = s*bytes;
+
+    // If C->F order then we need a temp C order array
+    if(Zarr.get_order() == "C") zarrArrC = calloc(readShape[0]*readShape[1]*readShape[2],bytes);
     
     void* zeroChunkUnc = NULL;
     if(sparse){
@@ -182,13 +186,14 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 if(!allZeros) continue;
             }
             
-            if(Zarr.get_order() == "F"){
-                for(int64_t z = cAV[2]*Zarr.get_chunks(2); z < (cAV[2]+1)*Zarr.get_chunks(2); z++){
-                    if(z>=endCoords[2]) break;
-                    else if(z<startCoords[2]) continue;
-                    for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
-                        if(y>=endCoords[1]) break;
-                        else if(y<startCoords[1]) continue;
+            // F->F
+            if(Zarr.get_order() == "F"){  
+                for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
+                    if(y>=endCoords[1]) break;
+                    else if(y<startCoords[1]) continue;
+                    for(int64_t z = cAV[2]*Zarr.get_chunks(2); z < (cAV[2]+1)*Zarr.get_chunks(2); z++){
+                        if(z>=endCoords[2]) break;
+                        else if(z<startCoords[2]) continue;
                         if(((cAV[0]*Zarr.get_chunks(0)) < startCoords[0] && ((cAV[0]+1)*Zarr.get_chunks(0)) > startCoords[0]) || (cAV[0]+1)*Zarr.get_chunks(0)>endCoords[0]){
                             if(((cAV[0]*Zarr.get_chunks(0)) < startCoords[0] && ((cAV[0]+1)*Zarr.get_chunks(0)) > startCoords[0]) && (cAV[0]+1)*Zarr.get_chunks(0)>endCoords[0]){
                                 memcpy((uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0]+(startCoords[0]%Zarr.get_chunks(0)))+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))*bytes),(uint8_t*)bufferDest+(((startCoords[0]%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((endCoords[0]%Zarr.get_chunks(0))-(startCoords[0]%Zarr.get_chunks(0)))*bytes);
@@ -207,34 +212,30 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
                 
             }
+            // C->C (x and z are flipped) then we flip to F below
             else if (Zarr.get_order() == "C"){
-                for(int64_t x = cAV[0]*Zarr.get_chunks(0); x < (cAV[0]+1)*Zarr.get_chunks(0); x++){
-                    if(x>=endCoords[0]) break;
-                    else if(x<startCoords[0]) continue;
-                    for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
-                        if(y>=endCoords[1]) break;
-                        else if(y<startCoords[1]) continue;
-                        for(int64_t z = cAV[2]*Zarr.get_chunks(2); z < (cAV[2]+1)*Zarr.get_chunks(2); z++){
-                            if(z>=endCoords[2]) break;
-                            else if(z<startCoords[2]) continue;
-                            switch(bytes){
-                                case 1:
-                                    ((uint8_t*)zarrArr)[((x-startCoords[0])+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))] = ((uint8_t*)bufferDest)[((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))];
-                                    break;
-                                case 2:
-                                    ((uint16_t*)zarrArr)[((x-startCoords[0])+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))] = ((uint16_t*)bufferDest)[((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))];
-                                    break;
-                                case 4:
-                                    ((float*)zarrArr)[((x-startCoords[0])+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))] = ((float*)bufferDest)[((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))];
-                                    break;
-                                case 8:
-                                    ((double*)zarrArr)[((x-startCoords[0])+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))] = ((double*)bufferDest)[((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))];
-                                    break;
+                for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
+                    if(y>=endCoords[1]) break;
+                    else if(y<startCoords[1]) continue;
+                    for(int64_t z = cAV[0]*Zarr.get_chunks(0); z < (cAV[0]+1)*Zarr.get_chunks(0); z++){
+                        if(z>=endCoords[0]) break;
+                        else if(z<startCoords[0]) continue;
+                        if(((cAV[2]*Zarr.get_chunks(2)) < startCoords[2] && ((cAV[2]+1)*Zarr.get_chunks(2)) > startCoords[2]) || (cAV[2]+1)*Zarr.get_chunks(2)>endCoords[2]){
+                            if(((cAV[2]*Zarr.get_chunks(2)) < startCoords[2] && ((cAV[2]+1)*Zarr.get_chunks(2)) > startCoords[2]) && (cAV[2]+1)*Zarr.get_chunks(2)>endCoords[2]){
+                                memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2))-startCoords[2]+(startCoords[2]%Zarr.get_chunks(2)))+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+(((startCoords[2]%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),((endCoords[2]%Zarr.get_chunks(2))-(startCoords[2]%Zarr.get_chunks(2)))*bytes);
                             }
-                            
+                            else if((cAV[2]+1)*Zarr.get_chunks(2)>endCoords[2]){
+                                memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2))-startCoords[2])+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),(endCoords[2]%Zarr.get_chunks(2))*bytes);
+                            }
+                            else if((cAV[2]*Zarr.get_chunks(2)) < startCoords[2] && ((cAV[2]+1)*Zarr.get_chunks(2)) > startCoords[2]){
+                                memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2)-startCoords[2]+(startCoords[2]%Zarr.get_chunks(2))))+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+(((startCoords[2]%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),(Zarr.get_chunks(2)-(startCoords[2]%Zarr.get_chunks(2)))*bytes);
+                            }
+                        }
+                        else{
+                            memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2))-startCoords[2])+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),Zarr.get_chunks(2)*bytes);
                         }
                     }
-                }
+                }  
                 
             }
             
@@ -253,7 +254,35 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         Zarr.set_errString(errString);
         return 1;
     }
-    else return 0;
+    else if (Zarr.get_order() == "C"){
+        // This transpose can potentially be optimized more
+        #pragma omp parallel for collapse(3)
+        for(size_t i = 0; i < readShape[0]; i++) {
+            for(size_t j = 0; j < readShape[1]; j++) {
+                for(size_t k = 0; k < readShape[2]; k++) {
+                    switch(bytes){
+                        case 1:
+                            *((uint8_t*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((uint8_t*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            break;
+                        case 2:
+                            *((uint16_t*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((uint16_t*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            break;
+                        case 4:
+                            *((float*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((float*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            break;
+                        case 8:
+                            *((double*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((double*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            break;
+                    }
+                }
+            }
+        }
+        
+        free(zarrArrC);
+
+        
+    }
+    return 0;
 }
 
 // TODO: FIX MEMORY LEAKS
