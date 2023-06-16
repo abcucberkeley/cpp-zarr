@@ -18,7 +18,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool useCtx,
                          const bool sparse)
 {
-    void* zarrArrC;
+    void* zarrArrC = NULL;
     const uint64_t bytes = (bits/8);
     
     int32_t numWorkers = omp_get_max_threads();
@@ -214,6 +214,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             }
             // C->C (x and z are flipped) then we flip to F below
             else if (Zarr.get_order() == "C"){
+
                 for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
                     if(y>=endCoords[1]) break;
                     else if(y<startCoords[1]) continue;
@@ -255,28 +256,28 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         return 1;
     }
     else if (Zarr.get_order() == "C"){
-        // This transpose can potentially be optimized more
-        #pragma omp parallel for collapse(3)
-        for(size_t i = 0; i < readShape[0]; i++) {
-            for(size_t j = 0; j < readShape[1]; j++) {
+        #pragma omp parallel for
+        for(size_t j = 0; j < readShape[1]; j++) {
+            for(size_t i = 0; i < readShape[0]; i++) {
                 for(size_t k = 0; k < readShape[2]; k++) {
                     switch(bytes){
                         case 1:
-                            *((uint8_t*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((uint8_t*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            *(((uint8_t*)zarrArr)+(k*readShape[0]*readShape[1])+(j*readShape[0])+i) = *((uint8_t*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
                             break;
                         case 2:
-                            *((uint16_t*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((uint16_t*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            *(((uint16_t*)zarrArr)+(k*readShape[0]*readShape[1])+(j*readShape[0])+i) = *((uint16_t*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
                             break;
                         case 4:
-                            *((float*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((float*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            *(((float*)zarrArr)+(k*readShape[0]*readShape[1])+(j*readShape[0])+i) = *((float*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
                             break;
                         case 8:
-                            *((double*)zarrArr+(k*readShape[0]*readShape[1])+(i*readShape[1])+j) = *((double*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
+                            *(((double*)zarrArr)+(k*readShape[0]*readShape[1])+(j*readShape[0])+i) = *((double*)zarrArrC+(i*readShape[1]*readShape[2])+(j*readShape[2])+k);
                             break;
                     }
                 }
             }
         }
+        
         
         free(zarrArrC);
 
