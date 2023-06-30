@@ -47,34 +47,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t iDims[3] = {1,1,1};
 
     if(nrhs < 2) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 2 arguments");
-    /*
-    else if(nrhs == 4 || nrhs == 5 || nrhs == 6){
-        if(mxGetN(prhs[3]) == 6){
-            crop = true;
-            startCoords[0] = (uint64_t)*(mxGetPr(prhs[3]))-1;
-            startCoords[1] = (uint64_t)*((mxGetPr(prhs[3])+1))-1;
-            startCoords[2] = (uint64_t)*((mxGetPr(prhs[3])+2))-1;
-            endCoords[0] = (uint64_t)*((mxGetPr(prhs[3])+3));
-            endCoords[1] = (uint64_t)*((mxGetPr(prhs[3])+4));
-            endCoords[2] = (uint64_t)*((mxGetPr(prhs[3])+5));
-
-
-            uint64_t* iDimsT = (uint64_t*)mxGetDimensions(prhs[1]);
-            uint64_t niDims = (uint64_t) mxGetNumberOfDimensions(prhs[1]);
-            for(uint64_t i = 0; i < niDims; i++) iDims[i] = iDimsT[i];
-
-            if(startCoords[0]+1 < 1 ||
-               startCoords[1]+1 < 1 ||
-               startCoords[2]+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
-
-            if(endCoords[0]-startCoords[0] > iDims[0] ||
-               endCoords[1]-startCoords[1] > iDims[1] ||
-               endCoords[2]-startCoords[2] > iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
-        }
-        else if(mxGetN(prhs[3]) != 3) mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6 or 3");
-    }
-    else if (nrhs > 6) mexErrMsgIdAndTxt("zarr:inputError","Number of input arguments must be 4 or less");
-    */
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
     std::string folderName(mxArrayToString(prhs[0]));
     // Handle the tilde character in filenames on Linux/Mac
@@ -145,6 +117,13 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(currInput == "subfolders"){
             if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","subfolders must be an array of 3 numbers\n");
             Zarr.set_subfolders({(uint64_t)*(mxGetPr(prhs[i+1])),
+                               (uint64_t)*((mxGetPr(prhs[i+1])+1)),
+                               (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+        }
+        else if(currInput == "chunk_shape"){
+            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","chunk_shape must be an array of 3 numbers\n");
+            Zarr.set_shard(true);
+            Zarr.set_chunk_shape({(uint64_t)*(mxGetPr(prhs[i+1])),
                                (uint64_t)*((mxGetPr(prhs[i+1])+1)),
                                (uint64_t)*((mxGetPr(prhs[i+1])+2))});
         }
@@ -234,6 +213,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             }
             else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
         }
+        
         if(dtypeT != Zarr.get_dtype()){
             uint64_t size = (endCoords[0]-startCoords[0])*
                 (endCoords[1]-startCoords[1])*

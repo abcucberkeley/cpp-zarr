@@ -11,6 +11,7 @@
 #include <uuid/uuid.h>
 #endif
 #include <sys/stat.h>
+#include <filesystem>
 #include "helperfunctions.h"
 
 #ifndef _WIN32
@@ -90,8 +91,20 @@ std::string generateUUID(){
     return std::string(uuidC);
 }
 
+bool folderExists(const std::string &folderName){
+    struct stat info;
+
+    if(stat(folderName.c_str(), &info) != 0)
+        return false;
+    else if(info.st_mode & S_IFDIR)
+        return true;
+    else
+        return false;
+}
+
 // Recursively make a directory and set its permissions to 775
 void mkdirRecursive(const char *dir) {
+    if(folderExists(dir)) return;
     char tmp[8192];
     char *p = NULL;
     size_t len;

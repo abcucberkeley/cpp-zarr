@@ -95,9 +95,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
                                (uint64_t)*((mxGetPr(prhs[i+1])+1)),
                                (uint64_t)*((mxGetPr(prhs[i+1])+2))});
         }
+        else if(currInput == "chunk_shape"){
+            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","chunk_shape must be an array of 3 numbers\n");
+            Zarr.set_shard(true);
+            Zarr.set_chunk_shape({(uint64_t)*(mxGetPr(prhs[i+1])),
+                               (uint64_t)*((mxGetPr(prhs[i+1])+1)),
+                               (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+        }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: chunks, cname, dtype, order, shape, clevel, subfolders\n",currInput.c_str());
+            Currently Supported Names: chunks, cname, dtype, order, shape, clevel, subfolders, chunk_shape\n",currInput.c_str());
         }
     }
 

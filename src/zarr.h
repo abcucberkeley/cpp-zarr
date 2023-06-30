@@ -39,6 +39,21 @@ public:
     void set_shape(const std::vector<uint64_t> &shape);
     const std::string get_subfoldersString(const std::vector<uint64_t> &cAV) const;
     void set_subfolders(const std::vector<uint64_t> &subfolders);
+
+    const bool &get_shard() const;
+    void set_shard(const bool shard);
+    const uint64_t &get_chunk_shape(const uint64_t &index) const;
+    void set_chunk_shape(const std::vector<uint64_t> &chunk_shape);
+    const uint64_t &get_numShards() const;
+    const uint64_t &get_numChunksPerShard() const;
+    const std::string chunkNameToShardName(const std::string &chunkName) const;
+
+    const std::vector<uint64_t> chunkToShard(const std::vector<uint64_t> &cAV) const;
+    const uint64_t get_ShardPosition(const std::vector<uint64_t> &cAV) const;
+
+    const uint64_t get_chunkShardPosition(const std::vector<uint64_t> &cAV) const;
+
+
     const std::vector<uint64_t> get_chunkAxisVals(const std::string &fileName) const;
     void set_chunkInfo(const std::vector<uint64_t> &startCoords,
                              const std::vector<uint64_t> &endCoords);
@@ -47,8 +62,10 @@ public:
     const std::string &get_errString() const;
     void set_errString(const std::string &errString);
 private:
+    const uint64_t dtypeBytes() const;
     void set_jsonValues();
     void write_jsonValues();
+    void set_shardData();
     uint64_t fastCeilDiv(uint64_t num, uint64_t denom);
     void createSubfolders();
     std::string fileName;
@@ -67,6 +84,14 @@ private:
     std::vector<uint64_t> shape;
     uint64_t zarr_format;
     std::vector<uint64_t> subfolders;
+    
+    // Sharding
+    bool shard;
+    std::vector<uint64_t> chunk_shape;
+    std::vector<uint64_t> chunksPerShard;
+    std::vector<uint64_t> shards;
+    uint64_t numShards;
+    uint64_t numChunksPerShard;
 
     std::vector<std::string> chunkNames;
     uint64_t numChunks;

@@ -19,7 +19,8 @@ zarr::zarr() :
 fileName(""), chunks({256,256,256}), blocksize(0),
 clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
 dimension_separator("."), fill_value(0), filters({}), order("F"), 
-shape({0,0,0}), zarr_format(2), subfolders({0,0,0})
+shape({0,0,0}), zarr_format(2), subfolders({0,0,0}), shard(false),
+chunk_shape({1,1,1})
 {
     set_jsonValues();
 }
@@ -28,7 +29,7 @@ zarr::zarr(const std::string &fileName) :
 fileName(fileName), chunks({256,256,256}), blocksize(0),
 clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
 fill_value(0), filters({}), order("F"), shape({0,0,0}),
-zarr_format(2), subfolders({0,0,0})
+zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
 {
     if(!fileExists(fileName+"/.zarray")){
         throw std::string("metadataFileMissing:"+fileName);
@@ -38,6 +39,18 @@ zarr_format(2), subfolders({0,0,0})
     zarray = json::parse(f);
 
     try{
+        // Check for Sharding
+        // Sharding should be false by default
+        try{
+            // Assuming the shard info is at the beginning for now
+            if(zarray.at("codecs").at(0).at("name") == "sharding_indexed"){
+                chunk_shape = zarray.at("codecs").at(0).at("configuration").at("chunk_shape").get<std::vector<uint64_t>>();
+                shard = true;
+            }
+        }
+        catch(...){
+
+        }
         chunks = zarray.at("chunks").get<std::vector<uint64_t>>();
         try{
             // Try blosc compression types
@@ -191,6 +204,15 @@ void zarr::set_shape(const std::vector<uint64_t> &shape){
     this->shape = shape;
 }
 
+const uint64_t zarr::dtypeBytes() const{
+    if(dtype.size() != 3) return 0;
+    else if(dtype[2] == '1') return 1;
+    else if(dtype[2] == '2') return 2;
+    else if(dtype[2] == '4') return 4;
+    else if(dtype[2] == '8') return 8;
+    else return 0;
+}
+
 // Set the values of the JSON file to the current member values
 void zarr::set_jsonValues(){
     zarray.clear();
@@ -209,6 +231,9 @@ void zarr::set_jsonValues(){
     }
     else throw std::string("unsupportedCompressor"); 
         //mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname.c_str());
+    
+    // dimension_separator only if dimension_separator is "/"
+    if(dimension_separator == "/") zarray["dimension_separator"] = dimension_separator;
 
     // filters null for now
     zarray["dtype"] = dtype;
@@ -221,6 +246,39 @@ void zarr::set_jsonValues(){
     zarray["zarr_format"] = 2;
 
     zarray["subfolders"] = subfolders;
+
+    // Sharding
+    if(shard){
+        // Create the inner JSON objects
+        json innerConfig;
+        json innerCodec;
+        json innerCodecConfig;
+
+        // Set the inner JSON values
+        // blosc
+        if(cname == "lz4" || cname == "blosclz" || cname == "lz4hc" || cname == "zlib" || cname == "zstd"){
+            innerCodec["name"] = id;
+            innerCodecConfig["cname"] = cname;
+            innerCodecConfig["clevel"] = clevel;
+            innerCodecConfig["shuffle"] = "shuffle";
+            innerCodecConfig["typesize"] = dtypeBytes();
+            innerCodecConfig["blocksize"] = blocksize;
+        }
+        // gzip
+        else if(cname == "gzip"){
+            innerCodec["name"] = cname;
+            innerCodecConfig["level"] = clevel;
+        }
+
+        innerCodec["configuration"] = innerCodecConfig;
+
+        innerConfig["chunk_shape"] = chunk_shape;
+        innerConfig["codecs"] = {innerCodec};
+        
+        // codecs is an array of json objects
+        zarray["codecs"] = {{{"name", "sharding_indexed"}, 
+                            {"configuration", innerConfig}}};
+    }
 }
 
 // Write the current JSON to disk
@@ -264,6 +322,60 @@ void zarr::set_subfolders(const std::vector<uint64_t> &subfolders){
     zarray["subfolders"] = subfolders;
 }
 
+void zarr::set_shardData(){
+    uint64_t prod = 1;
+    /*
+    uint64_t ind = 0;
+    for (const uint64_t& i : chunk_shape){
+        prod *= chunks[ind]/i;
+        ind++;
+    }
+    */
+    //numChunksPerShard = prod;
+    shards = std::vector<uint64_t>(3);
+    chunksPerShard = std::vector<uint64_t>(3);
+    for(uint64_t i = 0; i < 3; i++){
+        chunksPerShard[i] = fastCeilDiv(chunks[i],chunk_shape[i]);
+        shards[i] = ceil((double)shape[i]/(double)chunks[i]);
+        //shards[i] = ceil((((double)shape[i]/(double)chunks[i])/((double)chunks[i]/(double)chunk_shape[i])));
+        //std::cout << "shards: " << shards[i] << std::endl;
+        //fflush(stdout);
+    }
+    prod = 1;
+    for (const auto& i : shards)
+        prod *= i;
+    numShards = prod;
+    // TESTING
+    numChunksPerShard = fastCeilDiv(chunks[0],chunk_shape[0])*fastCeilDiv(chunks[1],chunk_shape[1])*fastCeilDiv(chunks[2],chunk_shape[2]);
+    //if(numShards) numChunksPerShard = fastCeilDiv(numChunks,numShards);//numChunks/numShards;//
+    //else numChunksPerShard = 0;
+}
+
+const bool &zarr::get_shard() const{
+    return shard;
+}
+
+void zarr::set_shard(const bool shard){
+    this->shard = shard;
+}
+
+const uint64_t &zarr::get_chunk_shape(const uint64_t &index) const{
+    return chunk_shape[index];
+}
+
+void zarr::set_chunk_shape(const std::vector<uint64_t> &chunk_shape){
+    this->chunk_shape = chunk_shape;
+    set_shardData();
+}
+
+const uint64_t &zarr::get_numShards() const{
+    return numShards;
+}
+
+const uint64_t &zarr::get_numChunksPerShard() const{
+    return numChunksPerShard;
+}
+
 // Fast ceiling for the subfolder function
 uint64_t zarr::fastCeilDiv(uint64_t num, uint64_t denom){
     return 1 + ((num - 1) / denom);
@@ -279,9 +391,19 @@ void zarr::createSubfolders(){
         return;
     }
 
-    std::vector<uint64_t> nChunks = {fastCeilDiv(shape[0],chunks[0]),
-                                     fastCeilDiv(shape[1],chunks[1]),
-                                     fastCeilDiv(shape[2],chunks[2])};
+    std::vector<uint64_t> nChunks;
+    if(!shard){
+        nChunks = {fastCeilDiv(shape[0],chunks[0]),
+                   fastCeilDiv(shape[1],chunks[1]),
+                   fastCeilDiv(shape[2],chunks[2])};
+    }
+    else{
+        set_shardData();
+        // Use shards instead
+        nChunks = {shards[0],
+                   shards[1],
+                   shards[2]};
+    }
     std::vector<uint64_t> nSubfolders = {1,1,1};
     for(uint64_t i = 0; i < nSubfolders.size(); i++){
         if(subfolders[i] > 0){
@@ -302,6 +424,56 @@ void zarr::createSubfolders(){
     }
 }
 
+const std::string zarr::chunkNameToShardName(const std::string &chunkName) const{
+    std::vector<uint64_t> cAV = get_chunkAxisVals(chunkName);
+    /*
+    return std::to_string(cAV[0]/(uint64_t)ceil((double)chunks[0]/(double)chunk_shape[0]))+
+                        dimension_separator+std::to_string(cAV[1]/(uint64_t)ceil((double)chunks[1]/(double)chunk_shape[1]))+
+                        dimension_separator+std::to_string(cAV[2]/(uint64_t)ceil((double)chunks[2]/(double)chunk_shape[2]));
+    */
+    return std::to_string(cAV[0]/chunksPerShard[0])+
+                          dimension_separator+std::to_string(cAV[1]/chunksPerShard[1])+
+                          dimension_separator+std::to_string(cAV[2]/chunksPerShard[2]);
+}
+
+const std::vector<uint64_t> zarr::chunkToShard(const std::vector<uint64_t> &cAV) const{
+    uint64_t x = ceil((double)cAV[0]/ceil((double)chunks[0]/(double)chunk_shape[0]));
+    if(x) x--;
+    uint64_t y = ceil((double)cAV[1]/ceil((double)chunks[1]/(double)chunk_shape[1]));
+    if(y) y--;
+    uint64_t z = ceil((double)cAV[2]/ceil((double)chunks[2]/(double)chunk_shape[2]));
+    if(z) z--;
+
+    return {x,y,z};
+            //cAV[1]/(uint64_t)ceil((double)chunks[1]/(double)chunk_shape[1]),
+            //cAV[2]/(uint64_t)ceil((double)chunks[2]/(double)chunk_shape[2])};
+}
+
+const uint64_t zarr::get_ShardPosition(const std::vector<uint64_t> &cAV) const{
+    return (cAV[0]*(shards[1]*shards[2]))+(cAV[1]*shards[2])+cAV[2];
+}
+
+const uint64_t zarr::get_chunkShardPosition(const std::vector<uint64_t> &cAV) const{
+    //uint64_t shardX = cAV[0] % shards[0];
+    //uint64_t shardY = cAV[1] % shards[1];
+    //uint64_t shardZ = cAV[2] % shards[2];
+    //chunksPerShard
+    //uint64_t shardX = cAV[0] / chunksPerShard[0];
+    //uint64_t shardY = cAV[1] / chunksPerShard[1];
+    //uint64_t shardZ = cAV[2] / chunksPerShard[2];
+
+    //uint64_t chunksPerShardRow = chunksPerShard[0] * chunksPerShard[1];
+
+    //uint64_t position = (cAV[0] % chunksPerShard[0]) + (cAV[1] % chunksPerShard[1]) * chunksPerShard[0] + (cAV[2] % chunksPerShard[2]) * chunksPerShardRow;
+    return (cAV[2]%chunksPerShard[2]) + ((cAV[1]%chunksPerShard[1])*chunksPerShard[2]) + ((cAV[0]%chunksPerShard[0])*chunksPerShard[2]*chunksPerShard[1]);
+
+
+    //return position;
+
+    //return (shardZ * (shards[0] * shards[1]) + shardY * shards[0] + shardX)%numChunksPerShard;
+    //return shardX * (shards[1] * shards[2]) + shardY * shards[2] + shardZ;
+}
+
 const std::vector<uint64_t> zarr::get_chunkAxisVals(const std::string &fileName) const{
     std::vector<uint64_t> cAV(3);
     char* ptr;
@@ -316,38 +488,202 @@ const std::vector<uint64_t> zarr::get_chunkAxisVals(const std::string &fileName)
 void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
                          const std::vector<uint64_t> &endCoords)
 {
+    //std::cout << xChunks << yChunks << zChunks << " numChunks: " << numChunks << std::endl;
+    
+    // Defualt behavior for when chunks are not sharded
+    if(!shard){
+        uint64_t xStartAligned = startCoords[0]-(startCoords[0]%chunks[0]);
+        uint64_t yStartAligned = startCoords[1]-(startCoords[1]%chunks[1]);
+        uint64_t zStartAligned = startCoords[2]-(startCoords[2]%chunks[2]);
+        uint64_t xStartChunk = (xStartAligned/chunks[0]);
+        uint64_t yStartChunk = (yStartAligned/chunks[1]);
+        uint64_t zStartChunk = (zStartAligned/chunks[2]);
+    
+        uint64_t xEndAligned = endCoords[0];
+        uint64_t yEndAligned = endCoords[1];
+        uint64_t zEndAligned = endCoords[2];
+    
+        if(xEndAligned%chunks[0]) xEndAligned = endCoords[0]-(endCoords[0]%chunks[0])+chunks[0];
+        if(yEndAligned%chunks[1]) yEndAligned = endCoords[1]-(endCoords[1]%chunks[1])+chunks[1];
+        if(zEndAligned%chunks[2]) zEndAligned = endCoords[2]-(endCoords[2]%chunks[2])+chunks[2];
+        uint64_t xEndChunk = (xEndAligned/chunks[0]);
+        uint64_t yEndChunk = (yEndAligned/chunks[1]);
+        uint64_t zEndChunk = (zEndAligned/chunks[2]);
+    
+        uint64_t xChunks = (xEndChunk-xStartChunk);
+        uint64_t yChunks = (yEndChunk-yStartChunk);
+        uint64_t zChunks = (zEndChunk-zStartChunk);
+        numChunks = xChunks*yChunks*zChunks;
 
-    uint64_t xStartAligned = startCoords[0]-(startCoords[0]%chunks[0]);
-    uint64_t yStartAligned = startCoords[1]-(startCoords[1]%chunks[1]);
-    uint64_t zStartAligned = startCoords[2]-(startCoords[2]%chunks[2]);
-    uint64_t xStartChunk = (xStartAligned/chunks[0]);
-    uint64_t yStartChunk = (yStartAligned/chunks[1]);
-    uint64_t zStartChunk = (zStartAligned/chunks[2]);
-
-    uint64_t xEndAligned = endCoords[0];
-    uint64_t yEndAligned = endCoords[1];
-    uint64_t zEndAligned = endCoords[2];
-
-    if(xEndAligned%chunks[0]) xEndAligned = endCoords[0]-(endCoords[0]%chunks[0])+chunks[0];
-    if(yEndAligned%chunks[1]) yEndAligned = endCoords[1]-(endCoords[1]%chunks[1])+chunks[1];
-    if(zEndAligned%chunks[2]) zEndAligned = endCoords[2]-(endCoords[2]%chunks[2])+chunks[2];
-    uint64_t xEndChunk = (xEndAligned/chunks[0]);
-    uint64_t yEndChunk = (yEndAligned/chunks[1]);
-    uint64_t zEndChunk = (zEndAligned/chunks[2]);
-
-    uint64_t xChunks = (xEndChunk-xStartChunk);
-    uint64_t yChunks = (yEndChunk-yStartChunk);
-    uint64_t zChunks = (zEndChunk-zStartChunk);
-    numChunks = xChunks*yChunks*zChunks;
-    chunkNames = std::vector<std::string>(numChunks);
-    #pragma omp parallel for collapse(3)
-    for(uint64_t x = xStartChunk; x < xEndChunk; x++){
-        for(uint64_t y = yStartChunk; y < yEndChunk; y++){
-            for(uint64_t z = zStartChunk; z < zEndChunk; z++){
-                uint64_t currFile = (z-zStartChunk)+((y-yStartChunk)*zChunks)+((x-xStartChunk)*yChunks*zChunks);
-                chunkNames[currFile] = std::to_string(x)+dimension_separator+std::to_string(y)+dimension_separator+std::to_string(z);
+        chunkNames = std::vector<std::string>(numChunks);
+        #pragma omp parallel for collapse(3)
+        for(uint64_t x = xStartChunk; x < xEndChunk; x++){
+            for(uint64_t y = yStartChunk; y < yEndChunk; y++){
+                for(uint64_t z = zStartChunk; z < zEndChunk; z++){
+                    uint64_t currFile = (z-zStartChunk)+((y-yStartChunk)*zChunks)+((x-xStartChunk)*yChunks*zChunks);
+                    chunkNames[currFile] = std::to_string(x)+dimension_separator+std::to_string(y)+dimension_separator+std::to_string(z);
+                }
             }
         }
+    }
+    // Sharding
+    else{
+        
+
+        uint64_t xStartAligned = startCoords[0]-(startCoords[0]%chunks[0]);
+        uint64_t yStartAligned = startCoords[1]-(startCoords[1]%chunks[1]);
+        uint64_t zStartAligned = startCoords[2]-(startCoords[2]%chunks[2]);
+        uint64_t xStartChunk = (xStartAligned/chunks[0]);
+        uint64_t yStartChunk = (yStartAligned/chunks[1]);
+        uint64_t zStartChunk = (zStartAligned/chunks[2]);
+    
+        uint64_t xEndAligned = endCoords[0];
+        uint64_t yEndAligned = endCoords[1];
+        uint64_t zEndAligned = endCoords[2];
+    
+        if(xEndAligned%chunks[0]) xEndAligned = endCoords[0]-(endCoords[0]%chunks[0])+chunks[0];
+        if(yEndAligned%chunks[1]) yEndAligned = endCoords[1]-(endCoords[1]%chunks[1])+chunks[1];
+        if(zEndAligned%chunks[2]) zEndAligned = endCoords[2]-(endCoords[2]%chunks[2])+chunks[2];
+        uint64_t xEndChunk = (xEndAligned/chunks[0]);
+        uint64_t yEndChunk = (yEndAligned/chunks[1]);
+        uint64_t zEndChunk = (zEndAligned/chunks[2]);
+    
+        uint64_t xChunks = (xEndChunk-xStartChunk);
+        uint64_t yChunks = (yEndChunk-yStartChunk);
+        uint64_t zChunks = (zEndChunk-zStartChunk);
+        numChunks = xChunks*yChunks*zChunks;
+        
+        //chunkNames = std::vector<std::string>(numChunks);
+
+        set_shardData();
+        numChunks = chunk_shape[0]*chunk_shape[1]*chunk_shape[2];
+        //std::cout << xEndChunk << " " << yEndChunk << " " << zEndChunk << std::endl;
+
+        //std::cout << "Start shard: " << chunkToShard(startCoords)[0] << chunkToShard(startCoords)[1] << chunkToShard(startCoords)[2] << std::endl;
+        //std::cout << "end shard: " << chunkToShard({xEndChunk,yEndChunk,zEndChunk})[0] << " " << chunkToShard({xEndChunk,yEndChunk,zEndChunk})[1] << " " << chunkToShard({xEndChunk,yEndChunk,zEndChunk})[2] << std::endl;
+        
+        //std::cout << "Start shard: " << get_ShardPosition(chunkToShard({xStartChunk,yStartChunk,zStartChunk})) << std::endl;
+        //std::cout << "End shard: " << get_ShardPosition(chunkToShard({xEndChunk,yEndChunk,zEndChunk})) << std::endl;
+        //std::cout << "Start shard: " << get_chunkShardPosition(startCoords) << std::endl;
+        //std::cout << "end shard: " << get_chunkShardPosition(endCoords) << std::endl;
+        //uint64_t startShard = get_ShardPosition(chunkToShard({xStartChunk,yStartChunk,zStartChunk}));
+        //uint64_t endShard = get_ShardPosition(chunkToShard({xEndChunk,yEndChunk,zEndChunk}));
+
+        //std::vector<uint64_t> startShard = chunkToShard({xStartChunk,yStartChunk,zStartChunk});
+        //std::vector<uint64_t> endShard = chunkToShard({xEndChunk,yEndChunk,zEndChunk});
+        std::vector<uint64_t> startShard = {xStartChunk,yStartChunk,zStartChunk};
+        std::vector<uint64_t> endShard = {xEndChunk,yEndChunk,zEndChunk};
+        //std::cout << "xyz: " << startShard[0] << " " << startShard[1] << " " << startShard[2] << std::endl;
+        //std::cout << "xyz: " << endShard[0] << " " << endShard[1] << " " << endShard[2] << std::endl;
+        uint64_t numShardsI = (endShard[0]-startShard[0])*(endShard[1]-startShard[1])*(endShard[2]-startShard[2])*numChunksPerShard;
+        numChunks = numShardsI;
+
+        //chunkNames = std::vector<std::string>(numChunks);
+        //std::cout << numShardsI << std::endl;
+        chunkNames = std::vector<std::string>(numShardsI);
+        //chunkNames = std::vector<std::string>(100000);
+        //TESTING
+        //uint64_t xDiv = (uint64_t)ceil((double)chunks[0]/(double)chunk_shape[0]);
+        //uint64_t yDiv = (uint64_t)ceil((double)chunks[1]/(double)chunk_shape[1]);
+        //uint64_t zDiv = (uint64_t)ceil((double)chunks[2]/(double)chunk_shape[2]);
+        //std::cout << numShardsI << std::endl;
+        //std::cout << xDiv << " " << yDiv << " " << zDiv << std::endl;
+        // Add parallel later
+        uint64_t currFile = 0;
+        
+        for(uint64_t x = startShard[0]; x < endShard[0]; x++){
+            for(uint64_t y = startShard[1]; y < endShard[1]; y++){
+                for(uint64_t z = startShard[2]; z < endShard[2]; z++){
+        //for (uint64_t s = 0; s <= numShardsC; s++) {
+
+        //for (uint64_t s = 0; s < 1; s++) {
+            //uint64_t shardX = s % shards[0];
+            //uint64_t shardY = (s / shards[0]) % shards[1];
+            //uint64_t shardZ = (s / (shards[0] * shards[1])) % shards[2];
+
+            //std::cout << "xChunks: "<< xEndChunk << " " << xStartChunk << std::endl;
+            //std::cout << "yChunks: "<< yEndChunk << " " << yStartChunk << std::endl;
+            //std::cout << "zChunks: "<< zEndChunk << " " << zStartChunk << std::endl;
+            /*
+            uint64_t xStart = shardX * (xEndChunk - xStartChunk) / shards[0] + xStartChunk;
+            uint64_t xEnd = (shardX + 1) * (xEndChunk - xStartChunk) / shards[0] + xStartChunk;
+        
+            uint64_t yStart = shardY * (yEndChunk - yStartChunk) / shards[1] + yStartChunk;
+            uint64_t yEnd = (shardY + 1) * (yEndChunk - yStartChunk) / shards[1] + yStartChunk;
+        
+            uint64_t zStart = shardZ * (zEndChunk - zStartChunk) / shards[2] + zStartChunk;
+            uint64_t zEnd = (shardZ + 1) * (zEndChunk - zStartChunk) / shards[2] + zStartChunk;
+            */
+            /*
+            uint64_t xStart = shardX * fastCeilDiv((xEndChunk - xStartChunk),shards[0]) + xStartChunk;
+            uint64_t xEnd = (shardX + 1) * fastCeilDiv((xEndChunk - xStartChunk),shards[0]) + xStartChunk;
+        
+            uint64_t yStart = shardY * fastCeilDiv((yEndChunk - yStartChunk),shards[1]) + yStartChunk;
+            uint64_t yEnd = (shardY + 1) * fastCeilDiv((yEndChunk - yStartChunk),shards[1]) + yStartChunk;
+        
+            uint64_t zStart = shardZ * fastCeilDiv((zEndChunk - zStartChunk),shards[2]) + zStartChunk;
+            uint64_t zEnd = (shardZ + 1) * fastCeilDiv((zEndChunk - zStartChunk),shards[2]) + zStartChunk;
+            */
+            uint64_t xStart = x * fastCeilDiv(chunks[0],chunk_shape[0]);
+            uint64_t xEnd = (x + 1) * fastCeilDiv(chunks[0],chunk_shape[0]);
+        
+            uint64_t yStart = y * fastCeilDiv(chunks[1],chunk_shape[1]);
+            uint64_t yEnd = (y + 1) * fastCeilDiv(chunks[1],chunk_shape[1]);
+        
+            uint64_t zStart = z * fastCeilDiv(chunks[2],chunk_shape[2]);
+            uint64_t zEnd = (z + 1) * fastCeilDiv(chunks[2],chunk_shape[2]);
+
+            //std::cout << "xChunks: " << xEnd << " " << xStart << std::endl;
+            //std::cout << "yChunks: " << yEnd << " " << yStart << std::endl;
+            //std::cout << "zChunks: " << zEnd << " " << zStart << std::endl;
+
+            uint64_t counter = 0;
+            for (uint64_t xI = xStart; xI < xEnd; xI++) {
+                //if(x == xEndChunk) break;
+                for (uint64_t yI = yStart; yI < yEnd; yI++) {
+                    //if(y == yEndChunk) break;
+                    for (uint64_t zI = zStart; zI < zEnd; zI++) {
+                        //if(x == xEndChunk) break;
+                        //if(currFile > numChunks) return;
+                        //uint64_t currFile = (z-zStartChunk)+((y-yStartChunk)*zChunks)+((x-xStartChunk)*yChunks*zChunks);
+                        chunkNames[currFile] = std::to_string(xI)+dimension_separator+std::to_string(yI)+dimension_separator+std::to_string(zI);
+                        //std::cout << std::to_string(x) + dimension_separator + std::to_string(y) + dimension_separator + std::to_string(z) << std::endl;
+                        //fflush(stdout);
+                        //std::cout << currFile << " " << chunkNames[currFile] << " " << chunkNameToShardName(chunkNames[currFile]) << " " << get_chunkShardPosition(get_chunkAxisVals(chunkNames[currFile])) << std::endl;
+                        currFile++;
+                        counter++;
+                    }
+                }
+            }
+                }
+            }
+        }
+            //std::cout << "counter: " << counter << std::endl;
+        //}
+        /*+((zChunks/shards[2]))*/
+        /*
+        for(uint64_t s = 0; s < numShards; s++){
+            for(uint64_t x = xStartChunk/shards[0]; x < xEndChunk/shards[0]; x++){
+                for(uint64_t y = yStartChunk/shards[1]; y < yEndChunk/shards[1]; y++){
+                    for(uint64_t z = zStartChunk/shards[2]; z < fastCeilDiv(zEndChunk,shards[2]); z++){
+                        std::cout << std::to_string(x)+dimension_separator+std::to_string(y)+dimension_separator+std::to_string(z) << std::endl;
+                        fflush(stdout);
+                    }
+                }
+            }
+        }
+        */
+        /*
+        #pragma omp parallel for collapse(3)
+        for(uint64_t x = xStartChunk; x < xEndChunk; x++){
+            for(uint64_t y = yStartChunk; y < yEndChunk; y++){
+                for(uint64_t z = zStartChunk; z < zEndChunk; z++){
+                    uint64_t currFile = (z-zStartChunk)+((y-yStartChunk)*zChunks)+((x-xStartChunk)*yChunks*zChunks);
+                    chunkNames[currFile] = std::to_string(x)+dimension_separator+std::to_string(y)+dimension_separator+std::to_string(z);
+                }
+            }
+        }
+        */
     }
 }
 
