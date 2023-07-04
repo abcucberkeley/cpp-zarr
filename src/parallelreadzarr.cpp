@@ -7,7 +7,6 @@
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "zlib.h"
-#include <iostream>
 
 // zarrArr should be initialized to all zeros if you have empty chunks
 uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
@@ -69,16 +68,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     int err = 0;
     std::string errString;
 
-
-    //std::cout << "numShards: " << Zarr.get_numShards() << std::endl;
-    //return 1;
     #pragma omp parallel for
     for(int32_t w = 0; w < numWorkers; w++){
-        //void* bufferDest = malloc(sB);
-        //void* buffer = malloc(sB);
         void* bufferDest = operator new(sB);
-        std::streamsize lastFileLen = 0;
         void* buffer = NULL;
+        std::streamsize lastFileLen = 0;
         int64_t dsize = -1;
         int uncErr = 0;
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
@@ -127,9 +121,6 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     
                     file.seekg(-(int64_t)(((Zarr.get_numChunksPerShard()*2*sizeof(uint64_t))+4)-(currChunkShardPosition*2*sizeof(uint64_t))), std::ios::end);
                     file.read(reinterpret_cast<char*>(offsetNBytes), sizeof(offsetNBytes));
-                    //std::cout << "Pos: " << -(int64_t)(((Zarr.get_numChunksPerShard()*2*sizeof(uint64_t))+4)-(currChunkShardPosition*2*sizeof(uint64_t))) << std::endl;
-                    //std::cout << "Chunk: " << Zarr.get_chunkNames(f) << " ChunkConv: " << Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)) << " currChunkShardPosition: " << currChunkShardPosition << std::endl;
-                    //std::cout << "offset: " << offsetNBytes[0] << " nBytes: " <<  offsetNBytes[1] << std::endl;
                     // All zeros or skippable chunk
                     if(offsetNBytes[0]== std::numeric_limits<uint64_t>::max() &&
                        offsetNBytes[1] == std::numeric_limits<uint64_t>::max()){
@@ -146,11 +137,6 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     file.read(reinterpret_cast<char*>(buffer), fileLen);
 
                     file.close();
-                    //std::cout << "Pos: " << -(int64_t)(((Zarr.get_numChunksPerShard()*2*sizeof(uint64_t))+4)-(currChunkShardPosition*2*sizeof(uint64_t))) << std::endl;
-                    //std::cout << "Chunk: " << Zarr.get_chunkNames(f) << " ChunkConv: " << Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)) << " currChunkShardPosition: " << currChunkShardPosition << std::endl;
-                    //std::cout << "offset: " << offsetNBytes[0] << " nBytes: " <<  offsetNBytes[1] << std::endl;
-                    //continue;
-                    //Zarr.get_chunkNames(f)
                 }
                 
                 // Decompress
@@ -165,10 +151,6 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                         dsize = blosc2_decompress_ctx(dctx, buffer, fileLen, bufferDest, sB);
                         blosc2_free_ctx(dctx);
                     }
-                    //std::cout << "dsize: " << dsize << std::endl;
-                    //std::cout << "fileLen: " << fileLen << " sB: " << sB << std::endl;
-
-
                 }
                 else{
                     dsize = sB;
@@ -300,8 +282,6 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         }
         operator delete(bufferDest);
         operator delete(buffer);
-        //free(bufferDest);
-        //free(buffer);
     }
     if(!useCtx){
         blosc2_destroy();
@@ -310,6 +290,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
 
     if(err){
         Zarr.set_errString(errString);
+        free(zarrArrC);
         return 1;
     }
     else if (Zarr.get_order() == "C"){
@@ -335,11 +316,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
             }
         }
-        
-        
         free(zarrArrC);
-
-        
     }
     return 0;
 }
