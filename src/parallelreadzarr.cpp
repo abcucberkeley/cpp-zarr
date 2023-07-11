@@ -87,9 +87,14 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             }
             else{
                 // Can change this to the check for zeros maybe
+                /*
                 bool pad = (cAV[0] >= ceil((double)readShape[0]/(double)Zarr.get_chunk_shape(0)) ||
                     cAV[1] >= ceil((double)readShape[1]/(double)Zarr.get_chunk_shape(1)) ||
                     cAV[2] >= ceil((double)readShape[2]/(double)Zarr.get_chunk_shape(2)));
+                */
+                bool pad = (cAV[0] >= ceil((double)endCoords[0]/(double)Zarr.get_chunk_shape(0)) ||
+                    cAV[1] >= ceil((double)endCoords[1]/(double)Zarr.get_chunk_shape(1)) ||
+                    cAV[2] >= ceil((double)endCoords[2]/(double)Zarr.get_chunk_shape(2)));
                 if(pad) continue;
                 fileName = Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f));
             }
@@ -121,6 +126,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     
                     file.seekg(-(int64_t)(((Zarr.get_numChunksPerShard()*2*sizeof(uint64_t))+4)-(currChunkShardPosition*2*sizeof(uint64_t))), std::ios::end);
                     file.read(reinterpret_cast<char*>(offsetNBytes), sizeof(offsetNBytes));
+                    
                     // All zeros or skippable chunk
                     if(offsetNBytes[0]== std::numeric_limits<uint64_t>::max() &&
                        offsetNBytes[1] == std::numeric_limits<uint64_t>::max()){
