@@ -3,10 +3,12 @@
 #include <omp.h>
 #include "parallelreadzarr.h"
 #include "blosc2.h"
-#include "blosc.h"
+//#include "blosc.h"
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "zlib.h"
+
+//#include <iostream>
 
 // zarrArr should be initialized to all zeros if you have empty chunks
 uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
@@ -17,7 +19,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool useCtx,
                          const bool sparse)
 {
-    void* zarrArrC = NULL;
+    //std::cout << "fileName: " << Zarr.get_fileName() << std::endl;
+    //std::cout << "startCoords: " << startCoords[0] << " " << startCoords[1] << " " << startCoords[2] << std::endl;
+    //std::cout << "endCoords: " << endCoords[0] << " " << endCoords[1] << " " << endCoords[2] << std::endl;
+    //std::cout << "readShape: " << readShape[0] << " " << readShape[1] << " " << readShape[2] << std::endl;
+    void* zarrArrC = nullptr;
     const uint64_t bytes = (bits/8);
     
     int32_t numWorkers = omp_get_max_threads();
@@ -67,7 +73,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
 
     int err = 0;
     std::string errString;
-
+    //return -1;
     #pragma omp parallel for
     for(int32_t w = 0; w < numWorkers; w++){
         void* bufferDest = operator new(sB);
@@ -92,10 +98,38 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     cAV[1] >= ceil((double)readShape[1]/(double)Zarr.get_chunk_shape(1)) ||
                     cAV[2] >= ceil((double)readShape[2]/(double)Zarr.get_chunk_shape(2)));
                 */
+                /*
                 bool pad = (cAV[0] >= ceil((double)endCoords[0]/(double)Zarr.get_chunk_shape(0)) ||
                     cAV[1] >= ceil((double)endCoords[1]/(double)Zarr.get_chunk_shape(1)) ||
-                    cAV[2] >= ceil((double)endCoords[2]/(double)Zarr.get_chunk_shape(2)));
-                if(pad) continue;
+                    cAV[2] >= ceil((double)endCoords[2]/(double)Zarr.get_chunk_shape(2)) ||
+                    cAV[0] < ceil((double)startCoords[0]/(double)Zarr.get_chunk_shape(0)) ||
+                    cAV[1] < ceil((double)startCoords[1]/(double)Zarr.get_chunk_shape(1)) ||
+                    cAV[2] < ceil((double)startCoords[2]/(double)Zarr.get_chunk_shape(2)));
+                */
+                bool pad = cAV[0] > endCoords[0]/Zarr.get_chunk_shape(0) ||
+                    cAV[1] > endCoords[1]/Zarr.get_chunk_shape(1) ||
+                    cAV[2] > endCoords[2]/Zarr.get_chunk_shape(2) ||
+                    cAV[0] < startCoords[0]/Zarr.get_chunk_shape(0) ||
+                    cAV[1] < startCoords[1]/Zarr.get_chunk_shape(1) ||
+                    cAV[2] < startCoords[2]/Zarr.get_chunk_shape(2);
+                /*
+                    std::cout <<  "cAV[0]: " << cAV[0] << " endC0: " << endCoords[0]/Zarr.get_chunk_shape(0) <<
+                        " cAV[1]: " << cAV[1] << " endC1: " << endCoords[1]/Zarr.get_chunk_shape(1) <<
+                        " cAv[2]: " << cAV[2] << " rnfC2: " << endCoords[2]/Zarr.get_chunk_shape(2) <<
+                        " startC0: " << startCoords[0]/Zarr.get_chunk_shape(0) << 
+                        " startC1: " << startCoords[1]/Zarr.get_chunk_shape(1) <<
+                        " startC2: " << startCoords[2]/Zarr.get_chunk_shape(2) << std::endl;
+                */
+                if(pad) {
+                    //std::cout << "PADDING" << std::endl;
+                    /*
+                    std::cout << "PADDING: "<< "cAV[0]: " << cAV[0] << " Zarr.get_chunks(0): " << Zarr.get_chunks(0) <<
+                        " startCoords[0]: " << startCoords[0] << " startCoords[1]: " << startCoords[1] <<
+                        " readShape[0]: " << readShape[0] << " startCoords[2]: " << startCoords[2] <<
+                        " readShape[1]: " << readShape[1] << " bytes: " << bytes << std::endl;
+                    */
+                    continue;
+                }
                 fileName = Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f));
             }
             // If we cannot open the file then set to all zeros
@@ -134,6 +168,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                         continue;
                     }
                     fileLen = offsetNBytes[1];
+                    //std::cout << "offset: " << offsetNBytes[0] << " lastFileLen: " << lastFileLen << " fileLen: " << fileLen << std::endl;
                     if(lastFileLen < fileLen){
                         operator delete(buffer);
                         buffer = operator new(fileLen);
@@ -233,6 +268,13 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             }
             
             // F->F
+            /*
+             std::cout << "cAV[0]: " << cAV[0] << " Zarr.get_chunks(0): " << Zarr.get_chunks(0) <<
+                 " startCoords[0]: " << startCoords[0] << " startCoords[1]: " << startCoords[1] <<
+                 " readShape[0]: " << readShape[0] << " startCoords[2]: " << startCoords[2] <<
+                 " readShape[1]: " << readShape[1] << " bytes: " << bytes << std::endl;
+        */
+            
             if(Zarr.get_order() == "F"){  
                 for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
                     if(y>=endCoords[1]) break;
@@ -357,7 +399,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     uint64_t readSize = readShape[0]*readShape[1]*readShape[2];
     if(Zarr.get_dtype() == "<u1"){
         uint64_t bits = 8;
-        uint8_t* zarrArr;
+        uint8_t* zarrArr = nullptr;
         if(Zarr.get_fill_value()){
             zarrArr = (uint8_t*)malloc(readSize*sizeof(uint8_t));
             memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(uint8_t));
@@ -372,7 +414,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<u2"){
         uint64_t bits = 16;
-        uint16_t* zarrArr;
+        uint16_t* zarrArr = nullptr;
         if(Zarr.get_fill_value()){
             zarrArr = (uint16_t*)malloc(readSize*(uint64_t)(sizeof(uint16_t)));
             memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(uint16_t));
@@ -387,7 +429,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<f4"){
         uint64_t bits = 32;
-        float* zarrArr;
+        float* zarrArr = nullptr;
         if(Zarr.get_fill_value()){
             zarrArr = (float*)malloc(readSize*(sizeof(float)));
             memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(float));
@@ -402,7 +444,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     }
     else if(Zarr.get_dtype() == "<f8"){
         uint64_t bits = 64;
-        double* zarrArr;
+        double* zarrArr = nullptr;
         if(Zarr.get_fill_value()){
             zarrArr = (double*)malloc(readSize*(sizeof(double)));
             memset(zarrArr,Zarr.get_fill_value(),readSize*sizeof(double));

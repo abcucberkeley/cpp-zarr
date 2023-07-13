@@ -13,6 +13,8 @@
 #include "zarr.h"
 #include "helperfunctions.h"
 
+//#include <iostream>
+
 // Create a blank zarr object with default values
 zarr::zarr() :
 fileName(""), chunks({256,256,256}), blocksize(0),
@@ -545,6 +547,8 @@ void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
         std::vector<uint64_t> endShard = {xEndChunk,yEndChunk,zEndChunk};
         uint64_t numShardsI = (endShard[0]-startShard[0])*(endShard[1]-startShard[1])*(endShard[2]-startShard[2])*numChunksPerShard;
         numChunks = numShardsI;
+        
+
 
         chunkNames = std::vector<std::string>(numShardsI);
         // Add parallel later
@@ -567,6 +571,7 @@ void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
                             for (uint64_t zI = zStart; zI < zEnd; zI++) {
                                 //uint64_t currFile = (z-zStartChunk)+((y-yStartChunk)*zChunks)+((x-xStartChunk)*yChunks*zChunks);
                                 chunkNames[currFile] = std::to_string(xI)+dimension_separator+std::to_string(yI)+dimension_separator+std::to_string(zI);
+                                //std::cout << currFile << " " << chunkNames[currFile] << " " << chunkNameToShardName(chunkNames[currFile]) << " " << get_chunkShardPosition(get_chunkAxisVals(chunkNames[currFile])) << std::endl;
                                 currFile++;
                             }
                         }
