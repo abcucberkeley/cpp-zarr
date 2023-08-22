@@ -175,9 +175,9 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                         || (((cAV[1])*Zarr.get_chunks(1)) < startCoords[1] || ((cAV[1]+1)*Zarr.get_chunks(1) > endCoords[1] && endCoords[1] < Zarr.get_shape(1)))
                         || (((cAV[2])*Zarr.get_chunks(2)) < startCoords[2] || ((cAV[2]+1)*Zarr.get_chunks(2) > endCoords[2] && endCoords[2] < Zarr.get_shape(2))))){
                 cRegion = parallelReadZarrWriteWrapper(Zarr, crop,
-                                                  {((cAV[0])*Zarr.get_chunks(0))+1,
-                                                   ((cAV[1])*Zarr.get_chunks(1))+1,
-                                                   ((cAV[2])*Zarr.get_chunks(2))+1},
+                                                  {((cAV[0])*Zarr.get_chunks(0)),
+                                                   ((cAV[1])*Zarr.get_chunks(1)),
+                                                   ((cAV[2])*Zarr.get_chunks(2))},
                                                   {(cAV[0]+1)*Zarr.get_chunks(0),
                                                    (cAV[1]+1)*Zarr.get_chunks(1),
                                                    (cAV[2]+1)*Zarr.get_chunks(2)});

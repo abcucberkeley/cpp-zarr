@@ -383,11 +383,6 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
         endCoords[1] = Zarr.get_shape(1);
         endCoords[2] = Zarr.get_shape(2);
     }
-    else{
-        startCoords[0]--;
-        startCoords[1]--;
-        startCoords[2]--;
-    }
 
     
     std::vector<uint64_t> readShape = {endCoords[0]-startCoords[0],
@@ -461,3 +456,39 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
         return NULL;
     }
 }
+
+void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t startY, uint64_t startZ, uint64_t endX, uint64_t endY, uint64_t endZ, uint8_t imageJIm){
+	zarr Zarr(folderName);	
+	void* zarrArr = malloc(dim[0]*dim[1]*dim[2]*(bits/8));
+    parallelReadZarr(zarr,folderName,startX,startY,startZ,endX,endY,endZ,chunkXSize,chunkYSize,chunkZSize,shapeX,shapeY,shapeZ,bits,order,cname);
+    // May need to add a check for if the data is f order or c order for ImageJ
+    // For the c order images I have tested, we also have to do this flip for now
+    if(imageJIm /*&& (order == 'F' || order == 'f')*/){
+        void* zarrC = malloc(dim[0]*dim[1]*dim[2]*(bits/8));
+        #pragma omp parallel for
+        for(uint64_t k = 0; k < dim[2]; k++){
+            for(uint64_t j = 0; j < dim[1]; j++){
+                for(uint64_t i = 0; i < dim[0]; i++){
+                    switch(bits){
+                        case 8:
+                            ((uint8_t*)zarrC)[j+(i*dim[1])+(k*dim[1]*dim[0])] = ((uint8_t*)zarr)[i+(j*dim[0])+(k*dim[1]*dim[0])];
+                            break;
+                        case 16:
+                            ((uint16_t*)zarrC)[j+(i*dim[1])+(k*dim[1]*dim[0])] = ((uint16_t*)zarr)[i+(j*dim[0])+(k*dim[1]*dim[0])];
+                            break;
+                        case 32:
+                            ((float*)zarrC)[j+(i*dim[1])+(k*dim[1]*dim[0])] = ((float*)zarr)[i+(j*dim[0])+(k*dim[1]*dim[0])];
+                            break;
+                        case 64:
+                            ((double*)zarrC)[j+(i*dim[1])+(k*dim[1]*dim[0])] = ((double*)zarr)[i+(j*dim[0])+(k*dim[1]*dim[0])];
+                            break;
+                    }
+                }
+            }
+        }
+        free(zarr);
+        return zarrC;
+    }
+    return zarr;
+}
+

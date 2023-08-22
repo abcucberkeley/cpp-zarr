@@ -61,8 +61,8 @@ public:
     const uint64_t &get_numChunks() const;
     const std::string &get_errString() const;
     void set_errString(const std::string &errString);
-private:
     const uint64_t dtypeBytes() const;
+private:
     void set_jsonValues();
     void write_jsonValues();
     void set_shardData();
