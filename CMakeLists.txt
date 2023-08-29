@@ -28,7 +28,7 @@ if (UNIX)
     # Build the UUID library using Autotools
     ExternalProject_Add(uuid_external
         SOURCE_DIR ${UUID_SOURCE_DIR}
-        CONFIGURE_COMMAND ${UUID_SOURCE_DIR}/configure
+        CONFIGURE_COMMAND ${UUID_SOURCE_DIR}/configure --with-pic
         BUILD_COMMAND make
         INSTALL_COMMAND ""
         BUILD_IN_SOURCE 1
@@ -64,12 +64,12 @@ set(JSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/json-3.11.2")
 add_subdirectory(${JSON_DIR})
 
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
-set(ZLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/zlib-1.2.13")
+set(ZLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/zlib-1.2.8")
 add_subdirectory(${ZLIB_DIR})
-set_property(TARGET zlibstatic_dep PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET zlibstaticCPPZARR PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 
-set(CBLOSC_INCLUDE_DIR "${CBLOSC_DIR}/include")
+set(CBLOSC_INCLUDE_DIR "${CBLOSC_DIR}/blosc")
 set(CBLOSC2_INCLUDE_DIR "${CBLOSC2_DIR}/include")
 set(JSON_INCLUDE_DIR "${JSON_DIR}/include")
 
@@ -79,7 +79,7 @@ add_library(cppZarr_shared SHARED ${SRC_DIR}/zarr.cpp ${SRC_DIR}/helperfunctions
 set_target_properties(cppZarr_shared PROPERTIES OUTPUT_NAME cppZarr)
 add_dependencies(cppZarr_shared blosc_static)
 add_dependencies(cppZarr_shared blosc2_static)
-add_dependencies(cppZarr_shared zlibstatic_dep)
+add_dependencies(cppZarr_shared zlibstaticCPPZARR)
 add_dependencies(cppZarr_shared uuid_external)
 
 #add_library(cppZarrStatic STATIC ${SRC_DIR}/zarr.cpp ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/parallelreadzarr.cpp ${SRC_DIR}/parallelwritezarr.cpp)
@@ -90,6 +90,11 @@ if(UNIX)
     target_include_directories(cppZarr_shared PRIVATE ${source_dir}/include)
     target_link_libraries(cppZarr_shared PRIVATE ${binary_dir}/.libs/libuuid.a)
 endif()
+
+#message(NOTICE "${CBLOSC_INCLUDE_DIR}")
+#message(NOTICE "${CBLOSC2_INCLUDE_DIR}")
+#message(NOTICE "${JSON_INCLUDE_DIR}")
+#message(NOTICE "${ZLIB_DIR}")
 
 # Include the header files from blosc, blosc2, and json
 target_include_directories(cppZarr_shared PRIVATE
@@ -109,10 +114,10 @@ target_include_directories(cppZarr_shared PRIVATE
 
 # Link against the blosc and blosc2 libraries
 target_link_libraries(cppZarr_shared PRIVATE
-    "-Wl,--allow-multiple-definition"  
-    ${CMAKE_BINARY_DIR}/dependencies/c-blosc-1.21.0/blosc/libblosc.a
+    #"-Wl,--allow-multiple-definition"  
     ${CMAKE_BINARY_DIR}/dependencies/c-blosc2-2.8.0/blosc/libblosc2.a
-    ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.13/libz.a
+    ${CMAKE_BINARY_DIR}/dependencies/c-blosc-1.21.0/blosc/libblosc.a
+    ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/libz.a
     -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX
