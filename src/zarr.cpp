@@ -105,11 +105,12 @@ zarr::zarr(const std::string &fileName, const std::vector<uint64_t> &chunks,
            const std::string &id, uint64_t shuffle, const std::string &dimension_separator, const std::string &dtype,
            const int64_t &fill_value, const std::vector<std::string> &filters,
            const std::string &order, const std::vector<uint64_t> &shape,
-           uint64_t zarr_format, const std::vector<uint64_t> subfolders) :
+           uint64_t zarr_format, const std::vector<uint64_t> &subfolders,
+		   const bool shard, const std::vector<uint64_t> &chunk_shape) :
 fileName(fileName), chunks(chunks), blocksize(blocksize), clevel(clevel),
 cname(cname), id(id), shuffle(shuffle), dimension_separator(dimension_separator),
 dtype(dtype), fill_value(fill_value), filters(filters), order(order), shape(shape),
-zarr_format(zarr_format), subfolders(subfolders)
+zarr_format(zarr_format), subfolders(subfolders), shard(shard), chunk_shape(chunk_shape)
 {
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32

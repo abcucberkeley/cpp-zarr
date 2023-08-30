@@ -16,7 +16,8 @@ public:
          const std::string &id, uint64_t shuffle, const std::string &dimension_separator, const std::string &dtype,
          const int64_t &fill_value, const std::vector<std::string> &filters,
          const std::string &order, const std::vector<uint64_t> &shape,
-         uint64_t zarr_format, const std::vector<uint64_t> subfolders);
+         uint64_t zarr_format, const std::vector<uint64_t> &subfolders,
+		 const bool shard, const std::vector<uint64_t> &chunk_shape);
     ~zarr();
     void write_zarray();
     const std::string &get_fileName() const;
