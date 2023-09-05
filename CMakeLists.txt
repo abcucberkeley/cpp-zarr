@@ -9,7 +9,7 @@ endif()
 
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 
 project(
   cpp-zarr
@@ -41,21 +41,20 @@ if (UNIX)
     #target_link_libraries(cppZarr_shared PRIVATE ${binary_dir}/.libs/libuuid.a)
 endif()
 
-
 # Add c-blosc
-set(CBLOSC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc-1.21.0")
+set(CBLOSC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc-1.21.5")
+set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CBLOSC_DIR})
 set_property(TARGET blosc_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-
-set(CBLOSC2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc2-2.8.0")
+set(CBLOSC2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc2-2.10.2")
 set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
-set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CBLOSC2_DIR})
 set_property(TARGET blosc2_static PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -113,13 +112,19 @@ target_include_directories(cppZarr_shared PRIVATE
 #    ${JSON_INCLUDE_DIR}
 #    ${ZLIB_DIR}
 #)
+ 
 
+if(UNIX)
+set(ZLIB_STATIC_NAME "libz.a")
+else()
+set(ZLIB_STATIC_NAME "libzlibstaticCPPZARR.a")
+endif()
 # Link against the blosc and blosc2 libraries
 target_link_libraries(cppZarr_shared PRIVATE
     #"-Wl,--allow-multiple-definition"  
-    ${CMAKE_BINARY_DIR}/dependencies/c-blosc2-2.8.0/blosc/libblosc2.a
-    ${CMAKE_BINARY_DIR}/dependencies/c-blosc-1.21.0/blosc/libblosc.a
-    ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/libz.a
+    ${CMAKE_BINARY_DIR}/dependencies/c-blosc2-2.10.2/blosc/libblosc2.a
+    ${CMAKE_BINARY_DIR}/dependencies/c-blosc-1.21.5/blosc/libblosc.a
+    ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME}
     -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX
