@@ -79,6 +79,12 @@ void mexFunction(int nlhs, mxArray *plhs[],
             else mexErrMsgIdAndTxt("zarr:inputError","order must be \"F\" or \"C\"\n");
             Zarr.set_order(order);
         }
+        else if(currInput == "dimension_separator"){
+            if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a string\n");
+            const std::string dimension_separator(mxArrayToString(prhs[i+1]));
+            if(dimension_separator != "." && dimension_separator != "/") mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a . or /\n");
+            Zarr.set_dimension_separator(dimension_separator);
+        }
         else if(currInput == "shape"){
             if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","shape must be an array of 3 numbers\n");
             Zarr.set_shape({(uint64_t)*(mxGetPr(prhs[i+1])),

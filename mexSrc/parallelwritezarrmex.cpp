@@ -136,6 +136,12 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(currInput == "sparse"){
             sparse = (bool)*((mxGetPr(prhs[i+1])));
         }
+        else if(currInput == "dimension_separator"){
+            if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a string\n");
+            const std::string dimension_separator(mxArrayToString(prhs[i+1]));
+            if(dimension_separator != "." && dimension_separator != "/") mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a . or /\n");
+            Zarr.set_dimension_separator(dimension_separator);
+        }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
             Currently Supported Names: uuid, bbox, cname, subfolders, chunks, chunk_shape, sparse\n",currInput.c_str());

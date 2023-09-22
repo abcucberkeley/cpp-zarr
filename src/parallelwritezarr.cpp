@@ -103,29 +103,18 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                 unWritten = true;
                 currChunk++;
                 std::vector<uint64_t> pAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
-                /*
-                bool pad = (pAV[0] >= ceil((double)endCoords[0]/(double)Zarr.get_chunk_shape(0)) ||
-                    pAV[1] >= ceil((double)endCoords[1]/(double)Zarr.get_chunk_shape(1)) ||
-                    pAV[2] >= ceil((double)endCoords[2]/(double)Zarr.get_chunk_shape(2)));
-                */
                 bool pad = pAV[0] > endCoords[0]/Zarr.get_chunk_shape(0) ||
                     pAV[1] > endCoords[1]/Zarr.get_chunk_shape(1) ||
                     pAV[2] > endCoords[2]/Zarr.get_chunk_shape(2);
                 
                 if(currChunk == Zarr.get_numChunksPerShard() || pad){
                     if(pad){
-                        /*
-                        for(uint64_t i = currChunk; i < Zarr.get_numChunksPerShard(); i++){
-                            shardFooter[i*2] = std::numeric_limits<uint64_t>::max();
-                            shardFooter[(i*2)+1] = std::numeric_limits<uint64_t>::max();
-                        }
-                        */
-                        //std::cout << "SANITY currChunk: " << currChunk << std::endl;
                         shardFooter[currChunk*2] = std::numeric_limits<uint64_t>::max();
                         shardFooter[(currChunk*2)+1] = std::numeric_limits<uint64_t>::max();
+
                         // Edge case for when we can't write because padded chunks are in the middle
                         if(currChunk != Zarr.get_numChunksPerShard()){
-                                    continue;
+                            continue;
                         }
                     }
                     unWritten = false;
@@ -135,6 +124,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     // Not sure how sharding interacts with the subfolders at the moment (cAV needs to be converted)
                     const std::string subfolderName = Zarr.get_subfoldersString(cAV);
                     std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f-1)));
+                    // Check if dimension folders exist if needed
+                    makeDimensionFolders(Zarr,fileName);
                     std::string fileNameFinal;
                     if(useUuid){
                         fileNameFinal = std::string(fileName);
@@ -426,6 +417,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             // Default write
             if(!Zarr.get_shard()){
                 std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
+                // Check if dimension folders exist if needed
+                makeDimensionFolders(Zarr,fileName);
                 std::string fileNameFinal;
                 if(useUuid){
                     fileNameFinal = std::string(fileName);
@@ -451,6 +444,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             // Sharding
             else{
                 std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
+                // Check if dimension folders exist if needed
+                makeDimensionFolders(Zarr,fileName);
                 if(useUuid){    
                     fileName.append(uuid);
                 }
@@ -522,6 +517,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             }
             const std::string subfolderName = Zarr.get_subfoldersString(cAV);
             std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
+            // Check if dimension folders exist if needed
+            makeDimensionFolders(Zarr,fileName);
             std::string fileNameFinal;
             if(useUuid){
                 fileNameFinal = std::string(fileName);

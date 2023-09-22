@@ -1,6 +1,7 @@
 #ifndef HELPERFUNCTIONS_H
 #define HELPERFUNCTIONS_H
 #include <string>
+#include "zarr.h"
 
 #ifndef _WIN32
 const char* expandTilde(const char* path);
@@ -21,4 +22,6 @@ std::string generateUUID();
 void mkdirRecursive(const char *dir);
 
 bool fileExists(const std::string &fileName);
+
+void makeDimensionFolders(const zarr &Zarr, const std::string &fileName);
 #endif

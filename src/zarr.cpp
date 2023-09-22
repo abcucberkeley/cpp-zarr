@@ -448,8 +448,6 @@ const std::vector<uint64_t> zarr::chunkToShard(const std::vector<uint64_t> &cAV)
     if(z) z--;
 
     return {x,y,z};
-            //cAV[1]/(uint64_t)ceil((double)chunks[1]/(double)chunk_shape[1]),
-            //cAV[2]/(uint64_t)ceil((double)chunks[2]/(double)chunk_shape[2])};
 }
 
 const uint64_t zarr::get_ShardPosition(const std::vector<uint64_t> &cAV) const{
@@ -457,24 +455,9 @@ const uint64_t zarr::get_ShardPosition(const std::vector<uint64_t> &cAV) const{
 }
 
 const uint64_t zarr::get_chunkShardPosition(const std::vector<uint64_t> &cAV) const{
-    //uint64_t shardX = cAV[0] % shards[0];
-    //uint64_t shardY = cAV[1] % shards[1];
-    //uint64_t shardZ = cAV[2] % shards[2];
-    //chunksPerShard
-    //uint64_t shardX = cAV[0] / chunksPerShard[0];
-    //uint64_t shardY = cAV[1] / chunksPerShard[1];
-    //uint64_t shardZ = cAV[2] / chunksPerShard[2];
-
-    //uint64_t chunksPerShardRow = chunksPerShard[0] * chunksPerShard[1];
-
-    //uint64_t position = (cAV[0] % chunksPerShard[0]) + (cAV[1] % chunksPerShard[1]) * chunksPerShard[0] + (cAV[2] % chunksPerShard[2]) * chunksPerShardRow;
-    return (cAV[2]%chunksPerShard[2]) + ((cAV[1]%chunksPerShard[1])*chunksPerShard[2]) + ((cAV[0]%chunksPerShard[0])*chunksPerShard[2]*chunksPerShard[1]);
-
-
-    //return position;
-
-    //return (shardZ * (shards[0] * shards[1]) + shardY * shards[0] + shardX)%numChunksPerShard;
-    //return shardX * (shards[1] * shards[2]) + shardY * shards[2] + shardZ;
+    return (cAV[2]%chunksPerShard[2]) +
+        ((cAV[1]%chunksPerShard[1])*chunksPerShard[2]) +
+        ((cAV[0]%chunksPerShard[0])*chunksPerShard[2]*chunksPerShard[1]);
 }
 
 const std::vector<uint64_t> zarr::get_chunkAxisVals(const std::string &fileName) const{

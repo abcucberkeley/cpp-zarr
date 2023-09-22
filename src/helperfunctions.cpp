@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <filesystem>
 #include "helperfunctions.h"
+#include "zarr.h"
 
 #ifndef _WIN32
 #include <wordexp.h>
@@ -140,4 +141,11 @@ bool fileExists(const std::string &fileName){
         return true;
     }
     else return false;
+}
+
+void makeDimensionFolders(const zarr &Zarr, const std::string &fileName){
+    if(Zarr.get_dimension_separator() == "/"){
+        size_t lastSlash = fileName.find_last_of("/");
+        mkdirRecursive(fileName.substr(0,lastSlash).c_str());
+    }
 }
