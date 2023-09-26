@@ -260,8 +260,14 @@ void zarr::set_jsonValues(){
     // zarr_format just 2 for now
     zarray["shape"] = shape;
     zarray["zarr_format"] = 2;
-
-    zarray["subfolders"] = subfolders;
+    
+    // Only add the subfolder parameter if subfolders is not all zeros
+    if(!std::all_of(subfolders.begin(),
+               subfolders.end(),
+               [](int i){return !i;})){
+        zarray["subfolders"] = subfolders;
+    }
+    
 
     // Sharding
     if(shard){
