@@ -143,9 +143,7 @@ bool fileExists(const std::string &fileName){
     else return false;
 }
 
-void makeDimensionFolders(const zarr &Zarr, const std::string &fileName){
-    if(Zarr.get_dimension_separator() == "/"){
-        size_t lastSlash = fileName.find_last_of("/");
-        mkdirRecursive(fileName.substr(0,lastSlash).c_str());
-    }
+void makeDimensionFolders(const std::string &fileName){
+    size_t lastSlash = fileName.find_last_of("/");
+    mkdirRecursive(fileName.substr(0,lastSlash).c_str());
 }

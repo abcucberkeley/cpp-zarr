@@ -124,8 +124,6 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     // Not sure how sharding interacts with the subfolders at the moment (cAV needs to be converted)
                     const std::string subfolderName = Zarr.get_subfoldersString(cAV);
                     std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f-1)));
-                    // Check if dimension folders exist if needed
-                    makeDimensionFolders(Zarr,fileName);
                     std::string fileNameFinal;
                     if(useUuid){
                         fileNameFinal = std::string(fileName);
@@ -417,8 +415,6 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             // Default write
             if(!Zarr.get_shard()){
                 std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
-                // Check if dimension folders exist if needed
-                makeDimensionFolders(Zarr,fileName);
                 std::string fileNameFinal;
                 if(useUuid){
                     fileNameFinal = std::string(fileName);
@@ -444,8 +440,6 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             // Sharding
             else{
                 std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
-                // Check if dimension folders exist if needed
-                makeDimensionFolders(Zarr,fileName);
                 if(useUuid){    
                     fileName.append(uuid);
                 }
@@ -517,8 +511,6 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             }
             const std::string subfolderName = Zarr.get_subfoldersString(cAV);
             std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
-            // Check if dimension folders exist if needed
-            makeDimensionFolders(Zarr,fileName);
             std::string fileNameFinal;
             if(useUuid){
                 fileNameFinal = std::string(fileName);

@@ -386,6 +386,14 @@ uint64_t zarr::fastCeilDiv(uint64_t num, uint64_t denom){
 
 // Create subfolder "chunks"
 void zarr::createSubfolders(){
+    // dimension_separator subfolders
+    if(dimension_separator == "/"){
+        set_chunkInfo({0,0,0},shape);
+        for(uint64_t i = 0; i < chunkNames.size(); i++){
+            makeDimensionFolders(fileName+"/"+chunkNames[i]);
+        }
+    }
+
     // If all elements are zero then we don't make subfolders
     if(std::all_of(subfolders.begin(),
                    subfolders.end(),

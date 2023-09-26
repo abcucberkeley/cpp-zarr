@@ -23,5 +23,5 @@ void mkdirRecursive(const char *dir);
 
 bool fileExists(const std::string &fileName);
 
-void makeDimensionFolders(const zarr &Zarr, const std::string &fileName);
+void makeDimensionFolders(const std::string &fileName);
 #endif
