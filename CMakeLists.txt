@@ -17,6 +17,9 @@ project(
   VERSION 1.1.1
   LANGUAGES CXX)
 
+# Set the RPATH to $ORIGIN when installing if applicable
+set(CMAKE_INSTALL_RPATH $ORIGIN)
+
 # OpenMP is Required
 find_package(OpenMP REQUIRED)
 
