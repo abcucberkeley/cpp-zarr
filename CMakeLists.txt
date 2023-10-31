@@ -24,7 +24,12 @@ set(CMAKE_INSTALL_RPATH $ORIGIN)
 find_package(OpenMP REQUIRED)
 
 if (UNIX)
-    include(ExternalProject)
+    execute_process(
+    	COMMAND tar -xf libuuid-1.0.3.tar.gz
+    	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/dependencies
+	)
+
+	include(ExternalProject)
         
     # Set the path to your Makefile.am
     set(UUID_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libuuid-1.0.3/")
