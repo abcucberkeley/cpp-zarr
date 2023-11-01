@@ -4,28 +4,49 @@ An efficient parallel Zarr reader/writer that utilizes c-blosc/c-blosc2 and Open
 ## Quick Start Guide (MATLAB)
 
 ### Prerequisites
-1. All neccessary libraries are included for the Linux, Mac, and Windows versions.
+1. All necessary libraries are included for the Linux, Mac, and Windows versions.
 
 ### Download and Install
 1. Download the latest release for your OS from here (windowsMatlab.zip/linuxMatlab.tar.gz): https://github.com/abcucberkeley/cpp-zarr/releases
 2. Unzip the folder
-3. You can now put the folders wherever you'd like and add them to your path if needed. Just keep the mex files with their associated library files so the mex function can always run.
+3. You can now put the folders wherever you'd like and add them to your path if needed. Keep the mex files with their associated library files so the mex function can always run.
 
 ### Usage
 
 #### createZarrFile - Create a custom .zarray metadata file
-% Note the created file is probably hidden by default on your system
-
+````
+% Note the created .zarray file is probably hidden by default on your system
 createZarrFile('path/to/file.zarr');
+````
 
 #### parallelReadZarr - Read a Zarr image into an array
+````
 im = parallelReadZarr('path/to/file.zarr');
+````
 
 #### parallelWriteTiff - Write an array out as a Zarr image
+````
 im = rand(100,100,100);
-
 % The third input can always be 1 to use a uuid for the written blocks
-
 % The fourth input is the size of the blocks
-
 parallelWriteZarr('path/to/file.zarr',im, 1, [256,256,256]);
+````
+
+## Compiling with CMake
+
+The C++ library can be compiled using the CMakeLists.txt file
+
+### Prerequisites
+1. Dependencies are included in the dependencies folder
+2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work
+
+### Download and Install
+````
+git clone https://github.com/abcucberkeley/cpp-zarr
+cd cpp-zarr
+mkdir build
+cd build
+cmake ..
+make -j
+make install
+````
