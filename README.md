@@ -7,9 +7,10 @@ An efficient parallel Zarr reader/writer that utilizes c-blosc/c-blosc2 and Open
 1. All necessary libraries are included for the Linux, Mac, and Windows versions.
 
 ### Download and Install
-1. Download the latest release for your OS from here (windowsMatlab.zip/linuxMatlab.tar.gz): https://github.com/abcucberkeley/cpp-zarr/releases
+1. Download the latest release for your OS from here: https://github.com/abcucberkeley/cpp-zarr/releases
 2. Unzip the folder
 3. You can now put the folders wherever you'd like and add them to your path if needed. Keep the mex files with their associated library files so the mex function can always run.
+4. Note for Mac Users: You may need to restart Matlab before using the Mex files if you have an open session
 
 ### Usage
 
