@@ -51,3 +51,9 @@ cmake ..
 make -j
 make install
 ````
+
+## Reference
+
+Please cite our software if you find it useful in your work:
+
+Xiongtao Ruan, Matthew Mueller, Gaoxiang Liu, Frederik Görlitz, Tian-Ming Fu, Daniel E. Milkie, Joshua Lillvis, Alison Killilea, Eric Betzig, Srigokul Upadhyayula. Image processing tools for petabyte-scale light sheet microscopy data. bioRxiv 2023.12.31.573734; doi: https://doi.org/10.1101/2023.12.31.573734
