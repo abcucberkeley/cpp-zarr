@@ -38,6 +38,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
 {
     if(nrhs < 2) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 2 arguments");
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
+    if(mxIsEmpty(prhs[1])) mexErrMsgIdAndTxt("zarr:inputError","All input data axes must be of at least size 1");
 
     std::vector<uint64_t> startCoords = {0,0,0};
     std::vector<uint64_t> endCoords = {0,0,0};
