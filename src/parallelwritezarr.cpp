@@ -1,10 +1,6 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <dirent.h>
-#include <string.h>
+#include <cstdint>
+#include <cstring>
 #include <omp.h>
-#include <stddef.h>
 #ifdef _WIN32
 #include <sys/time.h>
 #else

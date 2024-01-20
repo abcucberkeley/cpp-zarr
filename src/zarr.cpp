@@ -1,6 +1,4 @@
-#include <stdio.h>
-#include <cstdlib>
-#include <cstddef>
+#include <cstdint>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <stdarg.h>
@@ -8,12 +6,9 @@
 #else
 #include <uuid/uuid.h>
 #endif
-#include <iomanip>
 #include <fstream>
 #include "zarr.h"
 #include "helperfunctions.h"
-
-#include <iostream>
 
 // Create a blank zarr object with default values
 zarr::zarr() :

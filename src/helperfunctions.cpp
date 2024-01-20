@@ -1,9 +1,3 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <dirent.h>
-#include <string.h>
-#include <omp.h>
 #ifdef _WIN32
 #include <stdarg.h> 
 #include <sys/time.h>
@@ -11,7 +5,6 @@
 #include <uuid/uuid.h>
 #endif
 #include <sys/stat.h>
-#include <filesystem>
 #include "helperfunctions.h"
 #include "zarr.h"
 

@@ -1,11 +1,7 @@
-#include <omp.h>
-#include <fstream>
-#include "../src/parallelreadzarr.h"
-#include "blosc2.h"
 #include "mex.h"
-#include "../src/zarr.h"
 #include "../src/helperfunctions.h"
-#include "zlib.h"
+#include "../src/parallelreadzarr.h"
+#include "../src/zarr.h"
 
 // TODO: FIX MEMORY LEAKS
 void mexFunction(int nlhs, mxArray *plhs[],
