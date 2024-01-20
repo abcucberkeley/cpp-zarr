@@ -246,7 +246,6 @@ void zarr::set_jsonValues(){
         zarray["compressor"]["level"] = clevel;
     }
     else throw std::string("unsupportedCompressor"); 
-    //mexErrMsgIdAndTxt("zarr:zarrayError","Compressor: \"%s\" is not currently supported\n",cname.c_str());
     
     // dimension_separator only if dimension_separator is "/"
     if(dimension_separator == "/") zarray["dimension_separator"] = dimension_separator;
@@ -308,10 +307,8 @@ void zarr::write_jsonValues(){
     // If the .zarray file does not exist then build the zarr fileName path recursively
     const std::string fileNameFinal(fileName+"/.zarray");
 
-    //if(!std::filesystem::exists(fileNameFinal)){
     if(!fileExists(fileNameFinal)){
         mkdirRecursive(fileName.c_str());
-        chmod(fileName.c_str(), 0775);
     }
 
     const std::string uuid = generateUUID();
@@ -319,7 +316,6 @@ void zarr::write_jsonValues(){
 
     std::ofstream o(fnFull);
     if(!o.good()) throw std::string("cannotOpenZarray:"+fnFull);
-    //mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s\n",fnFull.c_str());
     o << std::setw(4) << zarray << std::endl;
     o.close();
 
