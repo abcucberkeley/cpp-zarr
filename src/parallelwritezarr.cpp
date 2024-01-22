@@ -6,9 +6,7 @@
 #else
 #include <uuid/uuid.h>
 #endif
-#include <sys/stat.h>
 #include <fstream>
-#include <algorithm>
 #include "blosc.h"
 #include "parallelreadzarr.h"
 #include "parallelwritezarr.h"

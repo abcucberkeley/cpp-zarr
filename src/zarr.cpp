@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <omp.h>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <stdarg.h>
