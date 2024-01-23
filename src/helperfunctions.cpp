@@ -1,6 +1,8 @@
 #ifdef _WIN32
 #include <stdarg.h> 
 #include <sys/time.h>
+// For std::replace
+#include <algorithm>
 #else
 #include <uuid/uuid.h>
 #endif
