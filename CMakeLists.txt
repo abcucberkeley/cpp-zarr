@@ -25,7 +25,11 @@ find_package(OpenMP REQUIRED)
 
 if (UNIX)
     execute_process(
-    	COMMAND tar -xf libuuid-1.0.3.tar.gz
+        COMMAND rm -rf libuuid-1.0.3
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/dependencies
+    )
+	execute_process(
+		COMMAND tar -xf libuuid-1.0.3.tar.gz
     	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/dependencies
 	)
 
