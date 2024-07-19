@@ -5,6 +5,7 @@ An efficient parallel Zarr reader/writer that utilizes c-blosc/c-blosc2 and Open
 
 ### Prerequisites
 1. All necessary libraries are included for the Linux, Mac, and Windows versions.
+2. For Linux and Windows, a CPU with AVX/SSE support is required for the reader (Almost all modern CPUs should be compatible)
 
 ### Download and Install
 1. Download the latest release for your OS from here: https://github.com/abcucberkeley/cpp-zarr/releases
