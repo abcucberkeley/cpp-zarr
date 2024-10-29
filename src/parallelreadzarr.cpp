@@ -323,6 +323,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         }
         free(zarrArrC);
     }
+    if(oppositeEndianness(Zarr.get_dtype())) swapArrayEndianness(zarrArr,bytes,readShape[0]*readShape[1]*readShape[2]);
     return 0;
 }
 
