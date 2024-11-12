@@ -14,8 +14,11 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 
 project(
   cpp-zarr
-  VERSION 1.1.1
+  VERSION 1.4.0
   LANGUAGES CXX)
+
+set(CBLOSC_VER "c-blosc-1.21.6")
+set(CBLOSC2_VER "c-blosc2-2.15.1")
 
 # Set the RPATH to $ORIGIN when installing if applicable
 set(CMAKE_INSTALL_RPATH $ORIGIN)
@@ -55,7 +58,7 @@ if (UNIX)
 endif()
 
 # Add c-blosc
-set(CBLOSC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc-1.21.5")
+set(CBLOSC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/${CBLOSC_VER}")
 set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -63,7 +66,7 @@ set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CBLOSC_DIR})
 set_property(TARGET blosc_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-set(CBLOSC2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc2-2.10.2")
+set(CBLOSC2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/${CBLOSC2_VER}")
 set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -135,8 +138,8 @@ endif()
 # Link against the blosc and blosc2 libraries
 target_link_libraries(cppZarr_shared PRIVATE
     #"-Wl,--allow-multiple-definition"  
-    ${CMAKE_BINARY_DIR}/dependencies/c-blosc2-2.10.2/blosc/libblosc2.a
-    ${CMAKE_BINARY_DIR}/dependencies/c-blosc-1.21.5/blosc/libblosc.a
+    ${CMAKE_BINARY_DIR}/dependencies/${CBLOSC2_VER}/blosc/libblosc2.a
+    ${CMAKE_BINARY_DIR}/dependencies/${CBLOSC_VER}/blosc/libblosc.a
     ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME}
     -static-libgcc
     -static-libstdc++
