@@ -1,0 +1,14 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "pybind11>=2.10.0",
+	"cmake==3.26.4"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.cibuildwheel]
+environment = {CXX="g++", CC="gcc", LD_LIBRARY_PATH="/project/build/install/lib64:$LD_LIBRARY_PATH"}
+skip = "pp* *musllinux*"
+
+[tool.cibuilddwheel.windows]
+CIBW_USE_MINGW = "true"
