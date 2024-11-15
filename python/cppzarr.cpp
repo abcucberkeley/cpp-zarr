@@ -25,12 +25,31 @@ pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims) {
     );
 }
 
-pybind11::array pybind11_read_zarr(const std::string& fileName){
+pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
+                                   std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}){
     zarr Zarr(fileName);
     uint64_t dims[3] = {Zarr.get_shape(0), Zarr.get_shape(1), Zarr.get_shape(2)};
-    std::vector<uint64_t> startCoords = {0, 0, 0};
-    std::vector<uint64_t> endCoords = {dims[0], dims[1], dims[2]};
-    void* data = parallelReadZarrWriteWrapper(Zarr, true, startCoords, endCoords);
+    bool crop = false;
+
+    // If the startCoords are not all zero then we are using user defined startCoords
+    if (!std::all_of(startCoords.begin(), startCoords.end(), [](int i) { return i==0; })){
+        crop = true;
+    }
+
+    // If the endCoords are not all zero then we are using user defined endCoords
+    // If we are only using user defined startCoords then we want to set the endCoords to the axis size
+    if (!std::all_of(endCoords.begin(), endCoords.end(), [](int i) { return i==0; })){
+        crop = true;
+    }
+    else if(crop) endCoords.assign({dims[0], dims[1], dims[2]});
+
+    if(crop){
+        Zarr.set_chunkInfo(startCoords, endCoords);
+        dims[0] = endCoords[0]-startCoords[0];
+        dims[1] = endCoords[1]-startCoords[1];
+        dims[2] = endCoords[2]-startCoords[2];
+    }
+    void* data = parallelReadZarrWriteWrapper(Zarr, crop, startCoords, endCoords);
 
 	switch (Zarr.dtypeBytes()) {
         case 1:  // 8-bit unsigned int
@@ -47,8 +66,8 @@ pybind11::array pybind11_read_zarr(const std::string& fileName){
 }
 
 void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::string &cname = "zstd",
-                         const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> chunks = std::vector<uint64_t>{256, 256, 256},
-                         const std::string &dimension_separator = ".") {
+                         const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> &chunks = std::vector<uint64_t>{256, 256, 256},
+                         const std::string &dimension_separator = "."){
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
