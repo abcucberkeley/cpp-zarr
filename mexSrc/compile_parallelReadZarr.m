@@ -44,5 +44,5 @@ elseif ispc
     if ~exist(releaseFolder, 'dir')
         mkdir(releaseFolder);
     end
-    mex -outdir ../windows -output parallelReadZarr.mexa64 -v CXX="C:/mingw64/bin/g++" CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2' -I'C:/Program Files (x86)/nlohmann_json/include' -I'C:/Program Files (x86)/blosc2/include' '-LC:/Program Files (x86)/blosc2/lib' -I'C:/Program Files (x86)/zlib/include' '-LC:/Program Files (x86)/zlib/lib' -lblosc2.dll -lzlib.dll parallelreadzarrmex.cpp ../src/zarr.cpp ../src/helperfunctions.cpp ../src/parallelreadzarr.cpp
+    mex -outdir ../windows -output parallelReadZarr.mexa64 -v CXX="C:/mingw64/bin/g++" CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2' -I'C:/Users/matt/Documents/GitHub/c-zarr/jenkinsBuild/install/include' -L'C:/Users/matt/Documents/GitHub/c-zarr/jenkinsBuild/install/lib' C:\mingw64\lib\gcc\x86_64-w64-mingw32\12.2.0\libgcc_eh.a -lcppZarr.dll parallelreadzarrmex.cpp
 end
