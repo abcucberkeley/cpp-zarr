@@ -4,7 +4,7 @@ if isunix && ~ismac
     if ~exist(releaseFolder, 'dir')
         mkdir(releaseFolder);
     end
-    mex -outdir ../linux -output createZarrFile.mexa64 -v CXXOPTIMFLAGS="-O2 -DNDEBUG" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O2 -fopenmp' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'/clusterfs/fiona/matthewmueller/cppZarrTest' -luuid createzarrfilemex.cpp ../src/helperfunctions.cpp ../src/zarr.cpp
+    mex -outdir ../linux -output createZarrFile.mexa64 -v CXXOPTIMFLAGS="-O2 -DNDEBUG" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O2 -fopenmp' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'/clusterfs/fiona/matthewmueller/cppZarrTest/c-zarr/jenkinsBuild/install/include' -L'/clusterfs/fiona/matthewmueller/cppZarrTest/c-zarr/jenkinsBuild/install/lib64' -lcppZarr createzarrfilemex.cpp
     % Need to change the library name because matlab preloads their own version
     % of libstdc++
     % Setting it to libstdc++.so.6.0.30 as of MATLAB R2022b
