@@ -18,7 +18,7 @@ project(
   LANGUAGES CXX)
 
 set(CBLOSC_VER "c-blosc-1.21.6")
-set(CBLOSC2_VER "c-blosc2-2.15.1")
+set(CBLOSC2_VER "c-blosc2-2.15.2")
 
 # Set the RPATH to $ORIGIN when installing if applicable
 set(CMAKE_INSTALL_RPATH $ORIGIN)
