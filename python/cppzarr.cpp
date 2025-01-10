@@ -112,7 +112,6 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     }
 
     Zarr.set_shape(writeShape);
-    Zarr.set_chunks({256,256,256});
     Zarr.set_chunkInfo(startCoords, endCoords);
 
     // Write out the new .zarray file
@@ -120,19 +119,7 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
 
     // Write out the data
     parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, dtype, true, crop);
-
-    // Call the function to write the data to a TIFF file
-    //writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, 0, compression);
 }
-
-/*
-pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
-    uint64_t* dims = getImageSize(fileName.c_str());
-	pybind11::tuple shape = pybind11::make_tuple(dims[2], dims[0], dims[1]);
-    free(dims);
-	return shape;
-}
-*/
 
 PYBIND11_MODULE(cppzarr, m) {
 	pybind11::module::import("numpy");
@@ -143,6 +130,4 @@ PYBIND11_MODULE(cppzarr, m) {
 
 	m.def("pybind11_write_zarr", &pybind11_write_zarr, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("cname"),
 	      pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"), pybind11::arg("dimension_separator"), "Write a zarr file");
-
-	//m.def("pybind11_get_image_shape", &pybind11_get_image_shape, "Get the image shape without reading the entire image");
 }
