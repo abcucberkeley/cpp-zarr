@@ -67,7 +67,7 @@ ext_modules = [
 # Packaging for PyPI
 setup(
     name="cpp-zarr",
-    version="1.0.2",
+    version="1.0.3",
     description="Python wrappers for cpp-zarr",
     url='https://github.com/abcucberkeley/cpp-zarr',
     author='Matthew Mueller',

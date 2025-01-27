@@ -17,5 +17,7 @@ def read_zarr(file_name, start_coords=None, end_coords=None):
 def write_zarr(file_name, data, cname='zstd', clevel=1, order='F', chunks=None, dimension_separator='.'):
     if chunks is None:
         chunks = [256, 256, 256]
+    if data.flags['C_CONTIGUOUS']:
+        data = np.asfortranarray(data)
     pybind11_write_zarr(file_name, data, cname, clevel, order, chunks, dimension_separator)
     return
