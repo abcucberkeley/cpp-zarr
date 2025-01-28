@@ -75,6 +75,18 @@ im = cppzarr.read_zarr('filename.zarr')
 cppzarr.write_zarr('outputFilename.zarr', im, cname='zstd', clevel=1, order='F', chunks=[256, 256, 256], dimension_separator='.')
 ````
 
+#### Write a region to an existing Zarr file
+````
+import cppzarr
+im = cppzarr.read_zarr('filename.zarr')
+
+# Write the zarr file out normally
+cppzarr.write_zarr('filename.zarr', im)
+
+# Write to a specified region with different data
+cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0,0,0], end_coords=[100,100,100])
+````
+
 ## CMake
 
 The C++ library can be compiled using the CMakeLists.txt file
