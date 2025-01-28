@@ -65,22 +65,16 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
     }
 }
 
-void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::string &cname = "zstd",
+void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
+                         const std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &cname = "zstd",
                          const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> &chunks = std::vector<uint64_t>{256, 256, 256},
-                         const std::string &dimension_separator = "."){
+                         const std::string &dimension_separator = ".", const bool crop = false){
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
-    // Get the dimensions of the array
-    uint64_t dims[3] = {static_cast<uint64_t>(info.shape[0]), static_cast<uint64_t>(info.shape[1]), static_cast<uint64_t>(info.shape[2])};
-
-    // Set up the shape of the data that will be written out
-	const std::vector<uint64_t> startCoords{0, 0, 0};
-    const std::vector<uint64_t> endCoords{dims[0], dims[1], dims[2]};
 	const std::vector<uint64_t> writeShape({endCoords[0]-startCoords[0],
                                       endCoords[1]-startCoords[1],
                                       endCoords[2]-startCoords[2]});
-    bool crop = false;
 
     zarr Zarr;
     Zarr.set_fileName(fileName);
@@ -115,7 +109,11 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     Zarr.set_chunkInfo(startCoords, endCoords);
 
     // Write out the new .zarray file
-    Zarr.write_zarray();
+    if(!crop || !fileExists(fileName+"/.zarray")) Zarr.write_zarray();
+    else{
+        Zarr = zarr(fileName);
+        Zarr.set_chunkInfo(startCoords, endCoords);
+    }
 
     // Write out the data
     parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, dtype, true, crop);
@@ -128,6 +126,7 @@ PYBIND11_MODULE(cppzarr, m) {
 
 	m.def("pybind11_read_zarr", &pybind11_read_zarr, "Read a zarr file");
 
-	m.def("pybind11_write_zarr", &pybind11_write_zarr, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("cname"),
-	      pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"), pybind11::arg("dimension_separator"), "Write a zarr file");
+	m.def("pybind11_write_zarr", &pybind11_write_zarr, pybind11::arg("fileName"), pybind11::arg("startCoords"), pybind11::arg("endCoords"),
+	      pybind11::arg("data"), pybind11::arg("cname"), pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"),
+	      pybind11::arg("dimension_separator"), pybind11::arg("crop"), "Write a zarr file");
 }
