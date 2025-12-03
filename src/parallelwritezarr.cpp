@@ -279,28 +279,28 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                         ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
                                         continue;
                                     }
-                                        ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint8_t*)zarrArr)[((x+(y*writeShape[0])+(z*writeShape[0]*writeShape[1])))];
+                                        ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint8_t*)zarrArr)[(((x%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*writeShape[0])+((z%Zarr.get_chunks(2))*writeShape[0]*writeShape[1])))];
                                         break;
                                 case 2:
                                     if(x>=endCoords[0] || x<startCoords[0] || y>= endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
                                         ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
                                         continue;
                                     }
-                                        ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint16_t*)zarrArr)[((x+(y*writeShape[0])+(z*writeShape[0]*writeShape[1])))];
+                                        ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint16_t*)zarrArr)[(((x%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*writeShape[0])+((z%Zarr.get_chunks(2))*writeShape[0]*writeShape[1])))];
                                         break;
                                 case 4:
                                     if(x>=endCoords[0] || x<startCoords[0] || y>= endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
                                         ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
                                         continue;
                                     }
-                                        ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((float*)zarrArr)[((x+(y*writeShape[0])+(z*writeShape[0]*writeShape[1])))];
+                                        ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((float*)zarrArr)[(((x%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*writeShape[0])+((z%Zarr.get_chunks(2))*writeShape[0]*writeShape[1])))];
                                         break;
                                 case 8:
                                     if(x>=endCoords[0] || x<startCoords[0] || y>= endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
                                         ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
                                         continue;
                                     }
-                                        ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((double*)zarrArr)[((x+(y*writeShape[0])+(z*writeShape[0]*writeShape[1])))];
+                                        ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((double*)zarrArr)[(((x%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*writeShape[0])+((z%Zarr.get_chunks(2))*writeShape[0]*writeShape[1])))];
                                         break;
                             }
 
