@@ -72,10 +72,6 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
-	const std::vector<uint64_t> writeShape({endCoords[0]-startCoords[0],
-                                      endCoords[1]-startCoords[1],
-                                      endCoords[2]-startCoords[2]});
-
     zarr Zarr;
     Zarr.set_fileName(fileName);
     Zarr.set_cname(cname);
@@ -105,15 +101,18 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
         throw std::runtime_error("Unsupported data type");
     }
 
-    Zarr.set_shape(writeShape);
-    Zarr.set_chunkInfo(startCoords, endCoords);
+    Zarr.set_shape(endCoords);
 
     // Write out the new .zarray file
     if(!crop || !fileExists(fileName+"/.zarray")) Zarr.write_zarray();
     else{
         Zarr = zarr(fileName);
-        Zarr.set_chunkInfo(startCoords, endCoords);
     }
+
+    const std::vector<uint64_t> writeShape({endCoords[0]-startCoords[0],
+                                  endCoords[1]-startCoords[1],
+                                  endCoords[2]-startCoords[2]});
+    Zarr.set_chunkInfo(startCoords, endCoords);
 
     // Write out the data
     parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, dtype, true, crop);
