@@ -13,7 +13,7 @@ A Python version of cpp-zarr is available through pip
 ### Prerequisites
 
 #### Python
-1. Python version >=3.8
+1. Python version 3.8-3.13
 
 #### CPU
 1. A CPU with AVX/SSE support is required for the reader (Almost all modern CPUs should be compatible)

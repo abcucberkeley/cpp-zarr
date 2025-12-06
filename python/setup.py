@@ -80,7 +80,7 @@ setup(
     package_data={"": shared_libraries} if system!="Linux" else {},
     include_package_data=True,
     zip_safe=False,
-    python_requires='>=3.8',
+    python_requires='>=3.8, <3.14',
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
