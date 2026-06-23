@@ -92,7 +92,7 @@ cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0
 The C++ library can be compiled using the CMakeLists.txt file
 
 ### Prerequisites
-1. Dependencies are included in the dependencies folder
+1. c-blosc, c-blosc2, nlohmann/json, and zlib are fetched automatically at configure time via CMake FetchContent, so an internet connection is required for the first configure. On Linux/Mac, libuuid is built from the tarball in the dependencies folder.
 2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work
 
 ### Download and Install
