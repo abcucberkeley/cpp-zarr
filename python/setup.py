@@ -67,7 +67,7 @@ ext_modules = [
 # Packaging for PyPI
 setup(
     name="cpp-zarr",
-    version="1.1.1",
+    version="1.5.0",
     description="Python wrappers for cpp-zarr",
     url='https://github.com/abcucberkeley/cpp-zarr',
     author='Matthew Mueller',
@@ -80,7 +80,7 @@ setup(
     package_data={"": shared_libraries} if system!="Linux" else {},
     include_package_data=True,
     zip_safe=False,
-    python_requires='>=3.8, <3.14',
+    python_requires='>=3.9, <3.15',
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",

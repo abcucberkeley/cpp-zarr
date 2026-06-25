@@ -13,7 +13,7 @@ A Python version of cpp-zarr is available through pip
 ### Prerequisites
 
 #### Python
-1. Python version 3.8-3.13
+1. Python version 3.9-3.14
 
 #### CPU
 1. A CPU with AVX/SSE support is required for the reader (Almost all modern CPUs should be compatible)
@@ -23,7 +23,7 @@ Linux: All Linux distros made within the past 10 years should work
 
 Mac Apple Silicon (M1, M2, etc.): macOS 13 or newer is required
 
-Mac Intel: macOS 12 or newer is required
+Mac Intel: Support has been discontinued as of v1.5.0 (macOS 12 or newer is required)
 
 Windows: Windows 10 or newer is required
 
