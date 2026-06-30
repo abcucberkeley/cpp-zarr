@@ -148,6 +148,10 @@ target_link_libraries(cppZarr_shared PRIVATE
     OpenMP::OpenMP_CXX
 )
 
+if(MINGW)
+    target_link_options(cppZarr_shared PRIVATE -Wl,--allow-multiple-definition)
+endif()
+
 install(TARGETS cppZarr_shared
         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_WRITE GROUP_EXECUTE WORLD_READ WORLD_WRITE WORLD_EXECUTE
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
