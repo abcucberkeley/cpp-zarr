@@ -47,10 +47,13 @@ if (UNIX)
     # Set the path to your Makefile.am
     set(UUID_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libuuid-1.0.3/")
 
-    # Build the UUID library using Autotools
+    # Build the UUID library using Autotools. libuuid 1.0.3 is old C that calls
+    # flock() (and similar) without their declaring headers; GCC 14 and recent
+    # Clang promote implicit function declarations to hard errors by default, so
+    # relax those diagnostics to keep this dependency building.
     ExternalProject_Add(uuid_external
         SOURCE_DIR ${UUID_SOURCE_DIR}
-        CONFIGURE_COMMAND ${UUID_SOURCE_DIR}/configure --with-pic
+        CONFIGURE_COMMAND ${UUID_SOURCE_DIR}/configure --with-pic "CFLAGS=-O2 -fPIC -Wno-implicit-function-declaration -Wno-implicit-int -Wno-int-conversion"
         BUILD_COMMAND make
         INSTALL_COMMAND ""
         BUILD_IN_SOURCE 1
