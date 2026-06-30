@@ -15,7 +15,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 project(
   cpp-zarr
   VERSION 1.5.0
-  LANGUAGES C CXX)
+  LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(FetchContent)
@@ -27,8 +27,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Set the RPATH to $ORIGIN when installing if applicable
 set(CMAKE_INSTALL_RPATH $ORIGIN)
 
-# OpenMP is Required
-find_package(OpenMP REQUIRED)
+# OpenMP is required for C++ only. (Requiring it for C too would break toolchains
+# whose C compiler lacks OpenMP -- e.g. Apple Clang on macOS -- and the C sources
+# we compile below, zlib, do not use OpenMP.)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 if (UNIX)
     execute_process(
@@ -100,6 +102,9 @@ set(ZLIB_SRCS
     adler32.c compress.c crc32.c deflate.c gzclose.c gzlib.c gzread.c gzwrite.c
     infback.c inffast.c inflate.c inftrees.c trees.c uncompr.c zutil.c)
 list(TRANSFORM ZLIB_SRCS PREPEND "${zlib_SOURCE_DIR}/")
+# Enable C only here (for zlib's C sources), after the OpenMP check, so the
+# project stays C++ and OpenMP is never required for the C compiler.
+enable_language(C)
 add_library(zlibstaticCPPZARR STATIC ${ZLIB_SRCS})
 target_include_directories(zlibstaticCPPZARR PUBLIC ${zlib_SOURCE_DIR} ${ZLIB_GEN_DIR})
 
