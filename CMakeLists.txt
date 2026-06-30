@@ -98,8 +98,13 @@ if(NOT zlib_POPULATED)
 endif()
 set(ZLIB_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/zlib_gen")
 configure_file(${zlib_SOURCE_DIR}/zconf.h.in ${ZLIB_GEN_DIR}/zconf.h COPYONLY)
+# cpp-zarr only uses zlib's in-memory inflate/deflate streaming API, so we omit
+# the gzFile file-API sources (gz*.c). They call POSIX lseek/read/write/close
+# and, when zlib is built outside its own configure step (which defines
+# Z_HAVE_UNISTD_H), they don't pull in <unistd.h> -- which Apple Clang rejects
+# as implicit declarations (hard error), breaking the macOS build.
 set(ZLIB_SRCS
-    adler32.c compress.c crc32.c deflate.c gzclose.c gzlib.c gzread.c gzwrite.c
+    adler32.c compress.c crc32.c deflate.c
     infback.c inffast.c inflate.c inftrees.c trees.c uncompr.c zutil.c)
 list(TRANSFORM ZLIB_SRCS PREPEND "${zlib_SOURCE_DIR}/")
 # Enable C only here (for zlib's C sources), after the OpenMP check, so the
