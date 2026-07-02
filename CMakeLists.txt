@@ -162,3 +162,17 @@ install(TARGETS cppZarr_shared
 install(DIRECTORY ${nlohmann_json_SOURCE_DIR}/include/nlohmann
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+# ---- Round-trip smoke tests (write random data, read it back, verify) ------
+# Enable with -DCPPZARR_BUILD_TESTS=ON, then run `ctest` in the build dir.
+# (BUILD_TESTS is forced OFF above for the bundled blosc deps, so this uses a
+# project-specific option name to avoid clashing with it.)
+option(CPPZARR_BUILD_TESTS "Build and register the round-trip smoke tests" OFF)
+if(CPPZARR_BUILD_TESTS)
+    enable_testing()
+    add_executable(roundtripTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.cpp)
+    set_target_properties(roundtripTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(roundtripTest PRIVATE ${SRC_DIR} ${nlohmann_json_SOURCE_DIR}/include)
+    target_link_libraries(roundtripTest PRIVATE cppZarr_shared OpenMP::OpenMP_CXX)
+    add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
+endif()

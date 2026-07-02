@@ -2,13 +2,29 @@
 requires = [
     "setuptools>=42",
     "pybind11>=2.10.0",
-	"cmake==3.26.4"
+    # Linux and macOS build the native library with CMake (see setup.py);
+    # Windows links a prebuilt library, so it doesn't need CMake in the build env.
+    "cmake==3.26.4; sys_platform != 'win32'",
 ]
 build-backend = "setuptools.build_meta"
 
+# Shared cibuildwheel settings; the [tool.cibuildwheel.<os>] tables below override
+# individual keys per platform (each key is inherited unless overridden).
 [tool.cibuildwheel]
-environment = {CXX="g++", CC="gcc", LD_LIBRARY_PATH="/project/build/install/lib64:$LD_LIBRARY_PATH"}
-skip = "pp* *musllinux*"
+skip = "pp*"
+environment = {CXX="g++", CC="gcc"}
+# Smoke-test every built wheel in an isolated env (also verifies it imports and
+# bundles its native library).
+test-requires = ["numpy"]
+test-command = "python {project}/tests/test_python.py"
 
-[tool.cibuilddwheel.windows]
-CIBW_USE_MINGW = "true"
+[tool.cibuildwheel.linux]
+skip = "pp* *musllinux*"
+environment = {CXX="g++", CC="gcc", LD_LIBRARY_PATH="/project/build/install/lib64:$LD_LIBRARY_PATH"}
+
+[tool.cibuildwheel.macos]
+environment = {CXX="/opt/homebrew/bin/g++-13", CC="/opt/homebrew/bin/gcc-13", MACOSX_DEPLOYMENT_TARGET="13.0"}
+
+[tool.cibuildwheel.windows]
+skip = "pp* cp*t-*"
+repair-wheel-command = "delvewheel repair --ignore-existing -w {dest_dir} {wheel}"
