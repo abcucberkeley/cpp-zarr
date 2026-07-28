@@ -115,7 +115,8 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     Zarr.set_chunkInfo(startCoords, endCoords);
 
     // Write out the data
-    parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, dtype, true, crop);
+    uint8_t err = parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, dtype, true, crop);
+    if(err) throw std::runtime_error(Zarr.get_errString());
 }
 
 PYBIND11_MODULE(cppzarr, m) {

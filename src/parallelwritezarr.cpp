@@ -58,6 +58,24 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
     const uint64_t sB = s*bytes;
 
+    // blosc (both blosc1 and blosc2) stores each chunk as a single frame with
+    // 32-bit size fields, so one chunk cannot exceed BLOSC_MAX_BUFFERSIZE
+    // (~2 GB) uncompressed. Exceeding it makes blosc_compress_ctx fail and, left
+    // unchecked, wrote empty chunk files -- silently losing data. Reject it up
+    // front with an actionable message. (gzip uses zlib's streaming API and is
+    // not subject to this limit, so it is allowed through.)
+    if(Zarr.get_cname() != "gzip" && sB > (uint64_t)BLOSC_MAX_BUFFERSIZE){
+        Zarr.set_errString("Chunk is too large for the \""+Zarr.get_cname()+
+            "\" compressor: "+std::to_string(Zarr.get_chunks(0))+"x"+
+            std::to_string(Zarr.get_chunks(1))+"x"+std::to_string(Zarr.get_chunks(2))+
+            " x "+std::to_string(bytes)+" bytes/element = "+std::to_string(sB)+
+            " bytes exceeds the blosc limit of "+std::to_string((uint64_t)BLOSC_MAX_BUFFERSIZE)+
+            " bytes (~2 GB). Reduce the chunk size so that "
+            "chunk[0]*chunk[1]*chunk[2]*dtypeBytes < "+
+            std::to_string((uint64_t)BLOSC_MAX_BUFFERSIZE+1)+", or use the gzip compressor.\n");
+        return 1;
+    }
+
     const std::string uuid(generateUUID());
 
     void* zeroChunkUnc = NULL;
@@ -347,6 +365,20 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                 }
                 */
                 csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,nBloscThreads);
+                // A non-positive return means blosc could not compress the chunk
+                // (e.g. it exceeds BLOSC_MAX_BUFFERSIZE). Fail loudly instead of
+                // writing an empty/garbage chunk. (The chunk-size guard above
+                // should already have caught the oversize case.)
+                if(csize <= 0){
+                    #pragma omp critical
+                    {
+                        err = 1;
+                        errString = "Compression error (blosc returned "+std::to_string(csize)+
+                            "). ChunkName: "+Zarr.get_fileName()+"/"+subfolderName+"/"+
+                            Zarr.get_chunkNames(f)+"\n";
+                    }
+                    break;
+                }
             }
             else{
                 csize = chunkCCap;

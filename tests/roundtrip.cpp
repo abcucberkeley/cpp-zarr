@@ -108,6 +108,35 @@ int main(int argc, char** argv){
         }
     }
 
+    // Oversize-chunk guard: a blosc chunk >= ~2 GB uncompressed must be rejected
+    // (not silently written as empty chunks). Uses a tiny shape with huge chunks
+    // so the guard fires before any large allocation.
+    {
+        total++;
+        const std::vector<uint64_t> tinyShape = {2, 2, 2};
+        const std::vector<uint64_t> hugeChunks = {1024, 1024, 1024}; // 1024^3 * 2B = 2 GiB > limit
+        const std::string path = dir + "/rt_oversize.zarr";
+        std::error_code ec; std::filesystem::remove_all(path, ec);
+        std::vector<uint16_t> tiny(2 * 2 * 2, 0);
+        uint8_t werr = 1;
+        try {
+            zarr Zw;
+            Zw.set_fileName(path); Zw.set_cname("zstd"); Zw.set_order("F");
+            Zw.set_chunks(hugeChunks); Zw.set_dtype("<u2"); Zw.set_shape(tinyShape);
+            Zw.write_zarray();
+            Zw.set_chunkInfo({0,0,0}, tinyShape);
+            werr = parallelWriteZarr(Zw, tiny.data(), {0,0,0}, tinyShape, tinyShape,
+                                     16, /*useUuid*/false, /*crop*/false, /*sparse*/false);
+        } catch (...) { werr = 1; }
+        std::filesystem::remove_all(path, ec);
+        if (werr) {
+            std::printf("PASS  oversize-chunk rejected\n");
+        } else {
+            std::printf("FAIL  oversize-chunk not rejected (would silently lose data)\n");
+            failures++;
+        }
+    }
+
     std::printf("\n%d/%d round trips passed\n", total - failures, total);
     return failures ? 1 : 0;
 }
