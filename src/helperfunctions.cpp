@@ -8,6 +8,9 @@
 #endif
 #include <sys/stat.h>
 #include <omp.h>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include "helperfunctions.h"
 #include "zarr.h"
 
@@ -154,6 +157,8 @@ bool isLittleEndian(){
 }
 
 bool oppositeEndianness(const std::string &dtype){
+    // '|' means byte order is not applicable (single-byte dtypes like |u1/|i1)
+    if(dtype.empty() || dtype[0] == '|') return false;
     if(isLittleEndian()){
         if(dtype[0] == '<') return false;
     }
@@ -161,6 +166,14 @@ bool oppositeEndianness(const std::string &dtype){
         if(dtype[0] == '>') return false;
     }
     return true;
+}
+
+int fillValueToInt(const std::string &fillValue){
+    errno = 0;
+    char* end = NULL;
+    const long v = strtol(fillValue.c_str(), &end, 10);
+    if(errno || end == fillValue.c_str() || v > INT_MAX || v < INT_MIN) return 0;
+    return (int)v;
 }
 
 void swapArrayEndianness(void* array, const size_t elementSize, const size_t numElements){

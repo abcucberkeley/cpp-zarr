@@ -17,6 +17,60 @@
 //Windows
 //mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-IC:\Program Files (x86)\bloscZarr\include' '-LC:\Program Files (x86)\bloscZarr\lib' -lblosc '-IC:\Program Files (x86)\cJSON\include\' '-LC:\Program Files (x86)\cJSON\lib' -lcjson '-IC:\Program Files (x86)\blosc\include' '-LC:\Program Files (x86)\blosc\lib' -lblosc2 parallelWriteZarr.c parallelReadZarr.c helperFunctions.c
 
+// Cast-copy between any two supported element types, used when writing into an
+// existing zarr file whose dtype differs from the MATLAB input's type.
+template <typename TDst, typename TSrc>
+static void castCopy(void* dstV, const void* srcV, const uint64_t n){
+    TDst* dst = (TDst*)dstV;
+    const TSrc* src = (const TSrc*)srcV;
+    #pragma omp parallel for
+    for(uint64_t i = 0; i < n; i++){
+        dst[i] = (TDst)src[i];
+    }
+}
+
+template <typename TSrc>
+static void* castToDtype(const std::string &dtype, const void* src, const uint64_t n){
+    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
+    const char dsize = dtype.size() == 3 ? dtype[2] : '\0';
+    void* dst = NULL;
+    if(kind == 'u'){
+        if(dsize == '1'){ dst = malloc(n*sizeof(uint8_t));  castCopy<uint8_t,TSrc>(dst,src,n); }
+        else if(dsize == '2'){ dst = malloc(n*sizeof(uint16_t)); castCopy<uint16_t,TSrc>(dst,src,n); }
+        else if(dsize == '4'){ dst = malloc(n*sizeof(uint32_t)); castCopy<uint32_t,TSrc>(dst,src,n); }
+        else if(dsize == '8'){ dst = malloc(n*sizeof(uint64_t)); castCopy<uint64_t,TSrc>(dst,src,n); }
+    }
+    else if(kind == 'i'){
+        if(dsize == '1'){ dst = malloc(n*sizeof(int8_t));  castCopy<int8_t,TSrc>(dst,src,n); }
+        else if(dsize == '2'){ dst = malloc(n*sizeof(int16_t)); castCopy<int16_t,TSrc>(dst,src,n); }
+        else if(dsize == '4'){ dst = malloc(n*sizeof(int32_t)); castCopy<int32_t,TSrc>(dst,src,n); }
+        else if(dsize == '8'){ dst = malloc(n*sizeof(int64_t)); castCopy<int64_t,TSrc>(dst,src,n); }
+    }
+    else if(kind == 'f'){
+        if(dsize == '4'){ dst = malloc(n*sizeof(float));  castCopy<float,TSrc>(dst,src,n); }
+        else if(dsize == '8'){ dst = malloc(n*sizeof(double)); castCopy<double,TSrc>(dst,src,n); }
+    }
+    return dst;
+}
+
+// Convert a MATLAB array's data to the given zarr dtype. Returns a malloc'd
+// buffer the caller frees, or NULL if either side is unsupported.
+static void* convertMxToDtype(const std::string &dtype, const mxArray* arr, const uint64_t n){
+    switch(mxGetClassID(arr)){
+        case mxUINT8_CLASS:  return castToDtype<uint8_t>(dtype, mxGetData(arr), n);
+        case mxINT8_CLASS:   return castToDtype<int8_t>(dtype, mxGetData(arr), n);
+        case mxUINT16_CLASS: return castToDtype<uint16_t>(dtype, mxGetData(arr), n);
+        case mxINT16_CLASS:  return castToDtype<int16_t>(dtype, mxGetData(arr), n);
+        case mxUINT32_CLASS: return castToDtype<uint32_t>(dtype, mxGetData(arr), n);
+        case mxINT32_CLASS:  return castToDtype<int32_t>(dtype, mxGetData(arr), n);
+        case mxUINT64_CLASS: return castToDtype<uint64_t>(dtype, mxGetData(arr), n);
+        case mxINT64_CLASS:  return castToDtype<int64_t>(dtype, mxGetData(arr), n);
+        case mxSINGLE_CLASS: return castToDtype<float>(dtype, mxGetData(arr), n);
+        case mxDOUBLE_CLASS: return castToDtype<double>(dtype, mxGetData(arr), n);
+        default: return NULL;
+    }
+}
+
 // TODO: FIX MEMORY LEAKS
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
@@ -138,17 +192,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
     void* zarrC = NULL;
 
     mxClassID mDType = mxGetClassID(prhs[1]);
-    if(mDType == mxUINT8_CLASS){
-        Zarr.set_dtype("<u1");
-    }
-    else if(mDType == mxUINT16_CLASS){
-        Zarr.set_dtype("<u2");
-    }
-    else if(mDType == mxSINGLE_CLASS){
-        Zarr.set_dtype("<f4");
-    }
-    else if(mDType == mxDOUBLE_CLASS){
-        Zarr.set_dtype("<f8");
+    switch(mDType){
+        case mxUINT8_CLASS:  Zarr.set_dtype("<u1"); break;
+        case mxINT8_CLASS:   Zarr.set_dtype("<i1"); break;
+        case mxUINT16_CLASS: Zarr.set_dtype("<u2"); break;
+        case mxINT16_CLASS:  Zarr.set_dtype("<i2"); break;
+        case mxUINT32_CLASS: Zarr.set_dtype("<u4"); break;
+        case mxINT32_CLASS:  Zarr.set_dtype("<i4"); break;
+        case mxUINT64_CLASS: Zarr.set_dtype("<u8"); break;
+        case mxINT64_CLASS:  Zarr.set_dtype("<i8"); break;
+        case mxSINGLE_CLASS: Zarr.set_dtype("<f4"); break;
+        case mxDOUBLE_CLASS: Zarr.set_dtype("<f8"); break;
+        default: mexErrMsgIdAndTxt("zarr:dataTypeError","The input data type is not supported");
     }
 
     if(!crop){
@@ -214,117 +269,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         
         if(dtypeT != Zarr.get_dtype()){
-            uint64_t size = (endCoords[0]-startCoords[0])*
+            const uint64_t size = (endCoords[0]-startCoords[0])*
                 (endCoords[1]-startCoords[1])*
                 (endCoords[2]-startCoords[2]);
-
-            uint64_t bitsT = 0;
-            if(dtypeT == "<u1") bitsT = 8;
-            else if(dtypeT == "<u2") bitsT = 16;
-            else if(dtypeT == "<f4") bitsT = 32;
-            else if(dtypeT == "<f8") bitsT = 64;
-            else mexErrMsgIdAndTxt("tiff:dataTypeError","Cannont convert to passed in data type. Data type not suppported");
-
-
-            if(Zarr.get_dtype() == "<u1"){
-                zarrC = malloc(size*sizeof(uint8_t));
-                if(bitsT == 16){
-                    uint16_t* zarrT = (uint16_t*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((uint8_t*)zarrC)[i] = (uint8_t)zarrT[i];
-                    }
-                }
-                else if(bitsT == 32){
-                    float* zarrT = (float*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((uint8_t*)zarrC)[i] = (uint8_t)zarrT[i];
-                    }
-                }
-                else if(bitsT == 64){
-                    double* zarrT = (double*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((uint8_t*)zarrC)[i] = (uint8_t)zarrT[i];
-                    }
-                }
-            }
-            else if(Zarr.get_dtype() == "<u2"){
-                zarrC = malloc(size*sizeof(uint16_t));
-                if(bitsT == 8){
-                    uint8_t* zarrT = (uint8_t*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((uint16_t*)zarrC)[i] = (uint16_t)zarrT[i];
-                    }
-                }
-                else if (bitsT == 32){
-                    float* zarrT = (float*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((uint16_t*)zarrC)[i] = (uint16_t)zarrT[i];
-                    }
-                }
-                else if (bitsT == 64){
-                    double* zarrT = (double*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((uint16_t*)zarrC)[i] = (uint16_t)zarrT[i];
-                    }
-                }
-            }
-            else if(Zarr.get_dtype() == "<f4"){
-                zarrC = malloc(size*sizeof(float));
-                if(bitsT == 8){
-                    uint8_t* zarrT = (uint8_t*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((float*)zarrC)[i] = (float)zarrT[i];
-                    }
-                }
-                else if(bitsT == 16){
-                    uint16_t* zarrT = (uint16_t*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((float*)zarrC)[i] = (float)zarrT[i];
-                    }
-                }
-                else if(bitsT == 64){
-                    double* zarrT = (double*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((float*)zarrC)[i] = (float)zarrT[i];
-                    }
-                }
-            }
-            else if(Zarr.get_dtype() == "<f8"){
-                zarrC = malloc(size*sizeof(double));
-                if(bitsT == 8){
-                    uint8_t* zarrT = (uint8_t*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((double*)zarrC)[i] = (double)zarrT[i];
-                    }
-                }
-                else if(bitsT == 16){
-                    uint16_t* zarrT = (uint16_t*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((double*)zarrC)[i] = (double)zarrT[i];
-                    }
-                }
-                else if(bitsT == 32){
-                    float* zarrT = (float*)mxGetPr(prhs[1]);
-                    #pragma omp parallel for
-                    for(uint64_t i = 0; i < size; i++){
-                        ((double*)zarrC)[i] = (double)zarrT[i];
-                    }
-                }
-            }
-            else{
-                mexErrMsgIdAndTxt("zarr:dataTypeError","Cannont convert to passed in data type. Data type not suppported");
-            }
+            zarrC = convertMxToDtype(Zarr.get_dtype(), prhs[1], size);
+            if(!zarrC) mexErrMsgIdAndTxt("zarr:dataTypeError","Cannot convert the input data to the existing file's data type \"%s\"",Zarr.get_dtype().c_str());
         }
     }
 
@@ -344,38 +293,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     Zarr.set_chunkInfo(startCoords, endCoords);
     bool err = 0;
-    if(Zarr.get_dtype() == "<u1"){
-        uint64_t bits = 8;
-        uint8_t* zarrArr;
-        if(zarrC) zarrArr = (uint8_t*)zarrC;
-        else zarrArr =  (uint8_t*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
-    }
-    else if(Zarr.get_dtype() == "<u2"){
-        uint64_t bits = 16;
-        uint16_t* zarrArr;
-        if(zarrC) zarrArr = (uint16_t*)zarrC;
-        else zarrArr = (uint16_t*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
-    }
-    else if(Zarr.get_dtype() == "<f4"){
-        uint64_t bits = 32;
-        float* zarrArr;
-        if(zarrC) zarrArr = (float*)zarrC;
-        else zarrArr = (float*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
-    }
-    else if(Zarr.get_dtype() == "<f8"){
-        uint64_t bits = 64;
-        double* zarrArr;
-        if(zarrC) zarrArr = (double*)zarrC;
-        else zarrArr = (double*)mxGetPr(prhs[1]);
-        err = parallelWriteZarr(Zarr, (void*)zarrArr, startCoords, endCoords, writeShape, bits, useUuid, crop, sparse);
-    }
-    else{
+    // The write machinery is element-width based, so one generic path covers
+    // every supported dtype: signed/unsigned 8/16/32/64-bit ints, 32/64-bit floats.
+    const std::string &dtypeOut = Zarr.get_dtype();
+    const uint64_t outBytes = Zarr.dtypeBytes();
+    const char outKind = dtypeOut.size() == 3 ? dtypeOut[1] : '\0';
+    if(!outBytes || (outKind != 'u' && outKind != 'i' && outKind != 'f') ||
+       (outKind == 'f' && outBytes < 4)){
         free(zarrC);
-        mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
+        mexErrMsgIdAndTxt("zarr:dataTypeError","Data type \"%s\" is not supported",dtypeOut.c_str());
     }
+    void* zarrArr = zarrC ? zarrC : mxGetData(prhs[1]);
+    err = parallelWriteZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, outBytes*8, useUuid, crop, sparse);
 
     // zarrC is either a copy for data conversion or NULL
     free(zarrC);

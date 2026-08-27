@@ -58,6 +58,10 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
     const uint64_t sB = s*bytes;
 
+    // Parse the fill value once (stoi would throw on Infinity-normalized fills,
+    // and the C-order path below fills per element).
+    const int fillValue = fillValueToInt(Zarr.get_fill_value());
+
     // blosc (both blosc1 and blosc2) stores each chunk as a single frame with
     // 32-bit size fields, so one chunk cannot exceed BLOSC_MAX_BUFFERSIZE
     // (~2 GB) uncompressed. Exceeding it makes blosc_compress_ctx fail and, left
@@ -192,7 +196,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                             if((cAV[2]+1)*Zarr.get_chunks(2) > Zarr.get_shape(2)){
                                 memcpy((uint8_t*)chunkUnC+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((Zarr.get_shape(2)-z)*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes);
                                 uint64_t zRest = ((cAV[2]+1)*Zarr.get_chunks(2))-Zarr.get_shape(2);
-                                memset((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),stoi(Zarr.get_fill_value()),(zRest*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
+                                memset((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),fillValue,(zRest*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
                             }
                             else{
                                 memcpy((uint8_t*)chunkUnC+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((((cAV[2]+1)*Zarr.get_chunks(2))-z)*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes);
@@ -200,7 +204,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                         }
                         else{
                             uint64_t zRest = ((cAV[2]+1)*Zarr.get_chunks(2))-z;
-                            memset((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),stoi(Zarr.get_fill_value()),(zRest*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
+                            memset((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),fillValue,(zRest*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
                         }
                         break;
                     }
@@ -209,7 +213,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                             memcpy((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),(uint8_t*)cRegion+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),((startCoords[2]-z)*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes);
                         }
                         else{
-                            memset((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),stoi(Zarr.get_fill_value()),((startCoords[2]-z)*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
+                            memset((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),fillValue,((startCoords[2]-z)*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
                         }
                         z = startCoords[2]-1;
                         continue;
@@ -220,7 +224,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                 if((cAV[1]+1)*Zarr.get_chunks(1) > Zarr.get_shape(1)){
                                     memcpy((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((Zarr.get_shape(1)-y)*Zarr.get_chunks(0))*bytes);
                                     uint64_t yRest = ((cAV[1]+1)*Zarr.get_chunks(1))-Zarr.get_shape(1);
-                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),stoi(Zarr.get_fill_value()),(yRest*(Zarr.get_chunks(0)))*bytes);
+                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(yRest*(Zarr.get_chunks(0)))*bytes);
                                 }
                                 else{
                                     memcpy((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((((cAV[1]+1)*Zarr.get_chunks(1))-y)*Zarr.get_chunks(0))*bytes);
@@ -228,7 +232,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                             }
                             else{
                                 uint64_t yRest = ((cAV[1]+1)*Zarr.get_chunks(1))-y;
-                                memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),stoi(Zarr.get_fill_value()),(yRest*Zarr.get_chunks(0))*bytes);
+                                memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(yRest*Zarr.get_chunks(0))*bytes);
                             }
                             break;
                         }
@@ -237,7 +241,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                 memcpy((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((startCoords[1]-y)*Zarr.get_chunks(0))*bytes);
                             }
                             else{
-                                memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),stoi(Zarr.get_fill_value()),(startCoords[1]-y)*bytes);
+                                memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(startCoords[1]-y)*bytes);
                             }
                             y = startCoords[1]-1;
                             continue;
@@ -251,9 +255,9 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                     memcpy((uint8_t*)chunkUnC+(((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))+(endCoords[0]%Zarr.get_chunks(0)))*bytes),(uint8_t*)cRegion+(((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))+(endCoords[0]%Zarr.get_chunks(0)))*bytes),(Zarr.get_chunks(0)-(endCoords[0]%Zarr.get_chunks(0)))*bytes);
                                 }
                                 else{
-                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),stoi(Zarr.get_fill_value()),(startCoords[0]%Zarr.get_chunks(0))*bytes);
+                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(startCoords[0]%Zarr.get_chunks(0))*bytes);
                                     memcpy((uint8_t*)chunkUnC+(((startCoords[0]%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0]+(startCoords[0]%Zarr.get_chunks(0)))+((y-startCoords[1])*writeShape[0])+((z-startCoords[2])*writeShape[0]*writeShape[1]))*bytes),((endCoords[0]%Zarr.get_chunks(0))-(startCoords[0]%Zarr.get_chunks(0)))*bytes);
-                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))+(endCoords[0]%Zarr.get_chunks(0))*bytes),stoi(Zarr.get_fill_value()),(Zarr.get_chunks(0)-(endCoords[0]%Zarr.get_chunks(0)))*bytes);
+                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))+(endCoords[0]%Zarr.get_chunks(0))*bytes),fillValue,(Zarr.get_chunks(0)-(endCoords[0]%Zarr.get_chunks(0)))*bytes);
                                 }
                             }
                             else if((cAV[0]+1)*Zarr.get_chunks(0)>endCoords[0]){
@@ -263,7 +267,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                     if((cAV[0]+1)*Zarr.get_chunks(0) > Zarr.get_shape(0)){
                                         memcpy((uint8_t*)chunkUnC+((((endCoords[0]-(cAV[0]*Zarr.get_chunks(0))))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((endCoords[0]-(cAV[0]*Zarr.get_chunks(0))))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(Zarr.get_shape(0)-endCoords[0])*bytes);
                                         uint64_t xRest = ((cAV[0]+1)*Zarr.get_chunks(0))-Zarr.get_shape(0);
-                                        memset((uint8_t*)chunkUnC+(((Zarr.get_shape(0)-(cAV[0]*Zarr.get_chunks(0)))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),stoi(Zarr.get_fill_value()),(xRest)*bytes);
+                                        memset((uint8_t*)chunkUnC+(((Zarr.get_shape(0)-(cAV[0]*Zarr.get_chunks(0)))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(xRest)*bytes);
                                     }
                                     else{
                                         memcpy((uint8_t*)chunkUnC+((((endCoords[0]-(cAV[0]*Zarr.get_chunks(0))))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((endCoords[0]-(cAV[0]*Zarr.get_chunks(0))))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(((cAV[0]+1)*Zarr.get_chunks(0))-endCoords[0])*bytes);
@@ -271,7 +275,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                 }
                                 else{
                                     memcpy((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0])+((y-startCoords[1])*writeShape[0])+((z-startCoords[2])*writeShape[0]*writeShape[1]))*bytes),(endCoords[0]%Zarr.get_chunks(0))*bytes);
-                                    memset((uint8_t*)chunkUnC+(((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))+(endCoords[0]%Zarr.get_chunks(0)))*bytes),stoi(Zarr.get_fill_value()),(Zarr.get_chunks(0)-(endCoords[0]%Zarr.get_chunks(0)))*bytes);
+                                    memset((uint8_t*)chunkUnC+(((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))+(endCoords[0]%Zarr.get_chunks(0)))*bytes),fillValue,(Zarr.get_chunks(0)-(endCoords[0]%Zarr.get_chunks(0)))*bytes);
                                 }
                             }
                             else if((cAV[0]*Zarr.get_chunks(0)) < startCoords[0] && ((cAV[0]+1)*Zarr.get_chunks(0)) > startCoords[0]){
@@ -280,7 +284,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                     memcpy((uint8_t*)chunkUnC+(((startCoords[0]%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0]+(startCoords[0]%Zarr.get_chunks(0)))+((y-startCoords[1])*writeShape[0])+((z-startCoords[2])*writeShape[0]*writeShape[1]))*bytes),(Zarr.get_chunks(0)-(startCoords[0]%Zarr.get_chunks(0)))*bytes);
                                 }
                                 else{
-                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),stoi(Zarr.get_fill_value()),(startCoords[0]%Zarr.get_chunks(0))*bytes);
+                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(startCoords[0]%Zarr.get_chunks(0))*bytes);
                                     memcpy((uint8_t*)chunkUnC+(((startCoords[0]%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0]+(startCoords[0]%Zarr.get_chunks(0)))+((y-startCoords[1])*writeShape[0])+((z-startCoords[2])*writeShape[0]*writeShape[1]))*bytes),(Zarr.get_chunks(0)-(startCoords[0]%Zarr.get_chunks(0)))*bytes);
                                 }
                             }
@@ -304,28 +308,28 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                             switch(bytes){
                                 case 1:
                                     if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
+                                        ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
                                         continue;
                                     }
                                         ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint8_t*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];
                                         break;
                                 case 2:
                                     if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
+                                        ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
                                         continue;
                                     }
                                         ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint16_t*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];
                                         break;
                                 case 4:
                                     if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
+                                        ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
                                         continue;
                                     }
                                         ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((float*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];
                                         break;
                                 case 8:
                                     if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = stoi(Zarr.get_fill_value());
+                                        ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
                                         continue;
                                     }
                                         ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((double*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];

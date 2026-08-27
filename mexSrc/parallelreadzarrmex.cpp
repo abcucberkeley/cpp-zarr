@@ -93,66 +93,46 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     bool err = 0;
     uint64_t readSize = readShape[0]*readShape[1]*readShape[2];
-    if(Zarr.get_dtype().find("u1") != std::string::npos){
-        uint64_t bits = 8;
-        uint8_t* zarrArr;
-        if(stoi(Zarr.get_fill_value())){
-            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
-            zarrArr = (uint8_t*)mxGetPr(plhs[0]);
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(uint8_t));
-        }
-        else{
-            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
-            zarrArr = (uint8_t*)mxGetPr(plhs[0]);
-        }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+
+    // Map the zarr dtype to the matching MATLAB class. The read machinery is
+    // element-width based, so one generic path covers every supported dtype:
+    // signed/unsigned 8/16/32/64-bit integers and 32/64-bit floats.
+    const std::string dtype = Zarr.get_dtype();
+    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
+    const char dsize = dtype.size() == 3 ? dtype[2] : '\0';
+    mxClassID mxClass = mxUNKNOWN_CLASS;
+    if(kind == 'u'){
+        if(dsize == '1') mxClass = mxUINT8_CLASS;
+        else if(dsize == '2') mxClass = mxUINT16_CLASS;
+        else if(dsize == '4') mxClass = mxUINT32_CLASS;
+        else if(dsize == '8') mxClass = mxUINT64_CLASS;
     }
-    else if(Zarr.get_dtype().find("u2") != std::string::npos){
-        uint64_t bits = 16;
-        uint16_t* zarrArr;
-        if(stoi(Zarr.get_fill_value())){
-            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
-            zarrArr = (uint16_t*)mxGetPr(plhs[0]);
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(uint16_t));
-        }
-        else{
-            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
-            zarrArr = (uint16_t*)mxGetPr(plhs[0]);
-        }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+    else if(kind == 'i'){
+        if(dsize == '1') mxClass = mxINT8_CLASS;
+        else if(dsize == '2') mxClass = mxINT16_CLASS;
+        else if(dsize == '4') mxClass = mxINT32_CLASS;
+        else if(dsize == '8') mxClass = mxINT64_CLASS;
     }
-    else if(Zarr.get_dtype().find("f4") != std::string::npos){
-        uint64_t bits = 32;
-        float* zarrArr;
-        if(stoi(Zarr.get_fill_value())){
-            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
-            zarrArr = (float*)mxGetPr(plhs[0]);
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(float));
-        }
-        else{
-            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
-            zarrArr = (float*)mxGetPr(plhs[0]);
-        }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+    else if(kind == 'f'){
+        if(dsize == '4') mxClass = mxSINGLE_CLASS;
+        else if(dsize == '8') mxClass = mxDOUBLE_CLASS;
     }
-    else if(Zarr.get_dtype().find("f8") != std::string::npos){
-        uint64_t bits = 64;
-        double* zarrArr;
-        if(stoi(Zarr.get_fill_value())){
-            plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
-            zarrArr = (double*)mxGetPr(plhs[0]);
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(double));
-        }
-        else{
-            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
-            zarrArr = (double*)mxGetPr(plhs[0]);
-        }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+    if(mxClass == mxUNKNOWN_CLASS) mexErrMsgIdAndTxt("zarr:dataTypeError","Data type \"%s\" is not supported",dtype.c_str());
+
+    const uint64_t bytes = Zarr.dtypeBytes();
+    void* zarrArr = NULL;
+    const int fillValue = fillValueToInt(Zarr.get_fill_value());
+    if(fillValue){
+        plhs[0] = mxCreateUninitNumericArray(3,(mwSize*)dim,mxClass, mxREAL);
+        zarrArr = mxGetData(plhs[0]);
+        memset(zarrArr,fillValue,readSize*bytes);
     }
     else{
-        mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
+        plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxClass, mxREAL);
+        zarrArr = mxGetData(plhs[0]);
     }
-    
+    err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,useCtx,sparse);
+
     if(err) mexErrMsgIdAndTxt("zarr:readError",Zarr.get_errString().c_str());
 
 }

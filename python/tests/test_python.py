@@ -18,7 +18,8 @@ def main():
     rng = np.random.default_rng(1234567)
     shape = (40, 24, 18)  # d0, d1, d2 (non-chunk-aligned -> exercises partial chunks)
     chunks = [16, 16, 16]
-    dtypes = [np.uint8, np.uint16, np.float32, np.float64]
+    dtypes = [np.uint8, np.int8, np.uint16, np.int16, np.uint32, np.int32,
+              np.uint64, np.int64, np.float32, np.float64]
     # (compressor, order) combinations. zstd/F is our most-used combo; the others
     # add lz4, gzip, and a C-order case (which exercises the read transpose).
     combos = [("zstd", "F"), ("lz4", "F"), ("zstd", "C"), ("gzip", "F")]
@@ -28,7 +29,9 @@ def main():
     for dt in dtypes:
         name = np.dtype(dt).name
         if np.issubdtype(dt, np.integer):
-            data = rng.integers(0, 200, size=shape, endpoint=True).astype(dt)
+            info = np.iinfo(dt)
+            lo, hi = max(info.min, -1000), min(info.max, 1000)  # negatives exercise signed types
+            data = rng.integers(lo, hi, size=shape, endpoint=True).astype(dt)
         else:
             data = (rng.standard_normal(shape) * 1000).astype(dt)
 

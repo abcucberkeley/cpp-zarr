@@ -1,5 +1,5 @@
-#ifndef HELPERFUNCTIONS_H
-#define HELPERFUNCTIONS_H
+#ifndef CPPZARR_HELPERFUNCTIONS_H
+#define CPPZARR_HELPERFUNCTIONS_H
 #include <string>
 
 #ifndef _WIN32
@@ -27,6 +27,13 @@ void makeDimensionFolders(const std::string &fileName);
 bool isLittleEndian();
 
 bool oppositeEndianness(const std::string &dtype);
+
+// Parse a zarr fill_value string for memset-style fills. Returns 0 for anything
+// unparsable or outside int range (e.g. the int64 min/max strings that
+// Infinity/-Infinity fill values normalize to), instead of throwing like stoi.
+// Note: memset-based fills are only exact for 0 (and -1) on multi-byte dtypes;
+// any other nonzero fill repeats its low byte across the element.
+int fillValueToInt(const std::string &fillValue);
 
 void swapArrayEndianness(void* array, const size_t elementSize, const size_t numElements);
 #endif

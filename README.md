@@ -40,6 +40,8 @@ The writer takes an output filename and a numpy array with optional arguments fo
 
 The following compressors are supported: blosclz, lz4, lz4hc, gzip, zlib, zstd
 
+The following data types are supported: uint8, int8, uint16, int16, uint32, int32, uint64, int64, float32/single, and float64/double
+
 zstd is recommended for when you want smaller file sizes or disk limited processing such as when using a cluster
 
 lz4 is recommended for when file sizes are not a concern or cpu limited processing such as when only using a single machine

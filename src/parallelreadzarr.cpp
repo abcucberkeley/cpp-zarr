@@ -350,72 +350,32 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
                                        endCoords[2]-startCoords[2]};
 
     Zarr.set_chunkInfo(startCoords, endCoords);
-    uint8_t err = 0;
     uint64_t readSize = readShape[0]*readShape[1]*readShape[2];
-    std::string dType = Zarr.get_dtype().substr(1);
-    if(dType == "u1"){
-        uint64_t bits = 8;
-        uint8_t* zarrArr = nullptr;
-        if(stoi(Zarr.get_fill_value())){
-            zarrArr = (uint8_t*)malloc(readSize*sizeof(uint8_t));
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(uint8_t));
-        }
-        else zarrArr = (uint8_t*)calloc(readSize,sizeof(uint8_t));
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
-        if(err){
-            free(zarrArr);
-            return NULL;
-        }
-        else return (void*)zarrArr;
-    }
-    else if(dType == "u2"){
-        uint64_t bits = 16;
-        uint16_t* zarrArr = nullptr;
-        if(stoi(Zarr.get_fill_value())){
-            zarrArr = (uint16_t*)malloc(readSize*(uint64_t)(sizeof(uint16_t)));
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(uint16_t));
-        }
-        else zarrArr = (uint16_t*)calloc(readSize,(uint64_t)(sizeof(uint16_t)));
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
-        if(err){
-            free(zarrArr);
-            return NULL;
-        }
-        else return (void*)zarrArr;
-    }
-    else if(dType == "f4"){
-        uint64_t bits = 32;
-        float* zarrArr = nullptr;
-        if(stoi(Zarr.get_fill_value())){
-            zarrArr = (float*)malloc(readSize*(sizeof(float)));
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(float));
-        }
-        else zarrArr = (float*)calloc(readSize,(sizeof(float)));
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
-        if(err){
-            free(zarrArr);
-            return NULL;
-        }
-        else return (void*)zarrArr;
-    }
-    else if(dType == "f8"){
-        uint64_t bits = 64;
-        double* zarrArr = nullptr;
-        if(stoi(Zarr.get_fill_value())){
-            zarrArr = (double*)malloc(readSize*(sizeof(double)));
-            memset(zarrArr,stoi(Zarr.get_fill_value()),readSize*sizeof(double));
-        }
-        else zarrArr = (double*)calloc(readSize,(sizeof(double)));
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,true);
-        if(err){
-            free(zarrArr);
-            return NULL;
-        }
-        else return (void*)zarrArr;
-    }
-    else{
+
+    // The chunk read/copy machinery is element-width based, so one generic path
+    // covers every supported dtype: signed/unsigned 8/16/32/64-bit integers and
+    // 32/64-bit floats.
+    const std::string &dtype = Zarr.get_dtype();
+    const uint64_t bytes = Zarr.dtypeBytes();
+    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
+    if(!bytes || (kind != 'u' && kind != 'i' && kind != 'f') ||
+       (kind == 'f' && bytes < 4)){
         return NULL;
     }
+
+    void* zarrArr = nullptr;
+    const int fillValue = fillValueToInt(Zarr.get_fill_value());
+    if(fillValue){
+        zarrArr = malloc(readSize*bytes);
+        memset(zarrArr,fillValue,readSize*bytes);
+    }
+    else zarrArr = calloc(readSize,bytes);
+    uint8_t err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,true);
+    if(err){
+        free(zarrArr);
+        return NULL;
+    }
+    return zarrArr;
 }
 
 void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t startY, uint64_t startZ, uint64_t endX, uint64_t endY, uint64_t endZ, uint8_t imageJIm){
@@ -423,26 +383,34 @@ void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t s
     void* zarrArr = parallelReadZarrWriteWrapper(Zarr, true,
                               {startX, startY, startZ},
                               {endX, endY, endZ});
+    // Unsupported dtype or read error: return NULL rather than crashing below
+    if(!zarrArr) return NULL;
     // May need to add a check for if the data is f order or c order for ImageJ
     // For the c order images I have tested, we also have to do this flip for now
     if(imageJIm /*&& (order == 'F' || order == 'f')*/){
-        void* zarrArrC = malloc(Zarr.get_shape(0)*Zarr.get_shape(1)*Zarr.get_shape(2)*Zarr.dtypeBytes());
+        // The buffer holds the read window, not the whole array, so allocate and
+        // index with the window's dimensions
+        const uint64_t rx = endX-startX;
+        const uint64_t ry = endY-startY;
+        const uint64_t rz = endZ-startZ;
+        const uint64_t es = Zarr.dtypeBytes();
+        void* zarrArrC = malloc(rx*ry*rz*es);
 		#pragma omp parallel for
-        for(uint64_t k = 0; k < Zarr.get_shape(2); k++){
-            for(uint64_t j = 0; j < Zarr.get_shape(1); j++){
-                for(uint64_t i = 0; i < Zarr.get_shape(0); i++){
-                    switch(Zarr.dtypeBytes()){
+        for(uint64_t k = 0; k < rz; k++){
+            for(uint64_t j = 0; j < ry; j++){
+                for(uint64_t i = 0; i < rx; i++){
+                    switch(es){
                         case 1:
-                            ((uint8_t*)zarrArrC)[j+(i*Zarr.get_shape(1))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))] = ((uint8_t*)zarrArr)[i+(j*Zarr.get_shape(0))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))];
+                            ((uint8_t*)zarrArrC)[j+(i*ry)+(k*ry*rx)] = ((uint8_t*)zarrArr)[i+(j*rx)+(k*rx*ry)];
                             break;
                         case 2:
-                            ((uint16_t*)zarrArrC)[j+(i*Zarr.get_shape(1))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))] = ((uint16_t*)zarrArr)[i+(j*Zarr.get_shape(0))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))];
+                            ((uint16_t*)zarrArrC)[j+(i*ry)+(k*ry*rx)] = ((uint16_t*)zarrArr)[i+(j*rx)+(k*rx*ry)];
                             break;
                         case 4:
-                            ((float*)zarrArrC)[j+(i*Zarr.get_shape(1))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))] = ((float*)zarrArr)[i+(j*Zarr.get_shape(0))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))];
+                            ((float*)zarrArrC)[j+(i*ry)+(k*ry*rx)] = ((float*)zarrArr)[i+(j*rx)+(k*rx*ry)];
                             break;
                         case 8:
-                            ((double*)zarrArrC)[j+(i*Zarr.get_shape(1))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))] = ((double*)zarrArr)[i+(j*Zarr.get_shape(0))+(k*Zarr.get_shape(1)*Zarr.get_shape(0))];
+                            ((double*)zarrArrC)[j+(i*ry)+(k*ry*rx)] = ((double*)zarrArr)[i+(j*rx)+(k*rx*ry)];
                             break;
                     }
                 }

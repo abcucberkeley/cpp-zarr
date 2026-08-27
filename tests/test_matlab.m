@@ -29,14 +29,16 @@ function test_matlab(mexDir)
 
     rng(1234567);
     sz = [40 24 18];                       % d0, d1, d2
-    types = {'uint8','uint16','single','double'};   % cpp-zarr dtypes: u1,u2,f4,f8
+    types = {'uint8','int8','uint16','int16','uint32','int32','uint64','int64','single','double'};
 
     for k = 1:numel(types)
         t = types{k};
         if any(strcmp(t, {'single','double'}))
             data = cast((rand(sz) - 0.5) * 1000, t);
-        else
+        elseif t(1) == 'u'
             data = cast(randi([0 200], sz), t);
+        else
+            data = cast(randi([-100 100], sz), t);   % negatives exercise signed types
         end
 
         f = fullfile(tmp, ['rt_' t '.zarr']);

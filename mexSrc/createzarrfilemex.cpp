@@ -46,19 +46,17 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 mexErrMsgIdAndTxt("zarr:inputError","The first character of dtype must be \"<\" or \">\"\n");
             }
 
-            if(dtype[1] == 'u' || dtype[1] == 'f'){
-                if(dtype[1] == 'u'){
-                    if(dtype[2] != '1' && dtype[2] != '2'){
-                        mexErrMsgIdAndTxt("zarr:inputError","For dtype u, the third character of dtype must be \"1\" or \"2\"\n");
-                    }
-                }
-                else{
-                    if(dtype[2] != '4' && dtype[2] != '8'){
-                        mexErrMsgIdAndTxt("zarr:inputError","For dtype f, the third character of dtype must be \"4\" or \"8\"\n");
-                    }
+            if(dtype[1] == 'u' || dtype[1] == 'i'){
+                if(dtype[2] != '1' && dtype[2] != '2' && dtype[2] != '4' && dtype[2] != '8'){
+                    mexErrMsgIdAndTxt("zarr:inputError","For dtype u or i, the third character of dtype must be \"1\", \"2\", \"4\", or \"8\"\n");
                 }
             }
-            else mexErrMsgIdAndTxt("zarr:inputError","The second character of dtype must be \"u\" or \"f\"\n");
+            else if(dtype[1] == 'f'){
+                if(dtype[2] != '4' && dtype[2] != '8'){
+                    mexErrMsgIdAndTxt("zarr:inputError","For dtype f, the third character of dtype must be \"4\" or \"8\"\n");
+                }
+            }
+            else mexErrMsgIdAndTxt("zarr:inputError","The second character of dtype must be \"u\", \"i\", or \"f\"\n");
             Zarr.set_dtype(dtype);
         }
         else if(currInput == "order"){

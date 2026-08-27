@@ -50,19 +50,31 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
         dims[2] = endCoords[2]-startCoords[2];
     }
     void* data = parallelReadZarrWriteWrapper(Zarr, crop, startCoords, endCoords);
+    if (!data) throw std::runtime_error("Failed to read the zarr file (unsupported dtype or read error)");
 
-	switch (Zarr.dtypeBytes()) {
-        case 1:  // 8-bit unsigned int
-            return create_pybind11_array<uint8_t>(data, dims);
-		case 2: // 16-bit unsigned int
-            return create_pybind11_array<uint16_t>(data, dims);
-        case 4: // 32-bit float
-            return create_pybind11_array<float>(data, dims);
-        case 8: // 64-bit double
-            return create_pybind11_array<double>(data, dims);
-        default:
-            throw std::runtime_error("Unsupported data type");
+    // Dispatch on the full dtype: byte width alone is ambiguous now that signed,
+    // unsigned, and float types of the same size are all supported.
+    const std::string &dtype = Zarr.get_dtype();
+    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
+    const char dsize = dtype.size() == 3 ? dtype[2] : '\0';
+    if (kind == 'u') {
+        if (dsize == '1') return create_pybind11_array<uint8_t>(data, dims);
+        if (dsize == '2') return create_pybind11_array<uint16_t>(data, dims);
+        if (dsize == '4') return create_pybind11_array<uint32_t>(data, dims);
+        if (dsize == '8') return create_pybind11_array<uint64_t>(data, dims);
     }
+    else if (kind == 'i') {
+        if (dsize == '1') return create_pybind11_array<int8_t>(data, dims);
+        if (dsize == '2') return create_pybind11_array<int16_t>(data, dims);
+        if (dsize == '4') return create_pybind11_array<int32_t>(data, dims);
+        if (dsize == '8') return create_pybind11_array<int64_t>(data, dims);
+    }
+    else if (kind == 'f') {
+        if (dsize == '4') return create_pybind11_array<float>(data, dims);
+        if (dsize == '8') return create_pybind11_array<double>(data, dims);
+    }
+    free(data);
+    throw std::runtime_error("Unsupported data type: " + dtype);
 }
 
 void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
@@ -80,26 +92,19 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     Zarr.set_chunks(chunks);
     Zarr.set_dimension_separator(dimension_separator);
 
-    uint64_t dtype;
-    if (info.format == pybind11::format_descriptor<uint8_t>::format()) {
-        dtype = 8;
-        Zarr.set_dtype("<u1");
+    // Map the numpy dtype via kind ('u' unsigned int, 'i' signed int, 'f' float)
+    // and element size. This is robust across platforms, unlike buffer-format
+    // strings (e.g. numpy int64 reports 'l' on Linux while int64_t formats as 'q').
+    const char kind = data.dtype().kind();
+    const uint64_t itemsize = (uint64_t)data.dtype().itemsize();
+    const bool intKind = (kind == 'u' || kind == 'i');
+    if (!((intKind && (itemsize == 1 || itemsize == 2 || itemsize == 4 || itemsize == 8)) ||
+          (kind == 'f' && (itemsize == 4 || itemsize == 8)))) {
+        throw std::runtime_error(std::string("Unsupported data type: kind '") + kind +
+                                 "' with " + std::to_string(itemsize) + " bytes per element");
     }
-	else if (info.format == pybind11::format_descriptor<uint16_t>::format()) {
-        dtype = 16;
-        Zarr.set_dtype("<u2");
-    }
-	else if (info.format == pybind11::format_descriptor<float>::format()) {
-        dtype = 32;
-        Zarr.set_dtype("<f4");
-    }
-	else if (info.format == pybind11::format_descriptor<double>::format()) {
-        dtype = 64;
-        Zarr.set_dtype("<f8");
-    }
-	else {
-        throw std::runtime_error("Unsupported data type");
-    }
+    const uint64_t dtype = itemsize * 8;
+    Zarr.set_dtype(std::string("<") + kind + std::to_string(itemsize));
 
     Zarr.set_shape(endCoords);
 
