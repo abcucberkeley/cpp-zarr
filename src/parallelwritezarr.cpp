@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <omp.h>
@@ -61,6 +62,20 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     // Parse the fill value once (stoi would throw on Infinity-normalized fills,
     // and the C-order path below fills per element).
     const int fillValue = fillValueToInt(Zarr.get_fill_value());
+
+    // The fill value as one element of the array's dtype, for the C-order path's
+    // per-element fills.
+    uint8_t fillElem[8] = {0};
+    {
+        const std::string &dtype = Zarr.get_dtype();
+        const char kind = dtype.size() == 3 ? dtype[1] : '\0';
+        if(kind == 'f' && bytes == 4){ const float v = (float)fillValue; memcpy(fillElem, &v, 4); }
+        else if(kind == 'f' && bytes == 8){ const double v = (double)fillValue; memcpy(fillElem, &v, 8); }
+        else if(bytes == 1){ const uint8_t v = (uint8_t)fillValue; memcpy(fillElem, &v, 1); }
+        else if(bytes == 2){ const uint16_t v = (uint16_t)fillValue; memcpy(fillElem, &v, 2); }
+        else if(bytes == 4){ const uint32_t v = (uint32_t)fillValue; memcpy(fillElem, &v, 4); }
+        else if(bytes == 8){ const uint64_t v = (uint64_t)(int64_t)fillValue; memcpy(fillElem, &v, 8); }
+    }
 
     // blosc (both blosc1 and blosc2) stores each chunk as a single frame with
     // 32-bit size fields, so one chunk cannot exceed BLOSC_MAX_BUFFERSIZE
@@ -196,7 +211,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                             if((cAV[2]+1)*Zarr.get_chunks(2) > Zarr.get_shape(2)){
                                 memcpy((uint8_t*)chunkUnC+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((Zarr.get_shape(2)-z)*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes);
                                 uint64_t zRest = ((cAV[2]+1)*Zarr.get_chunks(2))-Zarr.get_shape(2);
-                                memset((uint8_t*)chunkUnC+(((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),fillValue,(zRest*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
+                                // Fill starts at the array's end, after the existing data copied above
+                                memset((uint8_t*)chunkUnC+(((Zarr.get_shape(2)-(cAV[2]*Zarr.get_chunks(2)))*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes),fillValue,(zRest*(Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes);
                             }
                             else{
                                 memcpy((uint8_t*)chunkUnC+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((((cAV[2]+1)*Zarr.get_chunks(2))-z)*Zarr.get_chunks(0)*Zarr.get_chunks(1))*bytes);
@@ -224,7 +240,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                                 if((cAV[1]+1)*Zarr.get_chunks(1) > Zarr.get_shape(1)){
                                     memcpy((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((Zarr.get_shape(1)-y)*Zarr.get_chunks(0))*bytes);
                                     uint64_t yRest = ((cAV[1]+1)*Zarr.get_chunks(1))-Zarr.get_shape(1);
-                                    memset((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(yRest*(Zarr.get_chunks(0)))*bytes);
+                                    // Fill starts at the array's end, after the existing data copied above
+                                    memset((uint8_t*)chunkUnC+((((Zarr.get_shape(1)-(cAV[1]*Zarr.get_chunks(1)))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),fillValue,(yRest*(Zarr.get_chunks(0)))*bytes);
                                 }
                                 else{
                                     memcpy((uint8_t*)chunkUnC+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(uint8_t*)cRegion+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((((cAV[1]+1)*Zarr.get_chunks(1))-y)*Zarr.get_chunks(0))*bytes);
@@ -296,48 +313,36 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                 }
             }
             else if (Zarr.get_order() == "C"){
-                int64_t baseX = cAV[0]*Zarr.get_chunks(0);
-                int64_t baseY = cAV[1]*Zarr.get_chunks(1);
-                int64_t baseZ = cAV[2]*Zarr.get_chunks(2);
-                uint64_t writeX = (baseX-startCoords[0])/Zarr.get_chunks(0);
-                uint64_t writeY = (baseY-startCoords[1])/Zarr.get_chunks(1);
-                uint64_t writeZ = (baseZ-startCoords[2])/Zarr.get_chunks(2);
-                for(int64_t x = baseX; x < (cAV[0]+1)*Zarr.get_chunks(0); x++){
-                    for(int64_t y = baseY; y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
-                        for(int64_t z = baseZ; z < (cAV[2]+1)*Zarr.get_chunks(2); z++){
-                            switch(bytes){
-                                case 1:
-                                    if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
-                                        continue;
-                                    }
-                                        ((uint8_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint8_t*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];
-                                        break;
-                                case 2:
-                                    if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
-                                        continue;
-                                    }
-                                        ((uint16_t*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((uint16_t*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];
-                                        break;
-                                case 4:
-                                    if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
-                                        continue;
-                                    }
-                                        ((float*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((float*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];
-                                        break;
-                                case 8:
-                                    if(x>=endCoords[0] || x<startCoords[0] || y>=endCoords[1] || y<startCoords[1] || z>=endCoords[2] || z<startCoords[2]){
-                                        ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = fillValue;
-                                        continue;
-                                    }
-                                        ((double*)chunkUnC)[(((z%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((x%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1))))] = ((double*)zarrArr)[(x-baseX+(writeX*Zarr.get_chunks(0)))+((y-baseY+((writeY*Zarr.get_chunks(1))))*writeShape[0])+((z-baseZ+(writeZ*Zarr.get_chunks(2)))*writeShape[0]*writeShape[1])];
-                                        break;
-                            }
-
-                        }
+                // F->C: gather the chunk (z fastest) from the F-order input
+                // (x fastest) one cache-sized tile at a time.
+                const uint64_t C0 = Zarr.get_chunks(0), C1 = Zarr.get_chunks(1), C2 = Zarr.get_chunks(2);
+                const uint64_t b0 = cAV[0]*C0, b1 = cAV[1]*C1, b2 = cAV[2]*C2;
+                const uint64_t x0 = std::max(b0, startCoords[0]), x1 = std::min(b0+C0, endCoords[0]);
+                const uint64_t y0 = std::max(b1, startCoords[1]), y1 = std::min(b1+C1, endCoords[1]);
+                const uint64_t z0 = std::max(b2, startCoords[2]), z1 = std::min(b2+C2, endCoords[2]);
+                // Elements outside the written region get the fill value, except that
+                // when cropping into an existing array the chunk's current contents
+                // (cRegion, F order) are kept wherever they lie inside the array.
+                if(x0 != b0 || x1 != b0+C0 || y0 != b1 || y1 != b1+C1 || z0 != b2 || z1 != b2+C2){
+                    fillElements(bytes, chunkUnC, s, fillElem);
+                    if(cRegion){
+                        const uint64_t e0 = std::min(b0+C0, Zarr.get_shape(0))-b0;
+                        const uint64_t e1 = std::min(b1+C1, Zarr.get_shape(1))-b1;
+                        const uint64_t e2 = std::min(b2+C2, Zarr.get_shape(2))-b2;
+                        // i = z (contiguous in the chunk), j = y, k = x (contiguous in cRegion)
+                        copyBoxTransposed(bytes, cRegion, chunkUnC, e2, e1, e0,
+                                          C0*C1, C0, 1,
+                                          1, C2, C1*C2);
                     }
+                }
+                if(x0 < x1 && y0 < y1 && z0 < z1){
+                    // i = z (contiguous in the chunk), j = y, k = x (contiguous in the input)
+                    copyBoxTransposed(bytes,
+                        (const uint8_t*)zarrArr+((x0-startCoords[0])+((y0-startCoords[1])*writeShape[0])+((z0-startCoords[2])*writeShape[0]*writeShape[1]))*bytes,
+                        (uint8_t*)chunkUnC+(((x0-b0)*C1*C2)+((y0-b1)*C2)+(z0-b2))*bytes,
+                        z1-z0, y1-y0, x1-x0,
+                        writeShape[0]*writeShape[1], writeShape[0], 1,
+                        1, C2, C1*C2);
                 }
             }
 

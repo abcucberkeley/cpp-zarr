@@ -1,5 +1,6 @@
 #ifndef CPPZARR_HELPERFUNCTIONS_H
 #define CPPZARR_HELPERFUNCTIONS_H
+#include <cstdint>
 #include <string>
 
 #ifndef _WIN32
@@ -36,4 +37,19 @@ bool oppositeEndianness(const std::string &dtype);
 int fillValueToInt(const std::string &fillValue);
 
 void swapArrayEndianness(void* array, const size_t elementSize, const size_t numElements);
+
+// Copy an n0 x n1 x n2 box of elements between two strided layouts (strides in
+// elements, element size `bytes` = 1, 2, 4 or 8):
+//     dst[i*d0 + j*d1 + k*d2] = src[i*s0 + j*s1 + k*s2]
+// Used to convert between F-order (x fastest) and C-order (z fastest) data: i and
+// k are processed in small tiles so each tile's source and destination cache lines
+// stay in L1, instead of striding through memory one element at a time.
+void copyBoxTransposed(const uint64_t bytes, const void* src, void* dst,
+                       const uint64_t n0, const uint64_t n1, const uint64_t n2,
+                       const uint64_t s0, const uint64_t s1, const uint64_t s2,
+                       const uint64_t d0, const uint64_t d1, const uint64_t d2);
+
+// Set n elements of size `bytes` to the element whose bytes are at `elem`.
+void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void* elem);
+
 #endif

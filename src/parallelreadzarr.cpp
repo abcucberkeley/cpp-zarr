@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <fstream>
 #include <cstdint>
 #include <omp.h>
@@ -16,7 +17,6 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool useCtx,
                          const bool sparse)
 {
-    void* zarrArrC = nullptr;
     const uint64_t bytes = (bits/8);
     
     int32_t numWorkers = omp_get_max_threads();
@@ -56,9 +56,6 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
     const uint64_t sB = s*bytes;
 
-    // If C->F order then we need a temp C order array
-    if(Zarr.get_order() == "C") zarrArrC = calloc(readShape[0]*readShape[1]*readShape[2],bytes);
-    
     void* zeroChunkUnc = NULL;
     if(sparse){
         zeroChunkUnc = calloc(s,bytes);
@@ -257,31 +254,24 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
                 
             }
-            // C->C (x and z are flipped) then we flip to F below
+            // C->F: transpose the chunk (z fastest) straight into the F-order
+            // output (x fastest). Only the part of the chunk inside the read
+            // region is copied, one cache-sized tile at a time.
             else if (Zarr.get_order() == "C"){
-                for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
-                    if(y>=endCoords[1]) break;
-                    else if(y<startCoords[1]) continue;
-                    for(int64_t z = cAV[0]*Zarr.get_chunks(0); z < (cAV[0]+1)*Zarr.get_chunks(0); z++){
-                        if(z>=endCoords[0]) break;
-                        else if(z<startCoords[0]) continue;
-                        if(((cAV[2]*Zarr.get_chunks(2)) < startCoords[2] && ((cAV[2]+1)*Zarr.get_chunks(2)) > startCoords[2]) || (cAV[2]+1)*Zarr.get_chunks(2)>endCoords[2]){
-                            if(((cAV[2]*Zarr.get_chunks(2)) < startCoords[2] && ((cAV[2]+1)*Zarr.get_chunks(2)) > startCoords[2]) && (cAV[2]+1)*Zarr.get_chunks(2)>endCoords[2]){
-                                memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2))-startCoords[2]+(startCoords[2]%Zarr.get_chunks(2)))+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+(((startCoords[2]%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),((endCoords[2]%Zarr.get_chunks(2))-(startCoords[2]%Zarr.get_chunks(2)))*bytes);
-                            }
-                            else if((cAV[2]+1)*Zarr.get_chunks(2)>endCoords[2]){
-                                memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2))-startCoords[2])+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),(endCoords[2]%Zarr.get_chunks(2))*bytes);
-                            }
-                            else if((cAV[2]*Zarr.get_chunks(2)) < startCoords[2] && ((cAV[2]+1)*Zarr.get_chunks(2)) > startCoords[2]){
-                                memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2)-startCoords[2]+(startCoords[2]%Zarr.get_chunks(2))))+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+(((startCoords[2]%Zarr.get_chunks(2))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),(Zarr.get_chunks(2)-(startCoords[2]%Zarr.get_chunks(2)))*bytes);
-                            }
-                        }
-                        else{
-                            memcpy((uint8_t*)zarrArrC+((((cAV[2]*Zarr.get_chunks(2))-startCoords[2])+((y-startCoords[1])*readShape[2])+((z-startCoords[0])*readShape[2]*readShape[1]))*bytes),(uint8_t*)bufferDest+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(2))+((z%Zarr.get_chunks(0))*Zarr.get_chunks(2)*Zarr.get_chunks(1)))*bytes),Zarr.get_chunks(2)*bytes);
-                        }
-                    }
-                }  
-                
+                const uint64_t C0 = Zarr.get_chunks(0), C1 = Zarr.get_chunks(1), C2 = Zarr.get_chunks(2);
+                const uint64_t b0 = cAV[0]*C0, b1 = cAV[1]*C1, b2 = cAV[2]*C2;
+                const uint64_t x0 = std::max(b0, startCoords[0]), x1 = std::min(b0+C0, endCoords[0]);
+                const uint64_t y0 = std::max(b1, startCoords[1]), y1 = std::min(b1+C1, endCoords[1]);
+                const uint64_t z0 = std::max(b2, startCoords[2]), z1 = std::min(b2+C2, endCoords[2]);
+                if(x0 < x1 && y0 < y1 && z0 < z1){
+                    // i = x (contiguous in the output), j = y, k = z (contiguous in the chunk)
+                    copyBoxTransposed(bytes,
+                        (const uint8_t*)bufferDest+(((x0-b0)*C1*C2)+((y0-b1)*C2)+(z0-b2))*bytes,
+                        (uint8_t*)zarrArr+((x0-startCoords[0])+((y0-startCoords[1])*readShape[0])+((z0-startCoords[2])*readShape[0]*readShape[1]))*bytes,
+                        x1-x0, y1-y0, z1-z0,
+                        C1*C2, C2, 1,
+                        1, readShape[0], readShape[0]*readShape[1]);
+                }
             }
             
         }
@@ -295,35 +285,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
 
     if(err){
         Zarr.set_errString(errString);
-        free(zarrArrC);
         return 1;
-    }
-    else if (Zarr.get_order() == "C"){
-        // Transpose the C-order temp buffer into the F-order output.
-        // Cache-blocked over the i/k plane (per j-slice) with the dtype switch
-        // hoisted out of the element loop; both are far faster than a naive
-        // element-by-element transpose carrying a per-element type switch.
-        const size_t RS0=readShape[0], RS1=readShape[1], RS2=readShape[2];
-        const size_t B=16;
-        #define CZ_TRANSPOSE(T) do { \
-            T* dst=(T*)zarrArr; const T* src=(const T*)zarrArrC; \
-            _Pragma("omp parallel for schedule(static)") \
-            for(size_t j=0;j<RS1;j++){ \
-                for(size_t ii=0; ii<RS0; ii+=B){ const size_t iend=(ii+B<RS0)?ii+B:RS0; \
-                    for(size_t kk=0; kk<RS2; kk+=B){ const size_t kend=(kk+B<RS2)?kk+B:RS2; \
-                        for(size_t i=ii;i<iend;i++){ \
-                            const T* s = src + i*RS1*RS2 + j*RS2; \
-                            T* d = dst + j*RS0 + i; \
-                            for(size_t k=kk;k<kend;k++) d[k*RS0*RS1] = s[k]; \
-                        } } } } } while(0)
-        switch(bytes){
-            case 1: CZ_TRANSPOSE(uint8_t); break;
-            case 2: CZ_TRANSPOSE(uint16_t); break;
-            case 4: CZ_TRANSPOSE(float); break;
-            case 8: CZ_TRANSPOSE(double); break;
-        }
-        #undef CZ_TRANSPOSE
-        free(zarrArrC);
     }
     if(oppositeEndianness(Zarr.get_dtype())) swapArrayEndianness(zarrArr,bytes,readShape[0]*readShape[1]*readShape[2]);
     return 0;

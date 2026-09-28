@@ -1,7 +1,8 @@
 // Minimal smoke test for the cpp-zarr library: write small random volumes, read
 // them back, and check the bytes survive the round trip. Covers every supported
-// dtype (u1/u2/f4/f8), each compressor, and both storage orders (F and C), using
-// a shape that does not divide the chunk size so partial edge chunks are exercised.
+// dtype (signed/unsigned 8-64 bit ints, f4/f8), each compressor, and both storage
+// orders (F and C), using shapes that do not divide the chunk size so partial edge
+// chunks are exercised, plus chunks large enough for the full-tile F<->C paths.
 //
 // Exits 0 if every case passes, 1 otherwise, so CTest reports pass/fail.
 // Usage: roundtripTest [output_dir]   (defaults to the current directory)
@@ -32,10 +33,14 @@ static void step(const char* name, const char* comp, const char* order, const ch
 int main(int argc, char** argv){
     const std::string dir = (argc > 1) ? argv[1] : ".";
 
-    // Non-chunk-aligned shape so read/write hit partial edge chunks.
-    const std::vector<uint64_t> shape  = {40, 24, 18};
-    const std::vector<uint64_t> chunks = {16, 16, 16};
-    const uint64_t n = shape[0] * shape[1] * shape[2];
+    struct Config { const char* tag; std::vector<uint64_t> shape, chunks; std::vector<const char*> comps; };
+    const Config configs[] = {
+        // Non-chunk-aligned shape so read/write hit partial edge chunks; every compressor.
+        {"", {40, 24, 18}, {16, 16, 16}, {"lz4", "blosclz", "lz4hc", "zlib", "zstd", "gzip"}},
+        // Chunks >= 128 along x and z so C-order reads/writes take the full-tile
+        // (vectorized) transpose path for every element size, plus partial edges.
+        {"big", {300, 9, 270}, {128, 4, 128}, {"lz4"}},
+    };
 
     const Case cases[]  = {
         {"uint8",  "<u1", 8},  {"int8",   "<i1", 8},
@@ -44,22 +49,25 @@ int main(int argc, char** argv){
         {"uint64", "<u8", 64}, {"int64",  "<i8", 64},
         {"float",  "<f4", 32}, {"double", "<f8", 64},
     };
-    const char* comps[]  = {"lz4", "blosclz", "lz4hc", "zlib", "zstd", "gzip"};
     const char* orders[] = {"F", "C"};
 
     std::mt19937 rng(1234567u);
     std::uniform_int_distribution<int> byteDist(0, 255);
 
     int total = 0, failures = 0;
+    for (const Config& cfg : configs){
+    const std::vector<uint64_t>& shape = cfg.shape;
+    const std::vector<uint64_t>& chunks = cfg.chunks;
+    const uint64_t n = shape[0] * shape[1] * shape[2];
     for (const Case& c : cases){
         const uint64_t nbytes = n * (c.bits / 8);
         std::vector<uint8_t> orig(nbytes);
         for (uint64_t i = 0; i < nbytes; i++) orig[i] = static_cast<uint8_t>(byteDist(rng));
 
-        for (const char* comp : comps){
+        for (const char* comp : cfg.comps){
             for (const char* order : orders){
                 total++;
-                const std::string path = dir + "/rt_" + c.name + "_" + comp + "_" + order + ".zarr";
+                const std::string path = dir + "/rt_" + c.name + "_" + comp + "_" + order + cfg.tag + ".zarr";
                 std::error_code ec; std::filesystem::remove_all(path, ec);
 
                 bool metaOK = false, dataOK = false;
@@ -103,14 +111,15 @@ int main(int argc, char** argv){
                 std::filesystem::remove_all(path, ec);
 
                 if (metaOK && dataOK){
-                    std::printf("PASS  %-6s %-8s %s\n", c.name, comp, order);
+                    std::printf("PASS  %-6s %-8s %s %s\n", c.name, comp, order, cfg.tag);
                 } else {
-                    std::printf("FAIL  %-6s %-8s %s  (meta=%d data=%d)\n",
-                                c.name, comp, order, (int)metaOK, (int)dataOK);
+                    std::printf("FAIL  %-6s %-8s %s %s  (meta=%d data=%d)\n",
+                                c.name, comp, order, cfg.tag, (int)metaOK, (int)dataOK);
                     failures++;
                 }
             }
         }
+    }
     }
 
     // Oversize-chunk guard: a blosc chunk >= ~2 GB uncompressed must be rejected
@@ -219,6 +228,91 @@ int main(int argc, char** argv){
         std::filesystem::remove_all(path, ec);
         if (ok) std::printf("PASS  ImageJ windowed read + NULL guard\n");
         else  { std::printf("FAIL  ImageJ windowed read + NULL guard\n"); failures++; }
+    }
+
+    // Bbox (crop) writes into an existing array must keep the existing data around
+    // the box in partially covered chunks, in both orders:
+    //   partial  : chunk-aligned start, box ends mid-chunk
+    //   unaligned: start not on a chunk boundary
+    //   edge     : box ends inside the array's last, partial chunk (y and z)
+    // and a missing chunk file must read back as the fill value in both orders.
+    {
+        typedef std::vector<uint64_t> V;
+        const V shape = {40, 24, 18};
+        const uint64_t n = shape[0]*shape[1]*shape[2];
+        std::mt19937 srng(99);
+        std::vector<uint16_t> A(n);
+        for (auto& v : A) v = 1 + srng() % 60000;   // never 0, so lost data is visible
+
+        auto writeBox = [&](const std::string& path, const char* order, const std::vector<uint16_t>& data,
+                            const V& s, const V& e, bool create) {
+            zarr Z;
+            if (create) {
+                Z.set_fileName(path); Z.set_cname("lz4"); Z.set_order(order); Z.set_chunks({16,16,16});
+                Z.set_dimension_separator("."); Z.set_dtype("<u2"); Z.set_shape(shape); Z.write_zarray();
+            } else {
+                Z = zarr(path);   // crop into the existing array, as the bbox writers do
+            }
+            Z.set_chunkInfo(s, e);
+            return parallelWriteZarr(Z, (void*)data.data(), s, e, {e[0]-s[0], e[1]-s[1], e[2]-s[2]},
+                                     16, false, /*crop*/!create, false) == 0;
+        };
+
+        struct Box { const char* name; V s, e; };
+        const Box boxes[] = { {"partial", {16,0,0}, {29,13,11}}, {"unaligned", {5,3,2}, {29,13,11}},
+                              {"edge", {0,0,0}, {40,20,17}} };
+        for (const char* order : {"F", "C"}) {
+            for (const Box& b : boxes) {
+                total++;
+                const std::string path = dir + "/rt_crop_" + b.name + "_" + order + ".zarr";
+                std::error_code ec; std::filesystem::remove_all(path, ec);
+                const V ws = {b.e[0]-b.s[0], b.e[1]-b.s[1], b.e[2]-b.s[2]};
+                std::vector<uint16_t> B(ws[0]*ws[1]*ws[2]);
+                for (auto& v : B) v = 60001 + srng() % 5000;
+                std::vector<uint16_t> expect = A;
+                for (uint64_t z = 0; z < ws[2]; z++) for (uint64_t y = 0; y < ws[1]; y++) for (uint64_t x = 0; x < ws[0]; x++)
+                    expect[(b.s[0]+x) + (b.s[1]+y)*shape[0] + (b.s[2]+z)*shape[0]*shape[1]] = B[x + y*ws[0] + z*ws[0]*ws[1]];
+                bool ok = false;
+                try {
+                    if (writeBox(path, order, A, {0,0,0}, shape, true) && writeBox(path, order, B, b.s, b.e, false)) {
+                        zarr Zr(path);
+                        std::vector<uint16_t> got(n, 0);
+                        Zr.set_chunkInfo({0,0,0}, shape);
+                        ok = parallelReadZarr(Zr, got.data(), {0,0,0}, shape, shape, 16, true, false) == 0 && got == expect;
+                    }
+                } catch (...) { ok = false; }
+                std::filesystem::remove_all(path, ec);
+                std::printf("%s  crop write (%s) %s\n", ok ? "PASS" : "FAIL", b.name, order);
+                if (!ok) failures++;
+            }
+
+            total++;
+            const std::string path = dir + std::string("/rt_missing_") + order + ".zarr";
+            std::error_code ec; std::filesystem::remove_all(path, ec);
+            bool ok = false;
+            try {
+                writeBox(path, order, A, {0,0,0}, shape, true);
+                std::string meta;
+                { std::ifstream f(path + "/.zarray"); meta.assign(std::istreambuf_iterator<char>(f), {}); }
+                const size_t p = meta.find("\"fill_value\"");
+                meta = meta.substr(0, p) + "\"fill_value\": 7" + meta.substr(meta.find_first_of(",}", p));
+                { std::ofstream f(path + "/.zarray"); f << meta; }
+                std::filesystem::remove(path + "/1.0.0");
+                zarr Zr(path);
+                uint16_t* got = (uint16_t*)parallelReadZarrWriteWrapper(Zr, false, {0,0,0}, shape);
+                ok = got != nullptr;
+                for (uint64_t z = 0; ok && z < shape[2]; z++) for (uint64_t y = 0; ok && y < shape[1]; y++)
+                    for (uint64_t x = 0; ok && x < shape[0]; x++) {
+                        const size_t i = x + y*shape[0] + z*shape[0]*shape[1];
+                        const bool missing = x >= 16 && x < 32 && y < 16 && z < 16;
+                        ok = got[i] == (missing ? 0x0707 : A[i]);   // fill is applied byte-wise
+                    }
+                free(got);
+            } catch (...) { ok = false; }
+            std::filesystem::remove_all(path, ec);
+            std::printf("%s  missing chunk reads as fill_value %s\n", ok ? "PASS" : "FAIL", order);
+            if (!ok) failures++;
+        }
     }
 
     std::printf("\n%d/%d round trips passed\n", total - failures, total);
