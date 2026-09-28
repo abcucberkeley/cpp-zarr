@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include "helperfunctions.h"
@@ -347,4 +348,24 @@ void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void*
         case 4: fillTyped<uint32_t>(dst, n, elem); break;
         case 8: fillTyped<uint64_t>(dst, n, elem); break;
     }
+}
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+bool renameReplace(const std::string &src, const std::string &dst){
+#ifdef _WIN32
+    // rename() on Windows fails when dst exists, which silently kept the old
+    // chunk/.zarray whenever an existing array was rewritten
+    return MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    return rename(src.c_str(), dst.c_str()) == 0;
+#endif
 }

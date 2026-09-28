@@ -254,8 +254,10 @@ int main(int argc, char** argv){
                 Z = zarr(path);   // crop into the existing array, as the bbox writers do
             }
             Z.set_chunkInfo(s, e);
+            // uuid temp files + rename, as the MEX writer does by default: rewriting
+            // existing chunks must replace them (Windows' rename() cannot)
             return parallelWriteZarr(Z, (void*)data.data(), s, e, {e[0]-s[0], e[1]-s[1], e[2]-s[2]},
-                                     16, false, /*crop*/!create, false) == 0;
+                                     16, /*useUuid*/true, /*crop*/!create, false) == 0;
         };
 
         struct Box { const char* name; V s, e; };

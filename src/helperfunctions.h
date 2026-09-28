@@ -23,6 +23,11 @@ void mkdirRecursive(const char *dir);
 
 bool fileExists(const std::string &fileName);
 
+// Move src onto dst, replacing dst if it already exists (the POSIX rename()
+// behavior; on Windows rename() fails instead when dst exists). Returns true on
+// success.
+bool renameReplace(const std::string &src, const std::string &dst);
+
 void makeDimensionFolders(const std::string &fileName);
 
 bool isLittleEndian();

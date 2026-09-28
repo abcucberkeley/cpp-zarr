@@ -171,8 +171,15 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     file.write(reinterpret_cast<char*>(shardFooter),shardFooterSize*sizeof(uint64_t));
                     file.write(reinterpret_cast<char*>(&shardFooterCRC32C),sizeof(uint32_t));
                     file.close();
-                    if(useUuid){
-                        rename(fileName.c_str(),fileNameFinal.c_str());
+                    if(useUuid && !renameReplace(fileName, fileNameFinal)){
+                        remove(fileName.c_str());
+                        #pragma omp critical
+                        {
+                            err = 1;
+                            errString = "Cannot move the temporary file into place: "+
+                                fileNameFinal+"\n";
+                        }
+                        break;
                     }
                     /*
                     if(pad){
@@ -462,8 +469,15 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     }
                     file.write(reinterpret_cast<char*>(chunkC),csize);
                     file.close();
-                if(useUuid){
-                    rename(fileName.c_str(),fileNameFinal.c_str());
+                if(useUuid && !renameReplace(fileName, fileNameFinal)){
+                    remove(fileName.c_str());
+                    #pragma omp critical
+                    {
+                        err = 1;
+                        errString = "Cannot move the temporary file into place: "+
+                            fileNameFinal+"\n";
+                    }
+                    break;
                 }
             }
             // Sharding
@@ -550,8 +564,14 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             file.write(reinterpret_cast<char*>(shardFooter),shardFooterSize*sizeof(uint64_t));
             file.write(reinterpret_cast<char*>(&shardFooterCRC32C),sizeof(uint32_t));
             file.close();
-            if(useUuid){
-                rename(fileName.c_str(),fileNameFinal.c_str());
+            if(useUuid && !renameReplace(fileName, fileNameFinal)){
+                remove(fileName.c_str());
+                #pragma omp critical
+                {
+                    err = 1;
+                    errString = "Cannot move the temporary file into place: "+
+                        fileNameFinal+"\n";
+                }
             }
         }
         free(shardFooter);

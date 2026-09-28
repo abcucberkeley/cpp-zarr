@@ -322,7 +322,10 @@ void zarr::write_jsonValues(){
     o << std::setw(4) << zarray << std::endl;
     o.close();
 
-    rename(fnFull.c_str(),fileNameFinal.c_str());
+    if(!renameReplace(fnFull, fileNameFinal)){
+        remove(fnFull.c_str());
+        throw std::string("cannotOpenZarray:"+fileNameFinal);
+    }
 }
 
 const std::string zarr::get_subfoldersString(const std::vector<uint64_t> &cAV) const{
