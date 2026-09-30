@@ -75,6 +75,10 @@ set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 # nlohmann/json: don't build its test suite
 set(JSON_BuildTests OFF CACHE INTERNAL "")
+# c-blosc still declares cmake_minimum_required(VERSION 2.8.12), which CMake 4
+# rejects (it dropped compatibility with versions before 3.5). This lets CMake 4
+# configure it with the 3.5 policies; older CMake versions ignore it.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 FetchContent_Declare(cblosc
     URL      https://github.com/Blosc/c-blosc/archive/refs/tags/v1.21.6.tar.gz

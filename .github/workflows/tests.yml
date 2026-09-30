@@ -1,0 +1,166 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpp-python:
+    name: C++ and Python (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux,   os: ubuntu-24.04, shell: bash,        generator: Unix Makefiles }
+          - { name: macOS,   os: macos-15,     shell: bash,        generator: Unix Makefiles }
+          - { name: Windows, os: windows-2025, shell: 'msys2 {0}', generator: Ninja }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The library includes the system's <uuid/uuid.h> (macOS has it in its SDK)
+      - name: Install libuuid headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y uuid-dev
+
+      # The library's build flags and OpenMP setup are GCC-only, so Windows uses
+      # MinGW. Python comes from MSYS2 too, so everything shares one toolchain.
+      # MSYS2 packages GCC's OpenMP runtime (libgomp) separately from gcc.
+      - name: Set up MinGW (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          pacboy: gcc:p libgomp:p cmake:p ninja:p python:p python-numpy:p pybind11:p
+
+      # Same compiler as the release builds. Apple clang has no OpenMP.
+      - name: Set up GCC 13 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list gcc@13 > /dev/null 2>&1 || brew install gcc@13
+          echo "CC=$(brew --prefix gcc@13)/bin/gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=$(brew --prefix gcc@13)/bin/g++-13" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        if: runner.os != 'Windows'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Build library and C++ tests
+        run: |
+          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release -DCPPZARR_BUILD_TESTS=ON -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build build --parallel 4
+          cmake --install build --prefix install
+
+      - name: C++ tests
+        run: ctest --test-dir build --output-on-failure
+
+      # Compiles the extension straight against the library built above, then
+      # runs the same test file cibuildwheel runs against the release wheels.
+      # On Linux and macOS it links like python/setup.py does (static libstdc++
+      # after the library).
+      - name: Python tests
+        run: |
+          EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          case "$RUNNER_OS" in
+            Linux)
+              python -m pip install numpy pybind11
+              FLAGS="-fPIC $(python -m pybind11 --includes) -Wl,-rpath,$PWD/install/lib -static-libstdc++" ;;
+            macOS)
+              python -m pip install numpy pybind11
+              FLAGS="-fPIC $(python -m pybind11 --includes) -isysroot $(xcrun --show-sdk-path) -undefined dynamic_lookup -Wl,-rpath,$PWD/install/lib -static-libstdc++" ;;
+            Windows)
+              PYINC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
+              PYVER=$(python -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")
+              FLAGS="-I$PYINC -lpython$PYVER"
+              cp install/bin/libcppZarr.dll python/cppzarr/ ;;
+          esac
+          "${CXX:-g++}" -O2 -std=c++17 -shared python/cppzarr.cpp -o "python/cppzarr/cppzarr$EXT" \
+            -Iinstall/include -Linstall/lib -lcppZarr $FLAGS
+          PYTHONPATH=python python python/tests/test_python.py
+
+  matlab:
+    name: MATLAB (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux,   os: ubuntu-24.04, shell: bash,        generator: Unix Makefiles }
+          - { name: macOS,   os: macos-15,     shell: bash,        generator: Unix Makefiles }
+          - { name: Windows, os: windows-2025, shell: 'msys2 {0}', generator: Ninja }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install libuuid headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y uuid-dev
+
+      - name: Set up MinGW (Windows)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          pacboy: gcc:p libgomp:p cmake:p ninja:p
+
+      # MATLAB finds MinGW through MW_MINGW64_LOC; build_mex.m selects it.
+      - name: Point MATLAB at MinGW (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"MW_MINGW64_LOC=${{ steps.msys2.outputs.msys2-location }}\ucrt64" >> $env:GITHUB_ENV'
+
+      - name: Set up GCC 13 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list gcc@13 > /dev/null 2>&1 || brew install gcc@13
+          echo "CC=$(brew --prefix gcc@13)/bin/gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=$(brew --prefix gcc@13)/bin/g++-13" >> "$GITHUB_ENV"
+
+      - name: Build library
+        run: |
+          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build build --parallel 4
+          cmake --install build --prefix install
+
+      - uses: matlab-actions/setup-matlab@v3
+        with:
+          release: R2024b
+          cache: true
+
+      # On macOS, MATLAB crashes while exiting once two OpenMP runtimes are
+      # loaded (the library's libgomp and MATLAB's own), after the tests have
+      # finished. So the marker file written after the last test decides the
+      # result there, not MATLAB's exit code.
+      - name: Build mex files and run MATLAB tests
+        uses: matlab-actions/run-command@v3
+        continue-on-error: ${{ runner.os == 'macOS' }}
+        with:
+          command: >-
+            addpath('.github/scripts', 'tests');
+            build_mex(fullfile(pwd, 'install'), fullfile(pwd, 'mex'));
+            test_matlab(fullfile(pwd, 'mex'));
+            fclose(fopen('matlab-tests-passed', 'w'));
+
+      - name: Check MATLAB tests passed
+        shell: bash
+        run: test -f matlab-tests-passed || { echo "::error::MATLAB tests did not finish, see the previous step's log"; exit 1; }
