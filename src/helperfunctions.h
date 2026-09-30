@@ -2,6 +2,7 @@
 #define CPPZARR_HELPERFUNCTIONS_H
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #ifndef _WIN32
 const char* expandTilde(const char* path);
@@ -56,5 +57,30 @@ void copyBoxTransposed(const uint64_t bytes, const void* src, void* dst,
 
 // Set n elements of size `bytes` to the element whose bytes are at `elem`.
 void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void* elem);
+
+// Copy an N-dimensional box of elements between two strided layouts (strides in
+// elements, element size `bytes` = 1, 2, 4 or 8):
+//     dst[sum_d i_d*dstStrides[d]] = src[sum_d i_d*srcStrides[d]],  0 <= i_d < extents[d]
+// When both sides are contiguous along the same axis (e.g. F to F) the box is
+// copied as contiguous runs; when they differ (F <-> C order) it uses the tiled
+// transpose of copyBoxTransposed, one plane at a time. The runs are visited with
+// the smallest destination stride innermost, or with lastAxisInnermost the
+// highest-numbered axis innermost (spreads consecutive writes across pages,
+// which is faster when the destination is freshly allocated memory).
+void copyBoxND(const uint64_t bytes, const void* src, void* dst,
+               const std::vector<uint64_t> &extents,
+               const std::vector<uint64_t> &srcStrides,
+               const std::vector<uint64_t> &dstStrides,
+               const bool lastAxisInnermost = false);
+
+// Set every element of a packed N-dimensional buffer (full extents `full`,
+// layout `strides`, F or C order) that lies outside the box [lo, hi) to the
+// element whose bytes are at `elem`.
+void fillOutsideBoxND(const uint64_t bytes, void* buf,
+                      const std::vector<uint64_t> &full,
+                      const std::vector<uint64_t> &strides,
+                      const std::vector<uint64_t> &lo,
+                      const std::vector<uint64_t> &hi,
+                      const void* elem);
 
 #endif

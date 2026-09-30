@@ -1,10 +1,12 @@
 # cpp-zarr
 An efficient parallel Zarr reader/writer that utilizes c-blosc/c-blosc2 and OpenMP.
 
-## Limitations
-1. Currently only 3D Zarr files are officially supported but better support may be added in the future
-   1. 1D and 2D Zarr files are supported if the other axes are 1 like [10,1,1] or [10,10,1]
-2. Currently the speed for reading and writing F order data is much faster than C order but better support may be added in the future
+## Arrays of any dimension
+Arrays with any number of dimensions, including 0D (a single value), can be read and written in F or C order. In Python the only limit is NumPy's (32 dimensions in NumPy 1.x, 64 in NumPy 2.x).
+1. Per-axis arguments take one value per axis: `bbox` is `[starts ends]`, and `chunks`, `start_coords`, and `end_coords` have one value for each axis
+2. The 3D-style arguments still work on 1D and 2D arrays (e.g. a 6-value `bbox` or 3-value `chunks`)
+3. Default chunks are 256 along three axes (the first three in MATLAB, the last three in Python) and 1 along the rest
+4. MATLAB reads 1D arrays as column vectors and 0D arrays as scalars
 
 ## Python
 
@@ -38,7 +40,7 @@ The reader returns a numpy array for the given zarr file with optional arguments
 
 The writer takes an output filename and a numpy array with optional arguments for setting metadata
 
-The following compressors are supported: blosclz, lz4, lz4hc, gzip, zlib, zstd
+The following compressors are supported: blosclz, lz4, lz4hc, gzip, zlib, zstd, and none (uncompressed)
 
 The following data types are supported: uint8, int8, uint16, int16, uint32, int32, uint64, int64, float32/single, and float64/double
 
@@ -131,14 +133,18 @@ createZarrFile('path/to/file.zarr');
 #### parallelReadZarr - Read a Zarr image into an array
 ````
 im = parallelReadZarr('path/to/file.zarr');
+% Read a region: [starts ends] with one start and one end per axis (1-based, inclusive)
+im = parallelReadZarr('path/to/file.zarr', 'bbox', [1 1 1 100 100 50]);
 ````
 
-#### parallelWriteTiff - Write an array out as a Zarr image
+#### parallelWriteZarr - Write an array out as a Zarr image
 ````
 im = rand(100,100,100);
-% The third input can always be 1 to use a uuid for the written blocks
-% The fourth input is the size of the blocks
 parallelWriteZarr('path/to/file.zarr',im);
+% Write with a chunk size (one value per axis)
+parallelWriteZarr('path/to/file.zarr',im,'chunks',[64 64 64]);
+% Write into a region of an existing Zarr file ([starts ends] as in parallelReadZarr)
+parallelWriteZarr('path/to/file.zarr',im(1:50,:,:),'bbox',[1 1 1 50 100 100]);
 ````
 
 ## Reference

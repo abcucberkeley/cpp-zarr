@@ -17,6 +17,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool useCtx,
                          const bool sparse)
 {
+    // A 0-dimensional array is a single element: sharding does not apply
+    if(Zarr.get_ndims() == 0 && Zarr.get_shard()){
+        Zarr.set_errString("Sharding is not supported for 0-dimensional arrays\n");
+        return 1;
+    }
     const uint64_t bytes = (bits/8);
     
     int32_t numWorkers = omp_get_max_threads();
@@ -48,13 +53,31 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     */
 
     // The chunk size is actually the inner chunk size if the zarr file is sharded
+    const uint64_t nDims = Zarr.get_ndims();
     if(Zarr.get_shard()){
-        Zarr.set_chunks({Zarr.get_chunk_shape(0),Zarr.get_chunk_shape(1),Zarr.get_chunk_shape(2)});
+        std::vector<uint64_t> innerChunks(nDims);
+        for(uint64_t d = 0; d < nDims; d++) innerChunks[d] = Zarr.get_chunk_shape(d);
+        Zarr.set_chunks(innerChunks);
     }
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
-    const uint64_t s = Zarr.get_chunks(0)*Zarr.get_chunks(1)*Zarr.get_chunks(2);
+    uint64_t s = 1;
+    for(uint64_t d = 0; d < nDims; d++) s *= Zarr.get_chunks(d);
     const uint64_t sB = s*bytes;
+
+    // Element strides of a decompressed chunk (F or C order) and of the F-order output
+    std::vector<uint64_t> chunkStrides(nDims), outStrides(nDims);
+    {
+        uint64_t acc = 1;
+        if(Zarr.get_order() == "C"){
+            for(int64_t d = (int64_t)nDims-1; d >= 0; d--){ chunkStrides[d] = acc; acc *= Zarr.get_chunks(d); }
+        }
+        else{
+            for(uint64_t d = 0; d < nDims; d++){ chunkStrides[d] = acc; acc *= Zarr.get_chunks(d); }
+        }
+        acc = 1;
+        for(uint64_t d = 0; d < nDims; d++){ outStrides[d] = acc; acc *= readShape[d]; }
+    }
 
     void* zeroChunkUnc = NULL;
     if(sparse){
@@ -71,6 +94,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         std::streamsize lastFileLen = 0;
         int64_t dsize = -1;
         int uncErr = 0;
+        std::vector<uint64_t> boxExt(nDims);
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
             if(f>=Zarr.get_numChunks() || err) break;
             const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
@@ -83,12 +107,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             }
             else{
                 // Can change this to the check for zeros maybe
-                bool pad = cAV[0] > endCoords[0]/Zarr.get_chunk_shape(0) ||
-                    cAV[1] > endCoords[1]/Zarr.get_chunk_shape(1) ||
-                    cAV[2] > endCoords[2]/Zarr.get_chunk_shape(2) ||
-                    cAV[0] < startCoords[0]/Zarr.get_chunk_shape(0) ||
-                    cAV[1] < startCoords[1]/Zarr.get_chunk_shape(1) ||
-                    cAV[2] < startCoords[2]/Zarr.get_chunk_shape(2);
+                bool pad = false;
+                for(uint64_t d = 0; d < nDims; d++){
+                    pad = pad || cAV[d] > endCoords[d]/Zarr.get_chunk_shape(d) ||
+                                 cAV[d] < startCoords[d]/Zarr.get_chunk_shape(d);
+                }
                 if(pad) {
                     continue;
                 }
@@ -142,7 +165,22 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
                 
                 // Decompress
-                if(Zarr.get_cname() != "gzip"){
+                if(Zarr.get_cname() == "none"){
+                    // Uncompressed chunk: used straight from the file buffer
+                    if(fileLen != (std::streamsize)sB){
+                        #pragma omp critical
+                        {
+                        err = 1;
+                        errString = "Uncompressed chunk is "+std::to_string(fileLen)+
+                                     " bytes instead of "+std::to_string(sB)+". ChunkName: "+
+                                     Zarr.get_fileName()+"/"+subfolderName+"/"+
+                                     Zarr.get_chunkNames(f)+"\n";
+                        }
+                        break;
+                    }
+                    dsize = sB;
+                }
+                else if(Zarr.get_cname() != "gzip"){
                     if(!useCtx){
                         dsize = blosc2_decompress(buffer, fileLen, bufferDest, sB);
                     }
@@ -222,58 +260,28 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     break;
                 }
             }
+            // Uncompressed chunks are used straight from the file buffer
+            const void* chunkData = Zarr.get_cname() == "none" ? buffer : bufferDest;
             if(sparse){
                 // If the chunk is all zeros (memcmp == 0) then we skip it
-                const bool allZeros = memcmp(zeroChunkUnc,bufferDest,sB);
+                const bool allZeros = memcmp(zeroChunkUnc,chunkData,sB);
                 if(!allZeros) continue;
             }
             
-            // F->F
-            if(Zarr.get_order() == "F"){  
-                for(int64_t y = cAV[1]*Zarr.get_chunks(1); y < (cAV[1]+1)*Zarr.get_chunks(1); y++){
-                    if(y>=endCoords[1]) break;
-                    else if(y<startCoords[1]) continue;
-                    for(int64_t z = cAV[2]*Zarr.get_chunks(2); z < (cAV[2]+1)*Zarr.get_chunks(2); z++){
-                        if(z>=endCoords[2]) break;
-                        else if(z<startCoords[2]) continue;
-                        if(((cAV[0]*Zarr.get_chunks(0)) < startCoords[0] && ((cAV[0]+1)*Zarr.get_chunks(0)) > startCoords[0]) || (cAV[0]+1)*Zarr.get_chunks(0)>endCoords[0]){
-                            if(((cAV[0]*Zarr.get_chunks(0)) < startCoords[0] && ((cAV[0]+1)*Zarr.get_chunks(0)) > startCoords[0]) && (cAV[0]+1)*Zarr.get_chunks(0)>endCoords[0]){
-                                memcpy((uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0]+(startCoords[0]%Zarr.get_chunks(0)))+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))*bytes),(uint8_t*)bufferDest+(((startCoords[0]%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),((endCoords[0]%Zarr.get_chunks(0))-(startCoords[0]%Zarr.get_chunks(0)))*bytes);
-                            }
-                            else if((cAV[0]+1)*Zarr.get_chunks(0)>endCoords[0]){
-                                memcpy((uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0])+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))*bytes),(uint8_t*)bufferDest+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(endCoords[0]%Zarr.get_chunks(0))*bytes);
-                            }
-                            else if((cAV[0]*Zarr.get_chunks(0)) < startCoords[0] && ((cAV[0]+1)*Zarr.get_chunks(0)) > startCoords[0]){
-                                memcpy((uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0)-startCoords[0]+(startCoords[0]%Zarr.get_chunks(0))))+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))*bytes),(uint8_t*)bufferDest+(((startCoords[0]%Zarr.get_chunks(0))+((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),(Zarr.get_chunks(0)-(startCoords[0]%Zarr.get_chunks(0)))*bytes);
-                            }
-                        }
-                        else{
-                            memcpy((uint8_t*)zarrArr+((((cAV[0]*Zarr.get_chunks(0))-startCoords[0])+((y-startCoords[1])*readShape[0])+((z-startCoords[2])*readShape[0]*readShape[1]))*bytes),(uint8_t*)bufferDest+((((y%Zarr.get_chunks(1))*Zarr.get_chunks(0))+((z%Zarr.get_chunks(2))*Zarr.get_chunks(0)*Zarr.get_chunks(1)))*bytes),Zarr.get_chunks(0)*bytes);
-                        }
-                    }
-                }
-                
+            // Copy the part of the chunk inside the read region into the F-order
+            // output: contiguous runs for F-order chunks, a tiled transpose for
+            // C-order chunks (last axis fastest -> first axis fastest)
+            uint64_t srcOff = 0, dstOff = 0;
+            for(uint64_t d = 0; d < nDims; d++){
+                const uint64_t b = cAV[d]*Zarr.get_chunks(d);
+                const uint64_t lo = std::max(b, startCoords[d]);
+                const uint64_t hi = std::min(b+Zarr.get_chunks(d), endCoords[d]);
+                boxExt[d] = hi > lo ? hi-lo : 0;
+                srcOff += (lo-b)*chunkStrides[d];
+                dstOff += (lo-startCoords[d])*outStrides[d];
             }
-            // C->F: transpose the chunk (z fastest) straight into the F-order
-            // output (x fastest). Only the part of the chunk inside the read
-            // region is copied, one cache-sized tile at a time.
-            else if (Zarr.get_order() == "C"){
-                const uint64_t C0 = Zarr.get_chunks(0), C1 = Zarr.get_chunks(1), C2 = Zarr.get_chunks(2);
-                const uint64_t b0 = cAV[0]*C0, b1 = cAV[1]*C1, b2 = cAV[2]*C2;
-                const uint64_t x0 = std::max(b0, startCoords[0]), x1 = std::min(b0+C0, endCoords[0]);
-                const uint64_t y0 = std::max(b1, startCoords[1]), y1 = std::min(b1+C1, endCoords[1]);
-                const uint64_t z0 = std::max(b2, startCoords[2]), z1 = std::min(b2+C2, endCoords[2]);
-                if(x0 < x1 && y0 < y1 && z0 < z1){
-                    // i = x (contiguous in the output), j = y, k = z (contiguous in the chunk)
-                    copyBoxTransposed(bytes,
-                        (const uint8_t*)bufferDest+(((x0-b0)*C1*C2)+((y0-b1)*C2)+(z0-b2))*bytes,
-                        (uint8_t*)zarrArr+((x0-startCoords[0])+((y0-startCoords[1])*readShape[0])+((z0-startCoords[2])*readShape[0]*readShape[1]))*bytes,
-                        x1-x0, y1-y0, z1-z0,
-                        C1*C2, C2, 1,
-                        1, readShape[0], readShape[0]*readShape[1]);
-                }
-            }
-            
+            copyBoxND(bytes, (const uint8_t*)chunkData+srcOff*bytes, (uint8_t*)zarrArr+dstOff*bytes,
+                      boxExt, chunkStrides, outStrides, true);
         }
         operator delete(bufferDest);
         operator delete(buffer);
@@ -287,7 +295,9 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         Zarr.set_errString(errString);
         return 1;
     }
-    if(oppositeEndianness(Zarr.get_dtype())) swapArrayEndianness(zarrArr,bytes,readShape[0]*readShape[1]*readShape[2]);
+    uint64_t readSize = 1;
+    for(uint64_t d = 0; d < nDims; d++) readSize *= readShape[d];
+    if(oppositeEndianness(Zarr.get_dtype())) swapArrayEndianness(zarrArr,bytes,readSize);
     return 0;
 }
 
@@ -297,22 +307,21 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
                               std::vector<uint64_t> startCoords, 
                               std::vector<uint64_t> endCoords){
    
+    const uint64_t nDims = Zarr.get_ndims();
     if(!crop){
-        startCoords[0] = 0;
-        startCoords[1] = 0;
-        startCoords[2] = 0;
-        endCoords[0] = Zarr.get_shape(0);
-        endCoords[1] = Zarr.get_shape(1);
-        endCoords[2] = Zarr.get_shape(2);
+        startCoords.assign(nDims, 0);
+        endCoords.assign(nDims, 0);
+        for(uint64_t d = 0; d < nDims; d++) endCoords[d] = Zarr.get_shape(d);
     }
 
-    
-    std::vector<uint64_t> readShape = {endCoords[0]-startCoords[0],
-                                       endCoords[1]-startCoords[1],
-                                       endCoords[2]-startCoords[2]};
+    std::vector<uint64_t> readShape(nDims);
+    uint64_t readSize = 1;
+    for(uint64_t d = 0; d < nDims; d++){
+        readShape[d] = endCoords[d]-startCoords[d];
+        readSize *= readShape[d];
+    }
 
     Zarr.set_chunkInfo(startCoords, endCoords);
-    uint64_t readSize = readShape[0]*readShape[1]*readShape[2];
 
     // The chunk read/copy machinery is element-width based, so one generic path
     // covers every supported dtype: signed/unsigned 8/16/32/64-bit integers and
@@ -342,6 +351,8 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
 
 void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t startY, uint64_t startZ, uint64_t endX, uint64_t endY, uint64_t endZ, uint8_t imageJIm){
     zarr Zarr(folderName);
+    // This helper's interface is 3D
+    if(Zarr.get_ndims() != 3) return NULL;
     void* zarrArr = parallelReadZarrWriteWrapper(Zarr, true,
                               {startX, startY, startZ},
                               {endX, endY, endZ});

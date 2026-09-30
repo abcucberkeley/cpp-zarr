@@ -9,6 +9,7 @@
 #include "mex.h"
 #include "../src/zarr.h"
 #include "../src/helperfunctions.h"
+#include "zarrmexhelpers.h"
 
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
@@ -18,6 +19,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string\n");
     zarr Zarr;
     Zarr.set_fileName(mxArrayToString(prhs[0]));
+    // Per-axis options are fit to the number of dimensions after all options are read
+    std::vector<uint64_t> chunksVals, subfoldersVals, chunkShapeVals;
+    bool hasChunks = false, hasSubfolders = false, hasChunkShape = false;
 
     for(int i = 1; i < nrhs; i+=2){
         if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);
@@ -25,10 +29,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
         std::string currInput = mxArrayToString(prhs[i]);
 
         if(currInput == "chunks"){
-            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","chunks must be an array of 3 numbers\n");
-            Zarr.set_chunks({(uint64_t)*(mxGetPr(prhs[i+1])),
-                             (uint64_t)*((mxGetPr(prhs[i+1])+1)),
-                             (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+            chunksVals = mexVector(prhs[i+1]);
+            hasChunks = true;
         }
         else if(currInput == "cname"){
             if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","cname must be a string\n");
@@ -77,32 +79,34 @@ void mexFunction(int nlhs, mxArray *plhs[],
             Zarr.set_dimension_separator(dimension_separator);
         }
         else if(currInput == "shape"){
-            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","shape must be an array of 3 numbers\n");
-            Zarr.set_shape({(uint64_t)*(mxGetPr(prhs[i+1])),
-                           (uint64_t)*((mxGetPr(prhs[i+1])+1)),
-                           (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+            const std::vector<uint64_t> shape = mexVector(prhs[i+1]);
+            // An empty shape is a 0-dimensional array (a single element)
+            Zarr.set_shape(shape);
         }
         else if(currInput == "clevel"){
             if(!mxIsNumeric(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","clevel must be a numerical value\n");
             Zarr.set_clevel((uint64_t)*(mxGetPr(prhs[i+1])));
         }
         else if(currInput == "subfolders"){
-            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","subfolders must be an array of 3 numbers\n");
-            Zarr.set_subfolders({(uint64_t)*(mxGetPr(prhs[i+1])),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+1)),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+            subfoldersVals = mexVector(prhs[i+1]);
+            hasSubfolders = true;
         }
         else if(currInput == "chunk_shape"){
-            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","chunk_shape must be an array of 3 numbers\n");
-            Zarr.set_shard(true);
-            Zarr.set_chunk_shape({(uint64_t)*(mxGetPr(prhs[i+1])),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+1)),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+            chunkShapeVals = mexVector(prhs[i+1]);
+            hasChunkShape = true;
         }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
             Currently Supported Names: chunks, cname, dtype, order, shape, clevel, subfolders, chunk_shape\n",currInput.c_str());
         }
+    }
+
+    const uint64_t nDims = Zarr.get_ndims();
+    if(hasSubfolders) Zarr.set_subfolders(mexFitAxes(subfoldersVals, nDims, "subfolders"));
+    if(hasChunks) Zarr.set_chunks(mexFitAxes(chunksVals, nDims, "chunks"));
+    if(hasChunkShape){
+        Zarr.set_shard(true);
+        Zarr.set_chunk_shape(mexFitAxes(chunkShapeVals, nDims, "chunk_shape"));
     }
 
     try{

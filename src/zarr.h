@@ -64,6 +64,13 @@ public:
     const std::string &get_errString() const;
     void set_errString(const std::string &errString);
     const uint64_t dtypeBytes() const;
+    // Number of dimensions of the array (length of shape)
+    uint64_t get_ndims() const;
+    // Fit chunks, subfolders and chunk_shape to the number of dimensions: extra
+    // trailing values (e.g. the 3D defaults on a 2D array) are dropped, missing
+    // ones get chunks 256 on the first three axes and 1 after, subfolders 0 and
+    // chunk_shape 1.
+    void normalizeDims();
 private:
     void set_jsonValues();
     void write_jsonValues();

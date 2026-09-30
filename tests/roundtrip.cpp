@@ -2,13 +2,15 @@
 // them back, and check the bytes survive the round trip. Covers every supported
 // dtype (signed/unsigned 8-64 bit ints, f4/f8), each compressor, and both storage
 // orders (F and C), using shapes that do not divide the chunk size so partial edge
-// chunks are exercised, plus chunks large enough for the full-tile F<->C paths.
+// chunks are exercised, plus chunks large enough for the full-tile F<->C paths,
+// and 1D/2D/4D/5D arrays (region reads, crop writes, sharding, subfolders).
 //
 // Exits 0 if every case passes, 1 otherwise, so CTest reports pass/fail.
 // Usage: roundtripTest [output_dir]   (defaults to the current directory)
 //
 // Progress is written (flushed) to stderr before each operation so that if a
 // build segfaults, the CTest log shows exactly which step/dtype/compressor died.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,7 +38,7 @@ int main(int argc, char** argv){
     struct Config { const char* tag; std::vector<uint64_t> shape, chunks; std::vector<const char*> comps; };
     const Config configs[] = {
         // Non-chunk-aligned shape so read/write hit partial edge chunks; every compressor.
-        {"", {40, 24, 18}, {16, 16, 16}, {"lz4", "blosclz", "lz4hc", "zlib", "zstd", "gzip"}},
+        {"", {40, 24, 18}, {16, 16, 16}, {"lz4", "blosclz", "lz4hc", "zlib", "zstd", "gzip", "none"}},
         // Chunks >= 128 along x and z so C-order reads/writes take the full-tile
         // (vectorized) transpose path for every element size, plus partial edges.
         {"big", {300, 9, 270}, {128, 4, 128}, {"lz4"}},
@@ -315,6 +317,143 @@ int main(int argc, char** argv){
             std::printf("%s  missing chunk reads as fill_value %s\n", ok ? "PASS" : "FAIL", order);
             if (!ok) failures++;
         }
+    }
+
+    // Arrays of other numbers of dimensions: 1D, 2D, 4D and 5D, both orders, with
+    // partial edge chunks; sub-region reads; an unaligned crop write; and the
+    // sharded, "/" separator and subfolder layouts
+    {
+        typedef std::vector<uint64_t> V;
+        // Region [s, e) of an F-order array with the given shape
+        auto extract = [](const std::vector<uint8_t>& full, const V& shape, const V& s, const V& e, uint64_t bytes){
+            const uint64_t n = shape.size();
+            uint64_t count = 1; for (uint64_t d = 0; d < n; d++) count *= e[d]-s[d];
+            std::vector<uint8_t> out(count*bytes);
+            for (uint64_t i = 0; i < count; i++){
+                uint64_t r = i, off = 0, stride = 1;
+                for (uint64_t d = 0; d < n; d++){
+                    const uint64_t ext = e[d]-s[d];
+                    off += (s[d] + r%ext)*stride;
+                    r /= ext; stride *= shape[d];
+                }
+                std::memcpy(&out[i*bytes], &full[off*bytes], bytes);
+            }
+            return out;
+        };
+        struct NdCase { const char* name; V shape, chunks, inner, sub; const char* sep; };
+        V shape70(70, 1), chunks70(70, 1);
+        shape70[2] = 5;  shape70[35] = 3; shape70[66] = 4; shape70[69] = 6;
+        chunks70[2] = 2; chunks70[35] = 2; chunks70[66] = 3; chunks70[69] = 4;
+        const NdCase ndCases[] = {
+            {"0d", {}, {}, {}, {}, "."},
+            {"1d", {1000}, {128}, {}, {}, "."},
+            {"2d", {300, 170}, {128, 64}, {}, {}, "."},
+            {"4d", {5, 30, 40, 50}, {2, 16, 16, 32}, {}, {}, "."},
+            {"5d", {2, 3, 20, 30, 40}, {1, 2, 16, 16, 32}, {}, {}, "."},
+            {"4d_slash", {5, 30, 40, 50}, {2, 16, 16, 32}, {}, {}, "/"},
+            {"4d_subf", {5, 30, 40, 50}, {2, 16, 16, 32}, {}, {2, 1, 1, 2}, "."},
+            {"4d_shard", {5, 30, 40, 50}, {4, 32, 32, 64}, {2, 16, 16, 32}, {}, "."},
+            {"2d_shard", {300, 170}, {256, 128}, {128, 64}, {}, "."},
+            {"70d", shape70, chunks70, {}, {}, "."},
+        };
+        std::mt19937 nrng(4242);
+        for (const NdCase& c : ndCases){
+            for (const char* dtype : {"<u2", "<f8"}){
+                for (const char* order : {"F", "C"}){
+                    total++;
+                    const uint64_t bytes = dtype[2]-'0', n = c.shape.size();
+                    uint64_t count = 1; for (uint64_t v : c.shape) count *= v;
+                    std::vector<uint8_t> orig(count*bytes);
+                    for (auto& b : orig) b = (uint8_t)byteDist(rng);
+                    const std::string path = dir + "/rt_" + c.name + "_" + (dtype+1) + "_" + order + ".zarr";
+                    std::error_code ec; std::filesystem::remove_all(path, ec);
+                    bool ok = false;
+                    try {
+                        zarr Zw;
+                        Zw.set_fileName(path); Zw.set_cname("lz4"); Zw.set_order(order); Zw.set_chunks(c.chunks);
+                        Zw.set_dimension_separator(c.sep); Zw.set_dtype(dtype); Zw.set_shape(c.shape);
+                        if (!c.sub.empty()) Zw.set_subfolders(c.sub);
+                        if (!c.inner.empty()){ Zw.set_shard(true); Zw.set_chunk_shape(c.inner); }
+                        Zw.write_zarray();
+                        const V zeros(n, 0);
+                        Zw.set_chunkInfo(zeros, c.shape);
+                        if (parallelWriteZarr(Zw, orig.data(), zeros, c.shape, c.shape, bytes*8, true, false, false))
+                            throw std::string("write error: ") + Zw.get_errString();
+                        zarr Zr(path);
+                        ok = Zr.get_ndims() == n;
+                        Zr.set_chunkInfo(zeros, c.shape);
+                        std::vector<uint8_t> back(count*bytes, 0);
+                        ok = ok && parallelReadZarr(Zr, back.data(), zeros, c.shape, c.shape, bytes*8, true, false) == 0 && back == orig;
+                        // random sub-regions
+                        for (int t = 0; ok && t < 3; t++){
+                            V s(n), e(n), rs(n);
+                            for (uint64_t d = 0; d < n; d++){
+                                s[d] = nrng() % c.shape[d];
+                                e[d] = s[d] + 1 + nrng() % (c.shape[d]-s[d]);
+                                rs[d] = e[d]-s[d];
+                            }
+                            const std::vector<uint8_t> exp = extract(orig, c.shape, s, e, bytes);
+                            std::vector<uint8_t> got(exp.size(), 0);
+                            zarr Zs(path);
+                            Zs.set_chunkInfo(s, e);
+                            ok = parallelReadZarr(Zs, got.data(), s, e, rs, bytes*8, true, false) == 0 && got == exp;
+                        }
+                        // unaligned crop write into the existing array (non-sharded layouts)
+                        if (ok && c.inner.empty() && n > 1){
+                            V s(n), e(n), rs(n);
+                            uint64_t pc = 1;
+                            for (uint64_t d = 0; d < n; d++){
+                                s[d] = std::min<uint64_t>(3, c.shape[d]-1);
+                                e[d] = c.shape[d] > 3 ? std::max<uint64_t>(s[d]+1, c.shape[d]-2) : c.shape[d];
+                                rs[d] = e[d]-s[d]; pc *= rs[d];
+                            }
+                            std::vector<uint8_t> patch(pc*bytes);
+                            for (auto& b : patch) b = (uint8_t)byteDist(rng);
+                            zarr Zc(path);
+                            Zc.set_chunkInfo(s, e);
+                            if (parallelWriteZarr(Zc, patch.data(), s, e, rs, bytes*8, true, true, false))
+                                throw std::string("crop error: ") + Zc.get_errString();
+                            std::vector<uint8_t> exp = orig;
+                            for (uint64_t i = 0; i < pc; i++){
+                                uint64_t r = i, off = 0, stride = 1;
+                                for (uint64_t d = 0; d < n; d++){ off += (s[d] + r%rs[d])*stride; r /= rs[d]; stride *= c.shape[d]; }
+                                std::memcpy(&exp[off*bytes], &patch[i*bytes], bytes);
+                            }
+                            zarr Zr2(path);
+                            Zr2.set_chunkInfo(zeros, c.shape);
+                            std::fill(back.begin(), back.end(), 0);
+                            ok = parallelReadZarr(Zr2, back.data(), zeros, c.shape, c.shape, bytes*8, true, false) == 0 && back == exp;
+                        }
+                    } catch (const std::string& e) {
+                        std::fprintf(stderr, "    exception: %s\n", e.c_str()); ok = false;
+                    } catch (...) { ok = false; }
+                    std::filesystem::remove_all(path, ec);
+                    std::printf("%s  %-9s %s %s\n", ok ? "PASS" : "FAIL", c.name, dtype+1, order);
+                    if (!ok) failures++;
+                }
+            }
+        }
+    }
+
+    // Sharding does not apply to a 0-dimensional array: the write must fail cleanly
+    {
+        total++;
+        const std::string path = dir + "/rt_0d_shard.zarr";
+        std::error_code ec; std::filesystem::remove_all(path, ec);
+        bool ok = false;
+        try {
+            zarr Zw;
+            Zw.set_fileName(path); Zw.set_shape({}); Zw.set_chunks({}); Zw.set_dtype("<u2");
+            Zw.set_shard(true); Zw.set_chunk_shape({});
+            Zw.write_zarray();
+            Zw.set_chunkInfo({}, {});
+            uint16_t v = 7;
+            ok = parallelWriteZarr(Zw, &v, {}, {}, {}, 16, false, false, false) != 0 &&
+                 Zw.get_errString().find("0-dimensional") != std::string::npos;
+        } catch (...) { ok = false; }
+        std::filesystem::remove_all(path, ec);
+        std::printf("%s  0-D sharded write rejected\n", ok ? "PASS" : "FAIL");
+        if (!ok) failures++;
     }
 
     std::printf("\n%d/%d round trips passed\n", total - failures, total);

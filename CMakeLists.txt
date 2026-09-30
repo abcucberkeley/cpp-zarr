@@ -14,7 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 
 project(
   cpp-zarr
-  VERSION 1.5.2
+  VERSION 1.6.0
   LANGUAGES CXX)
 
 include(GNUInstallDirs)

@@ -5,6 +5,7 @@
 #include "../src/parallelwritezarr.h"
 #include "../src/parallelreadzarr.h"
 #include "../src/zarr.h"
+#include "zarrmexhelpers.h"
 
 //compile
 //mex -v COPTIMFLAGS="-DNDEBUG -O3" CFLAGS='$CFLAGS -fopenmp -O3' LDFLAGS='$LDFLAGS -fopenmp -O3' '-I/global/home/groups/software/sl-7.x86_64/modules/cBlosc/2.0.4/include/' '-I/global/home/groups/software/sl-7.x86_64/modules/cBlosc/zarr/include/' '-I/global/home/groups/software/sl-7.x86_64/modules/cJSON/1.7.15/include/' '-L/global/home/groups/software/sl-7.x86_64/modules/cBlosc/zarr/lib' -lblosc '-L/global/home/groups/software/sl-7.x86_64/modules/cBlosc/2.0.4/lib64' -lblosc2 '-L/global/home/groups/software/sl-7.x86_64/modules/cJSON/1.7.15/lib64' -lcjson -luuid parallelWriteZarr.c helperFunctions.c parallelReadZarr.c
@@ -79,15 +80,20 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
     if(mxIsEmpty(prhs[1])) mexErrMsgIdAndTxt("zarr:inputError","All input data axes must be of at least size 1");
 
-    std::vector<uint64_t> startCoords = {0,0,0};
-    std::vector<uint64_t> endCoords = {0,0,0};
+    std::vector<uint64_t> startCoords;
+    std::vector<uint64_t> endCoords;
     bool crop = false;
     bool useUuid = true;
-    uint8_t bboxIndex = 0;
     bool sparse = true;
+    // Per-axis options are collected first and fit to the array's number of
+    // dimensions once it is known
+    std::vector<uint64_t> bboxVals, chunksVals, subfoldersVals, chunkShapeVals;
+    bool hasChunks = false, hasSubfolders = false, hasChunkShape = false;
 
-    // Dims are 1 by default
-    uint64_t iDims[3] = {1,1,1};
+    // Input data dimensions (MATLAB arrays have at least 2)
+    const uint64_t nDataDims = (uint64_t)mxGetNumberOfDimensions(prhs[1]);
+    const mwSize* dataDimsT = mxGetDimensions(prhs[1]);
+    const std::vector<uint64_t> dataDims(dataDimsT, dataDimsT+nDataDims);
 
     std::string folderName(mxArrayToString(prhs[0]));
     // Handle the tilde character in filenames on Linux/Mac
@@ -97,7 +103,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     
     // Check if metadata exists that we can use or if we have to create new metadata
     zarr Zarr;
-    if(!fileExists(folderName+"/.zarray")){
+    const bool metadataExists = fileExists(folderName+"/.zarray");
+    if(!metadataExists){
         Zarr.set_fileName(folderName);
     }
     else{
@@ -126,53 +133,24 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(currInput == "bbox"){
             // Skip bbox if it is empty
             if(!mxGetN(prhs[i+1])) continue;
-            else if(mxGetN(prhs[i+1]) == 6){
-                crop = true;
-                startCoords[0] = (uint64_t)*(mxGetPr(prhs[i+1]))-1;
-                startCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+1))-1;
-                startCoords[2] = (uint64_t)*((mxGetPr(prhs[i+1])+2))-1;
-                endCoords[0] = (uint64_t)*((mxGetPr(prhs[i+1])+3));
-                endCoords[1] = (uint64_t)*((mxGetPr(prhs[i+1])+4));
-                endCoords[2] = (uint64_t)*((mxGetPr(prhs[i+1])+5));
-    
-    
-                uint64_t* iDimsT = (uint64_t*)mxGetDimensions(prhs[1]);
-                uint64_t niDims = (uint64_t) mxGetNumberOfDimensions(prhs[1]);
-                for(uint64_t i = 0; i < niDims; i++) iDims[i] = iDimsT[i];
-    
-                if(startCoords[0]+1 < 1 ||
-                   startCoords[1]+1 < 1 ||
-                   startCoords[2]+1 < 1) mexErrMsgIdAndTxt("zarr:inputError","Lower bounds must be at least 1");
-    
-                if(endCoords[0]-startCoords[0] > iDims[0] ||
-                   endCoords[1]-startCoords[1] > iDims[1] ||
-                   endCoords[2]-startCoords[2] > iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
-            }
-            else if(mxGetN(prhs[i+1]) == 3) bboxIndex = i+1; 
-            else mexErrMsgIdAndTxt("zarr:inputError","Input range is not 6 or 3");
+            // A region [starts ends], or one value per axis for the chunk size
+            bboxVals = mexVector(prhs[i+1]);
         }
         else if(currInput == "cname"){
             if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","cname must be a string\n");
             Zarr.set_cname(mxArrayToString(prhs[i+1]));
         }
         else if(currInput == "subfolders"){
-            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","subfolders must be an array of 3 numbers\n");
-            Zarr.set_subfolders({(uint64_t)*(mxGetPr(prhs[i+1])),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+1)),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+            subfoldersVals = mexVector(prhs[i+1]);
+            hasSubfolders = true;
         }
         else if(currInput == "chunks"){
-            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","chunks must be an array of 3 numbers\n");
-            Zarr.set_chunks({(uint64_t)*(mxGetPr(prhs[i+1])),
-                             (uint64_t)*((mxGetPr(prhs[i+1])+1)),
-                             (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+            chunksVals = mexVector(prhs[i+1]);
+            hasChunks = true;
         }
         else if(currInput == "chunk_shape"){
-            if(mxGetN(prhs[i+1]) != 3) mexErrMsgIdAndTxt("zarr:inputError","chunk_shape must be an array of 3 numbers\n");
-            Zarr.set_shard(true);
-            Zarr.set_chunk_shape({(uint64_t)*(mxGetPr(prhs[i+1])),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+1)),
-                               (uint64_t)*((mxGetPr(prhs[i+1])+2))});
+            chunkShapeVals = mexVector(prhs[i+1]);
+            hasChunkShape = true;
         }
         else if(currInput == "sparse"){
             sparse = (bool)*((mxGetPr(prhs[i+1])));
@@ -187,6 +165,50 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
             Currently Supported Names: uuid, bbox, cname, subfolders, chunks, chunk_shape, sparse\n",currInput.c_str());
         }
+    }
+
+    // Number of dimensions of the array being written: a region written into an
+    // existing array uses that array's; otherwise the input data's
+    uint64_t nDims = nDataDims;
+    std::vector<uint64_t> chunksFromBbox;
+    if(!bboxVals.empty()){
+        uint64_t nRegion = nDataDims;
+        std::vector<uint64_t> fileShape;
+        if(metadataExists){
+            nRegion = Zarr.get_ndims();
+            for(uint64_t d = 0; d < nRegion; d++) fileShape.push_back(Zarr.get_shape(d));
+        }
+        if(mexParseRegion(bboxVals, nRegion, startCoords, endCoords, fileShape)){
+            crop = true;
+            nDims = nRegion;
+        }
+        else if(bboxVals.size() == nDataDims || (bboxVals.size() == 3 && nDataDims < 3)){
+            // One value per axis: the chunk size
+            chunksFromBbox = mexFitAxes(bboxVals, nDataDims, "bbox");
+        }
+        else{
+            mexErrMsgIdAndTxt("zarr:inputError","bbox must have %d values ([starts ends]) or %d values (chunk size)",
+                              (int)(2*nRegion),(int)nDataDims);
+        }
+    }
+
+    // The data may omit trailing singleton axes (MATLAB drops them)
+    std::vector<uint64_t> iDims(nDims,1);
+    for(uint64_t d = 0; d < nDataDims; d++){
+        if(d < nDims) iDims[d] = dataDims[d];
+        else if(dataDims[d] != 1) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
+    }
+    if(crop){
+        for(uint64_t d = 0; d < nDims; d++){
+            if(endCoords[d]-startCoords[d] > iDims[d]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
+        }
+    }
+
+    if(hasSubfolders) Zarr.set_subfolders(mexFitAxes(subfoldersVals, nDims, "subfolders"));
+    if(hasChunks) Zarr.set_chunks(mexFitAxes(chunksVals, nDims, "chunks"));
+    if(hasChunkShape){
+        Zarr.set_shard(true);
+        Zarr.set_chunk_shape(mexFitAxes(chunkShapeVals, nDims, "chunk_shape"));
     }
 
     void* zarrC = NULL;
@@ -207,17 +229,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     }
 
     if(!crop){
-        uint64_t nDims = (uint64_t)mxGetNumberOfDimensions(prhs[1]);
-        if(nDims < 2 || nDims > 3) mexErrMsgIdAndTxt("zarr:inputError","Input data must be 2D or 3D");
-
-        uint64_t* dims = (uint64_t*)mxGetDimensions(prhs[1]);
-        if(nDims == 3) Zarr.set_shape({dims[0],dims[1],dims[2]});
-        else Zarr.set_shape({dims[0],dims[1],1});
-        if(bboxIndex){
-            Zarr.set_chunks({(uint64_t)*(mxGetPr(prhs[bboxIndex])),
-                            (uint64_t)*((mxGetPr(prhs[bboxIndex])+1)),
-                            (uint64_t)*((mxGetPr(prhs[bboxIndex])+2))});
-        }
+        Zarr.set_shape(iDims);
+        if(!chunksFromBbox.empty()) Zarr.set_chunks(chunksFromBbox);
         try{
             Zarr.write_zarray();
         }
@@ -232,12 +245,12 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
     }
     else{
-        Zarr.set_shape({endCoords[0],endCoords[1],endCoords[2]});
+        Zarr.set_shape(endCoords);
 
         if(fileExists(folderName+"/.zarray")){
-            if(endCoords[0]-startCoords[0] != iDims[0] ||
-               endCoords[1]-startCoords[1] != iDims[1] ||
-               endCoords[2]-startCoords[2] != iDims[2]) mexErrMsgIdAndTxt("zarr:inputError","Bounding box size does not match the size of the input data");
+            for(uint64_t d = 0; d < nDims; d++){
+                if(endCoords[d]-startCoords[d] != iDims[d]) mexErrMsgIdAndTxt("zarr:inputError","Bounding box size does not match the size of the input data");
+            }
         }
         else {
             try{
@@ -269,27 +282,23 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         
         if(dtypeT != Zarr.get_dtype()){
-            const uint64_t size = (endCoords[0]-startCoords[0])*
-                (endCoords[1]-startCoords[1])*
-                (endCoords[2]-startCoords[2]);
+            uint64_t size = 1;
+            for(uint64_t d = 0; d < nDims; d++) size *= endCoords[d]-startCoords[d];
             zarrC = convertMxToDtype(Zarr.get_dtype(), prhs[1], size);
             if(!zarrC) mexErrMsgIdAndTxt("zarr:dataTypeError","Cannot convert the input data to the existing file's data type \"%s\"",Zarr.get_dtype().c_str());
         }
     }
 
-
-    //endCoords[0]-startCoords[0]
-    if(endCoords[0] > Zarr.get_shape(0) ||
-       endCoords[1] > Zarr.get_shape(1) ||
-       endCoords[2] > Zarr.get_shape(2)) mexErrMsgIdAndTxt("zarr:inputError","Upper bound is invalid");
     if(!crop){
-        endCoords = {Zarr.get_shape(0),Zarr.get_shape(1),Zarr.get_shape(2)};
-        startCoords = {0,0,0};
+        startCoords.assign(nDims,0);
+        endCoords.assign(nDims,0);
+        for(uint64_t d = 0; d < nDims; d++) endCoords[d] = Zarr.get_shape(d);
     }
-    const std::vector<uint64_t> writeShape({endCoords[0]-startCoords[0],
-                                      endCoords[1]-startCoords[1],
-                                      endCoords[2]-startCoords[2]});
-    //printf("%s startCoords[0]yz: %d %d %d endCoords[0]yz: %d %d %d chunkxyz: %d %d %d writeShape[0]yz: %d %d %d\n",Zarr.get_fileName().c_str(),startCoords[0],startCoords[1],startCoords[2],endCoords[0],endCoords[1],endCoords[2],Zarr.get_chunks(0),Zarr.get_chunks(1),Zarr.get_chunks(2),writeShape[0],writeShape[1],writeShape[2]);
+    for(uint64_t d = 0; d < nDims; d++){
+        if(endCoords[d] > Zarr.get_shape(d)) mexErrMsgIdAndTxt("zarr:inputError","Upper bound is invalid");
+    }
+    std::vector<uint64_t> writeShape(nDims);
+    for(uint64_t d = 0; d < nDims; d++) writeShape[d] = endCoords[d]-startCoords[d];
 
     Zarr.set_chunkInfo(startCoords, endCoords);
     bool err = 0;

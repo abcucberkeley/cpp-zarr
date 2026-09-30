@@ -342,12 +342,223 @@ static void fillTyped(void* dst, const uint64_t n, const void* elem){
 }
 
 void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void* elem){
+    // Elements whose bytes are all equal (e.g. 0) are a plain memset
+    const uint8_t* e = (const uint8_t*)elem;
+    bool uniform = true;
+    for(uint64_t b = 1; b < bytes; b++) uniform = uniform && e[b] == e[0];
+    if(uniform){
+        memset(dst, e[0], n*bytes);
+        return;
+    }
     switch(bytes){
         case 1: fillTyped<uint8_t>(dst, n, elem); break;
         case 2: fillTyped<uint16_t>(dst, n, elem); break;
         case 4: fillTyped<uint32_t>(dst, n, elem); break;
         case 8: fillTyped<uint64_t>(dst, n, elem); break;
     }
+}
+
+// Zarr puts no limit on the number of dimensions. The N-D routines keep their
+// per-axis scratch arrays on the stack for up to CZ_FAST_DIMS dimensions and on
+// the heap beyond that.
+#define CZ_FAST_DIMS 64
+struct CzScratch {
+    uint64_t local[CZ_FAST_DIMS*12];
+    std::vector<uint64_t> heap;
+    // count arrays of n values each, zero-initialized
+    uint64_t* get(const uint64_t n, const uint64_t count){
+        uint64_t* p = local;
+        if(n > CZ_FAST_DIMS){
+            heap.assign(n*count, 0);
+            p = heap.data();
+        }
+        else std::fill(local, local+n*count, 0);
+        return p;
+    }
+};
+
+// Copy one element-strided box with a loop over every element (used only for
+// layouts that have no contiguous axis to exploit)
+static void copyBoxElementwise(const uint64_t bytes, const uint8_t* src, uint8_t* dst, const uint64_t m,
+                               const uint64_t* ext, const uint64_t* ss, const uint64_t* ds){
+    CzScratch scratch;
+    uint64_t* idx = scratch.get(m, 1);
+    uint64_t sOff = 0, dOff = 0;
+    while(true){
+        memcpy(dst+dOff*bytes, src+sOff*bytes, bytes);
+        uint64_t l = 0;
+        for(; l < m; l++){
+            idx[l]++; sOff += ss[l]; dOff += ds[l];
+            if(idx[l] < ext[l]) break;
+            sOff -= ext[l]*ss[l]; dOff -= ext[l]*ds[l]; idx[l] = 0;
+        }
+        if(l == m) return;
+    }
+}
+
+void copyBoxND(const uint64_t bytes, const void* src, void* dst,
+               const std::vector<uint64_t> &extents,
+               const std::vector<uint64_t> &srcStrides,
+               const std::vector<uint64_t> &dstStrides,
+               const bool lastAxisInnermost){
+    // Per-axis scratch: extents and strides of the axes that move, then the
+    // loop bookkeeping below
+    const uint64_t n = extents.size();
+    CzScratch scratch;
+    uint64_t* buf = scratch.get(n, 11);
+    uint64_t *ext = buf, *ss = buf+n, *ds = buf+2*n, *used = buf+3*n, *idx = buf+4*n;
+    uint64_t *oe = buf+5*n, *os = buf+6*n, *od = buf+7*n;
+    uint64_t *me = buf+8*n, *ms = buf+9*n, *md = buf+10*n;
+
+    // Axes of extent 1 do not move either pointer, so drop them (remaining axes
+    // stay in their original order)
+    uint64_t m = 0;
+    for(uint64_t d = 0; d < n; d++){
+        if(extents[d] == 0) return;
+        if(extents[d] == 1) continue;
+        ext[m] = extents[d]; ss[m] = srcStrides[d]; ds[m] = dstStrides[d]; m++;
+    }
+    const uint8_t* s = (const uint8_t*)src;
+    uint8_t* dp = (uint8_t*)dst;
+    if(m == 0){
+        memcpy(dp, s, bytes);
+        return;
+    }
+
+    // Axes that are contiguous in the source (a) and in the destination (b)
+    int64_t a = -1, b = -1;
+    for(uint64_t d = 0; d < m; d++){
+        if(a < 0 && ss[d] == 1) a = d;
+        if(b < 0 && ds[d] == 1) b = d;
+    }
+
+    if(a >= 0 && a == b){
+        // Same contiguous axis on both sides: copy contiguous runs, growing the
+        // run with any axis that continues it on both sides
+        used[a] = 1;
+        uint64_t run = ext[a];
+        for(bool merged = true; merged;){
+            merged = false;
+            for(uint64_t d = 0; d < m; d++){
+                if(!used[d] && ss[d] == run && ds[d] == run){
+                    run *= ext[d];
+                    used[d] = 1;
+                    merged = true;
+                }
+            }
+        }
+        // Remaining axes, innermost first: the smallest destination stride, or
+        // the highest-numbered axis
+        uint64_t k = 0;
+        for(uint64_t d = 0; d < m; d++){
+            if(used[d]) continue;
+            uint64_t p = k++;
+            if(lastAxisInnermost){
+                while(p > 0){ oe[p] = oe[p-1]; os[p] = os[p-1]; od[p] = od[p-1]; p--; }
+            }
+            else{
+                while(p > 0 && od[p-1] > ds[d]){ oe[p] = oe[p-1]; os[p] = os[p-1]; od[p] = od[p-1]; p--; }
+            }
+            oe[p] = ext[d]; os[p] = ss[d]; od[p] = ds[d];
+        }
+        const uint64_t runBytes = run*bytes;
+        if(k == 0){
+            memcpy(dp, s, runBytes);
+            return;
+        }
+        uint64_t sOff = 0, dOff = 0;
+        while(true){
+            const uint8_t* sp = s+sOff*bytes;
+            uint8_t* dq = dp+dOff*bytes;
+            for(uint64_t i = 0; i < oe[0]; i++){
+                memcpy(dq, sp, runBytes);
+                sp += os[0]*bytes;
+                dq += od[0]*bytes;
+            }
+            uint64_t l = 1;
+            for(; l < k; l++){
+                idx[l]++; sOff += os[l]; dOff += od[l];
+                if(idx[l] < oe[l]) break;
+                sOff -= oe[l]*os[l]; dOff -= oe[l]*od[l]; idx[l] = 0;
+            }
+            if(l == k) return;
+        }
+    }
+
+    // Different layouts (F <-> C): transpose tiles of the plane spanned by the
+    // destination-contiguous axis (i) and the source-contiguous axis (k). Without
+    // a contiguous axis on a side, use that side's smallest stride instead.
+    uint64_t i = 0, kk = 0;
+    if(b >= 0) i = b;
+    else for(uint64_t d = 1; d < m; d++) if(ds[d] < ds[i]) i = d;
+    if(a >= 0) kk = a;
+    else{
+        kk = (i == 0 && m > 1) ? 1 : 0;
+        for(uint64_t d = 0; d < m; d++) if(d != i && ss[d] < ss[kk]) kk = d;
+    }
+    if(i == kk || m == 1){
+        copyBoxElementwise(bytes, s, dp, m, ext, ss, ds);
+        return;
+    }
+    // Middle axes: the one with the smallest destination stride is the kernel's
+    // plane loop (j); any others are iterated here
+    uint64_t k = 0;
+    for(uint64_t d = 0; d < m; d++){
+        if(d == i || d == kk) continue;
+        uint64_t p = k++;
+        while(p > 0 && md[p-1] > ds[d]){ me[p] = me[p-1]; ms[p] = ms[p-1]; md[p] = md[p-1]; p--; }
+        me[p] = ext[d]; ms[p] = ss[d]; md[p] = ds[d];
+    }
+    const uint64_t n1 = k ? me[0] : 1, s1 = k ? ms[0] : 0, d1 = k ? md[0] : 0;
+    uint64_t sOff = 0, dOff = 0;
+    while(true){
+        copyBoxTransposed(bytes, s+sOff*bytes, dp+dOff*bytes, ext[i], n1, ext[kk],
+                          ss[i], s1, ss[kk], ds[i], d1, ds[kk]);
+        uint64_t l = 1;
+        for(; l < k; l++){
+            idx[l]++; sOff += ms[l]; dOff += md[l];
+            if(idx[l] < me[l]) break;
+            sOff -= me[l]*ms[l]; dOff -= me[l]*md[l]; idx[l] = 0;
+        }
+        if(l >= k) return;
+    }
+}
+
+// Fill the part of a packed buffer outside [lo, hi), from the outermost axis in:
+// the slabs before and after the box along axis order[level] are contiguous
+// blocks, and inside the box range the next axis is handled the same way.
+static void fillOutsideRec(const uint64_t bytes, uint8_t* base, const uint64_t level, const uint64_t m,
+                           const uint64_t* order, const std::vector<uint64_t> &full,
+                           const std::vector<uint64_t> &strides, const std::vector<uint64_t> &lo,
+                           const std::vector<uint64_t> &hi, const void* elem){
+    const uint64_t d = order[level];
+    const uint64_t blk = strides[d];
+    if(lo[d] > 0) fillElements(bytes, base, lo[d]*blk, elem);
+    if(hi[d] < full[d]) fillElements(bytes, base+hi[d]*blk*bytes, (full[d]-hi[d])*blk, elem);
+    if(level+1 < m){
+        for(uint64_t i = lo[d]; i < hi[d]; i++){
+            fillOutsideRec(bytes, base+i*blk*bytes, level+1, m, order, full, strides, lo, hi, elem);
+        }
+    }
+}
+
+void fillOutsideBoxND(const uint64_t bytes, void* buf,
+                      const std::vector<uint64_t> &full,
+                      const std::vector<uint64_t> &strides,
+                      const std::vector<uint64_t> &lo,
+                      const std::vector<uint64_t> &hi,
+                      const void* elem){
+    const uint64_t m = full.size();
+    if(!m) return;
+    // Axes from the largest stride (outermost) to the smallest
+    CzScratch scratch;
+    uint64_t* order = scratch.get(m, 1);
+    for(uint64_t d = 0; d < m; d++){
+        uint64_t p = d;
+        while(p > 0 && strides[order[p-1]] < strides[d]){ order[p] = order[p-1]; p--; }
+        order[p] = d;
+    }
+    fillOutsideRec(bytes, (uint8_t*)buf, 0, m, order, full, strides, lo, hi, elem);
 }
 
 #ifdef _WIN32

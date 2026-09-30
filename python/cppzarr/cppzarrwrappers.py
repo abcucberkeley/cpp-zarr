@@ -1,33 +1,70 @@
+import json
 import numpy as np
 import os
 from .cppzarr import pybind11_read_zarr, pybind11_write_zarr
 
 
+def _default_chunks(ndim):
+    # 256 along the last three axes (NumPy's usual spatial axes), 1 along any leading ones
+    return [1] * max(ndim - 3, 0) + [256] * min(ndim, 3)
+
+
+def _fit_coords(coords, ndim, is_end, name):
+    # Extra trailing values are accepted when they describe singleton axes, so
+    # 3-value coordinates keep working on 1D/2D arrays
+    coords = [int(c) for c in coords]
+    if len(coords) > ndim and all(c <= (1 if is_end else 0) for c in coords[ndim:]):
+        coords = coords[:ndim]
+    if len(coords) != ndim:
+        raise Exception(f'{name} has {len(coords)} values but the array has {ndim} dimensions')
+    return coords
+
+
 def read_zarr(file_name, start_coords=None, end_coords=None):
     if not os.path.isfile(os.path.join(file_name, '.zarray')):
         raise Exception(f'{file_name} does not exist. The .zarray metadata file was not found')
+    # All-zero coordinates mean the whole array, for any number of dimensions
     if start_coords is None:
         start_coords = [0, 0, 0]
     if end_coords is None:
         end_coords = [0, 0, 0]
-    im = pybind11_read_zarr(file_name, start_coords, end_coords)
+    im = pybind11_read_zarr(file_name, list(start_coords), list(end_coords))
     return im
 
 
 def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd', clevel=1, order='F', chunks=None,
                dimension_separator='.'):
-    crop = False
-    if start_coords is not None or end_coords is not None:
-        crop = True
+    crop = start_coords is not None or end_coords is not None
+
+    # Writing into an existing array uses its number of dimensions; the data may
+    # omit trailing singleton axes
+    ndim = data.ndim
+    zarray = os.path.join(file_name, '.zarray')
+    if crop and os.path.isfile(zarray):
+        with open(zarray) as f:
+            ndim = len(json.load(f)['shape'])
+    if data.ndim > ndim:
+        raise Exception(f'The data has {data.ndim} dimensions but the array has {ndim}')
+    data_shape = list(data.shape) + [1] * (ndim - data.ndim)
+
     if chunks is None:
-        chunks = [256, 256, 256]
-    if start_coords is None:
-        start_coords = [0, 0, 0]
+        chunks = _default_chunks(ndim)
+    chunks = [int(c) for c in chunks]
+    if len(chunks) < ndim:
+        raise Exception(f'chunks has {len(chunks)} values but the data has {ndim} dimensions')
+    chunks = chunks[:ndim]
+
+    start_coords = [0] * ndim if start_coords is None else _fit_coords(start_coords, ndim, False, 'start_coords')
     if end_coords is None:
-        end_coords = [data.shape[0], data.shape[1], data.shape[2]]
-    if end_coords[0]-start_coords[0] <= 0 or end_coords[1]-start_coords[1] <= 0 or end_coords[2]-start_coords[2] <= 0:
+        end_coords = [s + n for s, n in zip(start_coords, data_shape)]
+    else:
+        end_coords = _fit_coords(end_coords, ndim, True, 'end_coords')
+    if any(e - s <= 0 for s, e in zip(start_coords, end_coords)):
         raise Exception(f'Invalid start_coords or end_coords!')
-    if data.flags['C_CONTIGUOUS'] or not data.flags['F_CONTIGUOUS']:
+    if [e - s for s, e in zip(start_coords, end_coords)] != data_shape:
+        raise Exception(f'The region from start_coords to end_coords does not match the data shape {data.shape}')
+    # (asfortranarray would turn a 0-dimensional array into a 1-element 1D one)
+    if data.ndim > 0 and (data.flags['C_CONTIGUOUS'] or not data.flags['F_CONTIGUOUS']):
         data = np.asfortranarray(data)
     pybind11_write_zarr(file_name, data, start_coords, end_coords, cname, clevel, order, chunks, dimension_separator, crop)
     return

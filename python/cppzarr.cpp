@@ -8,48 +8,91 @@
 #include "helperfunctions.h"
 
 template <typename T>
-pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims) {
+pybind11::array_t<T> create_pybind11_array(void* data, const std::vector<uint64_t> &dims) {
     auto deleter = [](void* ptr) { free(ptr); };
 
-    std::vector<ssize_t> strides = {
-        static_cast<ssize_t>(sizeof(T)),
-        static_cast<ssize_t>(dims[0] * sizeof(T)),
-        static_cast<ssize_t>(dims[1] * dims[0] * sizeof(T))
-    };
+    // The data is in F order: the first axis is contiguous
+    std::vector<ssize_t> shape(dims.size()), strides(dims.size());
+    ssize_t stride = sizeof(T);
+    for (size_t d = 0; d < dims.size(); d++) {
+        shape[d] = static_cast<ssize_t>(dims[d]);
+        strides[d] = stride;
+        stride *= static_cast<ssize_t>(dims[d]);
+    }
 
     return pybind11::array_t<T>(
-        {dims[0], dims[1], dims[2]},  // shape (y, x, z)
+        shape,
         strides,
         static_cast<T*>(data),
         pybind11::capsule(data, deleter)
     );
 }
 
+// The zarr class reports metadata problems by throwing std::string; turn them
+// into Python exceptions with a readable message
+static zarr openZarr(const std::string &fileName) {
+    try {
+        return zarr(fileName);
+    }
+    catch (const std::string &e) {
+        throw std::runtime_error("Cannot read the zarr metadata of " + fileName + " (" + e + ")");
+    }
+}
+
+static void writeZarray(zarr &Zarr) {
+    try {
+        Zarr.write_zarray();
+    }
+    catch (const std::string &e) {
+        throw std::runtime_error("Cannot write the zarr metadata of " + Zarr.get_fileName() + " (" + e + ")");
+    }
+}
+
+// Fit user coordinates to an array with nDims axes. Extra trailing values are
+// accepted when they describe singleton axes (start 0, end 0 or 1), so 3-value
+// coordinates keep working on 1D/2D arrays.
+static std::vector<uint64_t> fitCoords(const std::vector<uint64_t> &coords, const uint64_t nDims,
+                                       const bool isEnd, const char* name) {
+    if (coords.size() == nDims) return coords;
+    if (coords.size() > nDims) {
+        for (size_t d = nDims; d < coords.size(); d++) {
+            if (coords[d] > (isEnd ? 1u : 0u)) {
+                throw std::runtime_error(std::string(name) + " has " + std::to_string(coords.size()) +
+                                         " values but the array has " + std::to_string(nDims) + " dimensions");
+            }
+        }
+        return std::vector<uint64_t>(coords.begin(), coords.begin() + nDims);
+    }
+    throw std::runtime_error(std::string(name) + " has " + std::to_string(coords.size()) +
+                             " values but the array has " + std::to_string(nDims) + " dimensions");
+}
+
 pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
                                    std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}){
-    zarr Zarr(fileName);
-    uint64_t dims[3] = {Zarr.get_shape(0), Zarr.get_shape(1), Zarr.get_shape(2)};
-    bool crop = false;
+    zarr Zarr = openZarr(fileName);
+    const uint64_t nDims = Zarr.get_ndims();
+    std::vector<uint64_t> dims(nDims);
+    for (uint64_t d = 0; d < nDims; d++) dims[d] = Zarr.get_shape(d);
 
-    // If the startCoords are not all zero then we are using user defined startCoords
-    if (!std::all_of(startCoords.begin(), startCoords.end(), [](int i) { return i==0; })){
-        crop = true;
-    }
-
-    // If the endCoords are not all zero then we are using user defined endCoords
-    // If we are only using user defined startCoords then we want to set the endCoords to the axis size
-    if (!std::all_of(endCoords.begin(), endCoords.end(), [](int i) { return i==0; })){
-        crop = true;
-    }
-    else if(crop) endCoords.assign({dims[0], dims[1], dims[2]});
+    // All-zero (or empty) coordinates mean the whole array
+    const bool startGiven = !std::all_of(startCoords.begin(), startCoords.end(), [](uint64_t i) { return i==0; });
+    const bool endGiven = !std::all_of(endCoords.begin(), endCoords.end(), [](uint64_t i) { return i==0; });
+    const bool crop = startGiven || endGiven;
+    std::vector<uint64_t> start(nDims, 0), end = dims;
+    if (startGiven) start = fitCoords(startCoords, nDims, false, "start_coords");
+    // If we are only using user defined startCoords then the end is the axis size
+    if (endGiven) end = fitCoords(endCoords, nDims, true, "end_coords");
 
     if(crop){
-        Zarr.set_chunkInfo(startCoords, endCoords);
-        dims[0] = endCoords[0]-startCoords[0];
-        dims[1] = endCoords[1]-startCoords[1];
-        dims[2] = endCoords[2]-startCoords[2];
+        for (uint64_t d = 0; d < nDims; d++) {
+            if (end[d] > Zarr.get_shape(d) || start[d] >= end[d]) {
+                throw std::runtime_error("Invalid start_coords or end_coords for axis " + std::to_string(d));
+            }
+            dims[d] = end[d]-start[d];
+        }
+        Zarr.set_chunkInfo(start, end);
     }
-    void* data = parallelReadZarrWriteWrapper(Zarr, crop, startCoords, endCoords);
+    void* data = parallelReadZarrWriteWrapper(Zarr, crop, start, end);
     if (!data) throw std::runtime_error("Failed to read the zarr file (unsupported dtype or read error)");
 
     // Dispatch on the full dtype: byte width alone is ambiguous now that signed,
@@ -109,14 +152,17 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     Zarr.set_shape(endCoords);
 
     // Write out the new .zarray file
-    if(!crop || !fileExists(fileName+"/.zarray")) Zarr.write_zarray();
+    if(!crop || !fileExists(fileName+"/.zarray")) writeZarray(Zarr);
     else{
-        Zarr = zarr(fileName);
+        Zarr = openZarr(fileName);
+        if (Zarr.get_ndims() != endCoords.size()) {
+            throw std::runtime_error("The coordinates have " + std::to_string(endCoords.size()) +
+                                     " values but the existing array has " + std::to_string(Zarr.get_ndims()) + " dimensions");
+        }
     }
 
-    const std::vector<uint64_t> writeShape({endCoords[0]-startCoords[0],
-                                  endCoords[1]-startCoords[1],
-                                  endCoords[2]-startCoords[2]});
+    std::vector<uint64_t> writeShape(endCoords.size());
+    for (size_t d = 0; d < endCoords.size(); d++) writeShape[d] = endCoords[d]-startCoords[d];
     Zarr.set_chunkInfo(startCoords, endCoords);
 
     // Write out the data
