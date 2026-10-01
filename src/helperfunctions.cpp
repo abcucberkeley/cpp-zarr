@@ -400,7 +400,7 @@ void copyBoxND(const uint64_t bytes, const void* src, void* dst,
                const std::vector<uint64_t> &extents,
                const std::vector<uint64_t> &srcStrides,
                const std::vector<uint64_t> &dstStrides,
-               const bool lastAxisInnermost){
+               const bool spreadWrites){
     // Per-axis scratch: extents and strides of the axes that move, then the
     // loop bookkeeping below
     const uint64_t n = extents.size();
@@ -448,13 +448,13 @@ void copyBoxND(const uint64_t bytes, const void* src, void* dst,
             }
         }
         // Remaining axes, innermost first: the smallest destination stride, or
-        // the highest-numbered axis
+        // with spreadWrites the largest
         uint64_t k = 0;
         for(uint64_t d = 0; d < m; d++){
             if(used[d]) continue;
             uint64_t p = k++;
-            if(lastAxisInnermost){
-                while(p > 0){ oe[p] = oe[p-1]; os[p] = os[p-1]; od[p] = od[p-1]; p--; }
+            if(spreadWrites){
+                while(p > 0 && od[p-1] < ds[d]){ oe[p] = oe[p-1]; os[p] = os[p-1]; od[p] = od[p-1]; p--; }
             }
             else{
                 while(p > 0 && od[p-1] > ds[d]){ oe[p] = oe[p-1]; os[p] = os[p-1]; od[p] = od[p-1]; p--; }

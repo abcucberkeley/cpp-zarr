@@ -64,14 +64,14 @@ void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void*
 // When both sides are contiguous along the same axis (e.g. F to F) the box is
 // copied as contiguous runs; when they differ (F <-> C order) it uses the tiled
 // transpose of copyBoxTransposed, one plane at a time. The runs are visited with
-// the smallest destination stride innermost, or with lastAxisInnermost the
-// highest-numbered axis innermost (spreads consecutive writes across pages,
-// which is faster when the destination is freshly allocated memory).
+// the smallest destination stride innermost, or with spreadWrites the largest
+// destination stride innermost (spreads consecutive writes across pages, which
+// is faster when the destination is freshly allocated memory).
 void copyBoxND(const uint64_t bytes, const void* src, void* dst,
                const std::vector<uint64_t> &extents,
                const std::vector<uint64_t> &srcStrides,
                const std::vector<uint64_t> &dstStrides,
-               const bool lastAxisInnermost = false);
+               const bool spreadWrites = false);
 
 // Set every element of a packed N-dimensional buffer (full extents `full`,
 // layout `strides`, F or C order) that lies outside the box [lo, hi) to the

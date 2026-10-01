@@ -3,7 +3,8 @@
 // dtype (signed/unsigned 8-64 bit ints, f4/f8), each compressor, and both storage
 // orders (F and C), using shapes that do not divide the chunk size so partial edge
 // chunks are exercised, plus chunks large enough for the full-tile F<->C paths,
-// and 1D/2D/4D/5D arrays (region reads, crop writes, sharding, subfolders).
+// and 1D/2D/4D/5D arrays (region reads, crop writes, sharding, subfolders, and
+// C-order input and output).
 //
 // Exits 0 if every case passes, 1 otherwise, so CTest reports pass/fail.
 // Usage: roundtripTest [output_dir]   (defaults to the current directory)
@@ -398,6 +399,38 @@ int main(int argc, char** argv){
                             Zs.set_chunkInfo(s, e);
                             ok = parallelReadZarr(Zs, got.data(), s, e, rs, bytes*8, true, false) == 0 && got == exp;
                         }
+                        // The same array given in C order (read through its strides) must store
+                        // the same data, and a C-order read must return that buffer exactly
+                        if (ok){
+                            V cs(n);
+                            { uint64_t acc = 1; for (int64_t d = (int64_t)n-1; d >= 0; d--){ cs[d] = acc; acc *= c.shape[d]; } }
+                            std::vector<uint8_t> corig(count*bytes);
+                            for (uint64_t i = 0; i < count; i++){
+                                uint64_t r = i, coff = 0;
+                                for (uint64_t d = 0; d < n; d++){ coff += (r%c.shape[d])*cs[d]; r /= c.shape[d]; }
+                                std::memcpy(&corig[coff*bytes], &orig[i*bytes], bytes);
+                            }
+                            const std::string cpath = path + "_cin";
+                            std::filesystem::remove_all(cpath, ec);
+                            zarr Zc;
+                            Zc.set_fileName(cpath); Zc.set_cname("lz4"); Zc.set_order(order); Zc.set_chunks(c.chunks);
+                            Zc.set_dimension_separator(c.sep); Zc.set_dtype(dtype); Zc.set_shape(c.shape);
+                            if (!c.sub.empty()) Zc.set_subfolders(c.sub);
+                            if (!c.inner.empty()){ Zc.set_shard(true); Zc.set_chunk_shape(c.inner); }
+                            Zc.write_zarray();
+                            Zc.set_chunkInfo(zeros, c.shape);
+                            if (parallelWriteZarr(Zc, corig.data(), zeros, c.shape, c.shape, cs, bytes*8, true, false, false))
+                                throw std::string("C-order input write error: ") + Zc.get_errString();
+                            zarr Zcr(cpath);
+                            Zcr.set_chunkInfo(zeros, c.shape);
+                            std::fill(back.begin(), back.end(), 0);
+                            ok = parallelReadZarr(Zcr, back.data(), zeros, c.shape, c.shape, bytes*8, true, false) == 0 && back == orig;
+                            zarr Zco(cpath);
+                            void* cback = parallelReadZarrWriteWrapper(Zco, false, zeros, c.shape, true);
+                            ok = ok && cback && std::memcmp(cback, corig.data(), count*bytes) == 0;
+                            free(cback);
+                            std::filesystem::remove_all(cpath, ec);
+                        }
                         // unaligned crop write into the existing array (non-sharded layouts)
                         if (ok && c.inner.empty() && n > 1){
                             V s(n), e(n), rs(n);
@@ -423,6 +456,31 @@ int main(int argc, char** argv){
                             Zr2.set_chunkInfo(zeros, c.shape);
                             std::fill(back.begin(), back.end(), 0);
                             ok = parallelReadZarr(Zr2, back.data(), zeros, c.shape, c.shape, bytes*8, true, false) == 0 && back == exp;
+                            // the same region again, from a C-order patch
+                            if (ok){
+                                V pcs(n);
+                                { uint64_t acc = 1; for (int64_t d = (int64_t)n-1; d >= 0; d--){ pcs[d] = acc; acc *= rs[d]; } }
+                                std::vector<uint8_t> patch2(pc*bytes), patch2C(pc*bytes);
+                                for (auto& b : patch2) b = (uint8_t)byteDist(rng);
+                                for (uint64_t i = 0; i < pc; i++){
+                                    uint64_t r = i, coff = 0, off = 0, stride = 1;
+                                    for (uint64_t d = 0; d < n; d++){
+                                        coff += (r%rs[d])*pcs[d];
+                                        off += (s[d] + r%rs[d])*stride;
+                                        r /= rs[d]; stride *= c.shape[d];
+                                    }
+                                    std::memcpy(&patch2C[coff*bytes], &patch2[i*bytes], bytes);
+                                    std::memcpy(&exp[off*bytes], &patch2[i*bytes], bytes);
+                                }
+                                zarr Zc2(path);
+                                Zc2.set_chunkInfo(s, e);
+                                if (parallelWriteZarr(Zc2, patch2C.data(), s, e, rs, pcs, bytes*8, true, true, false))
+                                    throw std::string("C-order crop error: ") + Zc2.get_errString();
+                                zarr Zr3(path);
+                                Zr3.set_chunkInfo(zeros, c.shape);
+                                std::fill(back.begin(), back.end(), 0);
+                                ok = parallelReadZarr(Zr3, back.data(), zeros, c.shape, c.shape, bytes*8, true, false) == 0 && back == exp;
+                            }
                         }
                     } catch (const std::string& e) {
                         std::fprintf(stderr, "    exception: %s\n", e.c_str()); ok = false;

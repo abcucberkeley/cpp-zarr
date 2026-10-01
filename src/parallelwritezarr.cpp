@@ -36,6 +36,20 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                           const std::vector<uint64_t> &writeShape,
                           const uint64_t bits, const bool useUuid,
                           const bool crop, const bool sparse){
+    // The input is in F order: the first axis is contiguous
+    std::vector<uint64_t> inStrides(writeShape.size());
+    uint64_t acc = 1;
+    for(uint64_t d = 0; d < writeShape.size(); d++){ inStrides[d] = acc; acc *= writeShape[d]; }
+    return parallelWriteZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, inStrides, bits, useUuid, crop, sparse);
+}
+
+uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
+                          const std::vector<uint64_t> &startCoords,
+                          const std::vector<uint64_t> &endCoords,
+                          const std::vector<uint64_t> &writeShape,
+                          const std::vector<uint64_t> &inStrides,
+                          const uint64_t bits, const bool useUuid,
+                          const bool crop, const bool sparse){
     // A 0-dimensional array is a single element: sharding does not apply
     if(Zarr.get_ndims() == 0 && Zarr.get_shard()){
         Zarr.set_errString("Sharding is not supported for 0-dimensional arrays\n");
@@ -72,10 +86,16 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     }
     const uint64_t sB = s*bytes;
 
-    // Element strides of an uncompressed chunk (F or C order), of an F-order
-    // chunk-sized region (existing data read back when cropping) and of the
-    // F-order input
-    std::vector<uint64_t> chunkStrides(nDims), chunkFStrides(nDims), inStrides(nDims);
+    if(writeShape.size() != nDims || inStrides.size() != nDims){
+        Zarr.set_errString("The input has "+std::to_string(writeShape.size())+" dimensions and "+
+                           std::to_string(inStrides.size())+" strides but the array has "+
+                           std::to_string(nDims)+" dimensions\n");
+        return 1;
+    }
+
+    // Element strides of an uncompressed chunk (F or C order) and of an F-order
+    // chunk-sized region (existing data read back when cropping)
+    std::vector<uint64_t> chunkStrides(nDims), chunkFStrides(nDims);
     {
         uint64_t acc = 1;
         for(uint64_t d = 0; d < nDims; d++){ chunkFStrides[d] = acc; acc *= chunkDims[d]; }
@@ -84,8 +104,6 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             for(int64_t d = (int64_t)nDims-1; d >= 0; d--){ chunkStrides[d] = acc; acc *= chunkDims[d]; }
         }
         else chunkStrides = chunkFStrides;
-        acc = 1;
-        for(uint64_t d = 0; d < nDims; d++){ inStrides[d] = acc; acc *= writeShape[d]; }
     }
 
     // Parse the fill value once (stoi would throw on Infinity-normalized fills,

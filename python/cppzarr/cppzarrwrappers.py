@@ -20,15 +20,20 @@ def _fit_coords(coords, ndim, is_end, name):
     return coords
 
 
-def read_zarr(file_name, start_coords=None, end_coords=None):
+def read_zarr(file_name, start_coords=None, end_coords=None, order=None):
+    # order is the memory layout of the returned array: 'F' (first axis
+    # contiguous), 'C' (last axis contiguous), or None (the default) for the
+    # file's own storage order, like zarr-python
     if not os.path.isfile(os.path.join(file_name, '.zarray')):
         raise Exception(f'{file_name} does not exist. The .zarray metadata file was not found')
+    if order not in (None, 'F', 'C'):
+        raise Exception(f"order must be 'F', 'C' or None, not {order!r}")
     # All-zero coordinates mean the whole array, for any number of dimensions
     if start_coords is None:
         start_coords = [0, 0, 0]
     if end_coords is None:
         end_coords = [0, 0, 0]
-    im = pybind11_read_zarr(file_name, list(start_coords), list(end_coords))
+    im = pybind11_read_zarr(file_name, list(start_coords), list(end_coords), order or '')
     return im
 
 
@@ -63,8 +68,11 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
         raise Exception(f'Invalid start_coords or end_coords!')
     if [e - s for s, e in zip(start_coords, end_coords)] != data_shape:
         raise Exception(f'The region from start_coords to end_coords does not match the data shape {data.shape}')
-    # (asfortranarray would turn a 0-dimensional array into a 1-element 1D one)
-    if data.ndim > 0 and (data.flags['C_CONTIGUOUS'] or not data.flags['F_CONTIGUOUS']):
-        data = np.asfortranarray(data)
+    # The writer reads the array in place in any memory layout (C or F order, or a
+    # strided view), so it is not converted. Only reversed or repeated axes
+    # (negative or zero strides) and misaligned data need a copy first.
+    if not data.flags['ALIGNED'] or any(n > 1 and (s <= 0 or s % data.itemsize)
+                                        for s, n in zip(data.strides, data.shape)):
+        data = np.array(data, order='K')
     pybind11_write_zarr(file_name, data, start_coords, end_coords, cname, clevel, order, chunks, dimension_separator, crop)
     return

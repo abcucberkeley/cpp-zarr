@@ -2,7 +2,9 @@
 
 Writes small random volumes, reads them back, and checks the data survives the
 round trip -- across dtypes, compressors, both storage orders (F and C), plus a
-region (cropped) read, and 1D to 5D arrays with region reads and crop writes. Run automatically by cibuildwheel against the freshly
+region (cropped) read, arrays of 0 to 40 dimensions with region reads and crop
+writes, and arrays in any memory layout (C order, F order, strided views) read
+back in either order. Run automatically by cibuildwheel against the freshly
 built+installed wheel, so it also verifies the wheel imports and bundles its
 native library. Exits non-zero on any failure.
 """
@@ -78,7 +80,8 @@ def main():
     p0 = os.path.join(tmp, "nd0.zarr")
     cppzarr.write_zarr(p0, s0)
     b0 = cppzarr.read_zarr(p0)
-    good = b0.shape == () and b0.dtype == s0.dtype and b0 == s0
+    b0c = cppzarr.read_zarr(p0, order='C')
+    good = b0.shape == () and b0.dtype == s0.dtype and b0 == s0 and b0c.shape == () and b0c == s0
     print(f"0D               {'OK' if good else 'FAIL'}")
     ok = ok and good
 
@@ -100,6 +103,46 @@ def main():
         good = np.array_equal(cppzarr.read_zarr(path), data) and np.array_equal(cppzarr.read_zarr(path, s, e), data[region])
         print(f"{nd}D      {order}         {'OK' if good else 'FAIL'}")
         ok = ok and good
+
+    # Memory layouts: write_zarr reads C-order and F-order arrays and strided views
+    # in place (reversed axes are copied first); read_zarr returns the file's own
+    # order by default, or the order asked for; full reads, region reads and crop writes
+    for shp, chks in [((300, 170), [128, 64]), ((40, 24, 18), [16, 16, 16]), ((5, 30, 40, 50), [2, 16, 16, 32])]:
+        base = rng.integers(0, 60000, size=shp).astype(np.uint16)
+        perm = (1, 0) + tuple(range(2, len(shp)))
+        layouts = {'C': base, 'F': np.asfortranarray(base),
+                   'strided': np.repeat(base, 2, axis=0)[::2],
+                   'permuted': np.ascontiguousarray(base.transpose(perm)).transpose(perm),
+                   'reversed': base[::-1]}
+        s = [n // 4 for n in shp]
+        e = [max(si + 1, 3 * n // 4) for si, n in zip(s, shp)]
+        region = tuple(slice(si, ei) for si, ei in zip(s, e))
+        for zorder in "FC":
+            for name, data in layouts.items():
+                path = os.path.join(tmp, f"layout_{len(shp)}d_{zorder}_{name}.zarr")
+                cppzarr.write_zarr(path, data, order=zorder, chunks=chks)
+                back = cppzarr.read_zarr(path)
+                f_back, c_back = cppzarr.read_zarr(path, order='F'), cppzarr.read_zarr(path, order='C')
+                good = (np.array_equal(back, data) and back.flags[f'{zorder}_CONTIGUOUS'] and
+                        np.array_equal(f_back, data) and f_back.flags['F_CONTIGUOUS'] and
+                        np.array_equal(c_back, data) and c_back.flags['C_CONTIGUOUS'])
+                for o in (None, 'F', 'C'):
+                    sub = cppzarr.read_zarr(path, s, e, order=o)
+                    good = good and np.array_equal(sub, data[region]) and sub.flags[f'{o or zorder}_CONTIGUOUS']
+                patch = (data[region] // 2).astype(np.uint16)
+                cppzarr.write_zarr(path, patch, start_coords=s, end_coords=e)
+                exp = np.array(data)
+                exp[region] = patch
+                good = good and np.array_equal(cppzarr.read_zarr(path, order='C'), exp)
+                print(f"{len(shp)}D {zorder}-order zarr, {name:8s} input  {'OK' if good else 'FAIL'}")
+                ok = ok and good
+    try:
+        cppzarr.read_zarr(path, order='X')
+        good = False
+    except Exception:
+        good = True
+    print(f"invalid order rejected  {'OK' if good else 'FAIL'}")
+    ok = ok and good
 
     # 3-value coordinates and chunks keep working on a 2D array
     d2 = rng.integers(0, 60000, size=(70, 45)).astype(np.uint16)

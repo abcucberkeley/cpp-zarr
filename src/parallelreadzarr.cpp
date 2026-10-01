@@ -17,6 +17,18 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool useCtx,
                          const bool sparse)
 {
+    return parallelReadZarr(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, false);
+}
+
+uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
+                         const std::vector<uint64_t> &startCoords,
+                         const std::vector<uint64_t> &endCoords,
+                         const std::vector<uint64_t> &readShape,
+                         const uint64_t bits,
+                         const bool useCtx,
+                         const bool sparse,
+                         const bool cOrder)
+{
     // A 0-dimensional array is a single element: sharding does not apply
     if(Zarr.get_ndims() == 0 && Zarr.get_shard()){
         Zarr.set_errString("Sharding is not supported for 0-dimensional arrays\n");
@@ -65,7 +77,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     for(uint64_t d = 0; d < nDims; d++) s *= Zarr.get_chunks(d);
     const uint64_t sB = s*bytes;
 
-    // Element strides of a decompressed chunk (F or C order) and of the F-order output
+    // Element strides of a decompressed chunk and of the output (each F or C order)
     std::vector<uint64_t> chunkStrides(nDims), outStrides(nDims);
     {
         uint64_t acc = 1;
@@ -76,7 +88,12 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             for(uint64_t d = 0; d < nDims; d++){ chunkStrides[d] = acc; acc *= Zarr.get_chunks(d); }
         }
         acc = 1;
-        for(uint64_t d = 0; d < nDims; d++){ outStrides[d] = acc; acc *= readShape[d]; }
+        if(cOrder){
+            for(int64_t d = (int64_t)nDims-1; d >= 0; d--){ outStrides[d] = acc; acc *= readShape[d]; }
+        }
+        else{
+            for(uint64_t d = 0; d < nDims; d++){ outStrides[d] = acc; acc *= readShape[d]; }
+        }
     }
 
     void* zeroChunkUnc = NULL;
@@ -306,6 +323,13 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
 void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
                               std::vector<uint64_t> startCoords, 
                               std::vector<uint64_t> endCoords){
+    return parallelReadZarrWriteWrapper(Zarr, crop, startCoords, endCoords, false);
+}
+
+void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
+                              std::vector<uint64_t> startCoords,
+                              std::vector<uint64_t> endCoords,
+                              const bool cOrder){
    
     const uint64_t nDims = Zarr.get_ndims();
     if(!crop){
@@ -341,7 +365,7 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
         memset(zarrArr,fillValue,readSize*bytes);
     }
     else zarrArr = calloc(readSize,bytes);
-    uint8_t err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,true);
+    uint8_t err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,true,false,cOrder);
     if(err){
         free(zarrArr);
         return NULL;

@@ -70,6 +70,13 @@ im1 = cppzarr.read_zarr('filename.zarr', end_coords=[100, 100, 100])
 im2 = cppzarr.read_zarr('filename.zarr', start_coords=[10, 10, 10], end_coords=[100, 100, 100])
 ````
 
+#### Memory layout
+read_zarr returns arrays in the file's own storage order by default, like zarr-python: C-order files as C-order arrays (the last axis is contiguous) and F-order files as F-order arrays (the first axis is contiguous). Pass order='C' or order='F' to choose the layout. write_zarr takes arrays in either order, and strided views, without copying them; its order argument sets the file's storage order (F by default).
+````
+import cppzarr
+im = cppzarr.read_zarr('filename.zarr', order='C')
+````
+
 #### Write a Zarr file with specific metadata
 ````
 import cppzarr
