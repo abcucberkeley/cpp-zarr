@@ -119,6 +119,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(e.find("cannotOpenZarray") != std::string::npos){
             mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions and path.\n",e.substr(e.find(':')+1).c_str());
         }
-        else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+        else mexZarrError(e);
     }
 }

@@ -12,6 +12,7 @@
 // Progress is written (flushed) to stderr before each operation so that if a
 // build segfaults, the CTest log shows exactly which step/dtype/compressor died.
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -314,7 +315,7 @@ int main(int argc, char** argv){
                     for (uint64_t x = 0; ok && x < shape[0]; x++) {
                         const size_t i = x + y*shape[0] + z*shape[0]*shape[1];
                         const bool missing = x >= 16 && x < 32 && y < 16 && z < 16;
-                        ok = got[i] == (missing ? 0x0707 : A[i]);   // fill is applied byte-wise
+                        ok = got[i] == (missing ? 7 : A[i]);   // the fill value, as zarr-python reads it
                     }
                 free(got);
             } catch (...) { ok = false; }
@@ -865,6 +866,134 @@ int main(int argc, char** argv){
         std::filesystem::remove_all(path, ec);
         std::printf("%s  0-D sharded write rejected\n", ok ? "PASS" : "FAIL");
         if (!ok) failures++;
+    }
+
+    // Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays, made by
+    // tests/make_test_arrays.py): Zarr v3 arrays, and v2 arrays with codecs and fill
+    // values cpp-zarr does not write itself. Full reads in C and F order and a region read
+    // must match the values zarr-python reads, and the arrays cpp-zarr cannot read must
+    // be rejected with an error that names the reason. Writing into a v3 array (a copy)
+    // must fail before anything is written.
+    {
+#ifdef CPPZARR_TEST_ARRAYS
+        const std::string v3dir = CPPZARR_TEST_ARRAYS;
+#else
+        const std::string v3dir = "tests/test_arrays";
+#endif
+        std::ifstream mf(v3dir + "/arrays.json");
+        if (!mf){
+            // made by tests/make_test_arrays.py; CI makes them and requires them
+            const bool required = std::getenv("CPPZARR_REQUIRE_TEST_ARRAYS") != nullptr;
+            if (required){ total++; failures++; }
+            std::printf("%s  test arrays not found in %s (make them with tests/make_test_arrays.py)\n",
+                        required ? "FAIL" : "SKIP", v3dir.c_str());
+        }
+        else{
+            const json manifest = json::parse(mf);
+            for (const json& fx : manifest.at("arrays")){
+                total++;
+                const std::string name = fx.at("name"), path = v3dir + "/" + name + ".zarr";
+                bool ok = false;
+                std::string detail;
+                if (fx.contains("error")){
+                    const std::string want = fx.at("error");
+                    try { zarr Z(path); detail = "was not rejected"; }
+                    catch (const std::string& e){ ok = e.find(want) != std::string::npos; detail = e; }
+                    catch (...){ detail = "threw something other than an error message"; }
+                    std::printf("%s  test array %s rejected%s%s\n", ok ? "PASS" : "FAIL", name.c_str(),
+                                ok ? "" : ": ", ok ? "" : detail.c_str());
+                    if (!ok) failures++;
+                    continue;
+                }
+                try{
+                    const std::string dt = fx.at("dtype");
+                    const std::vector<uint64_t> shape = fx.at("shape").get<std::vector<uint64_t>>();
+                    const uint64_t nd = shape.size(), bytes = dt[2] - '0';
+                    uint64_t count = 1;
+                    for (uint64_t v : shape) count *= v;
+                    std::ifstream bf(v3dir + "/" + name + ".bin", std::ios::binary);
+                    const std::vector<uint8_t> want((std::istreambuf_iterator<char>(bf)), std::istreambuf_iterator<char>());
+                    // equal elements, NaN equal to NaN
+                    auto same = [&](const uint8_t* a, const uint8_t* b){
+                        if (!std::memcmp(a, b, bytes)) return true;
+                        if (dt[1] != 'f') return false;
+                        if (bytes == 4){ float x, y; std::memcpy(&x, a, 4); std::memcpy(&y, b, 4); return std::isnan(x) && std::isnan(y); }
+                        double x, y; std::memcpy(&x, a, 8); std::memcpy(&y, b, 8); return std::isnan(x) && std::isnan(y);
+                    };
+                    // the expected element at C-order coordinates idx
+                    auto at = [&](const std::vector<uint64_t>& idx){
+                        uint64_t off = 0;
+                        for (uint64_t d = 0; d < nd; d++) off = off * shape[d] + idx[d];
+                        return &want[off * bytes];
+                    };
+                    // compare a read of [s, e) in C or F order
+                    auto check = [&](const uint8_t* got, const std::vector<uint64_t>& s, const std::vector<uint64_t>& e, bool cOrder){
+                        std::vector<uint64_t> ext(nd), idx(nd);
+                        uint64_t n = 1;
+                        for (uint64_t d = 0; d < nd; d++){ ext[d] = e[d] - s[d]; n *= ext[d]; }
+                        for (uint64_t i = 0; i < n; i++){
+                            uint64_t r = i;
+                            if (cOrder) for (int64_t d = (int64_t)nd - 1; d >= 0; d--){ idx[d] = s[d] + r % ext[d]; r /= ext[d]; }
+                            else for (uint64_t d = 0; d < nd; d++){ idx[d] = s[d] + r % ext[d]; r /= ext[d]; }
+                            if (!same(got + i * bytes, at(idx))) return false;
+                        }
+                        return true;
+                    };
+                    zarr Z(path);
+                    const std::vector<uint64_t> zeros(nd, 0);
+                    const uint64_t format = name.rfind("v3_", 0) == 0 ? 3 : 2;
+                    ok = want.size() == count * bytes && Z.get_ndims() == nd && Z.get_zarr_format() == format;
+                    for (bool cOrder : {true, false}){
+                        void* d = parallelReadZarrWriteWrapper(Z, false, zeros, shape, cOrder);
+                        ok = ok && d && check((const uint8_t*)d, zeros, shape, cOrder);
+                        if (!d) detail = "read failed";
+                        free(d);
+                    }
+                    // a region inside the array
+                    std::vector<uint64_t> s(nd), e(nd);
+                    for (uint64_t d = 0; d < nd; d++){ s[d] = shape[d] > 2 ? 1 : 0; e[d] = shape[d] > 2 ? shape[d] - 1 : shape[d]; }
+                    void* r = parallelReadZarrWriteWrapper(Z, true, s, e, true);
+                    ok = ok && r && check((const uint8_t*)r, s, e, true);
+                    free(r);
+                }
+                catch (const std::string& e){ ok = false; detail = e; }
+                catch (const std::exception& e){ ok = false; detail = e.what(); }
+                std::printf("%s  test array %s%s%s\n", ok ? "PASS" : "FAIL", name.c_str(), ok ? "" : ": ", detail.c_str());
+                if (!ok) failures++;
+            }
+
+            // Writing into a Zarr v3 array is refused before anything is written
+            total++;
+            const std::string copy = dir + "/rt_v3_write.zarr";
+            std::error_code ec;
+            std::filesystem::remove_all(copy, ec);
+            std::filesystem::copy(v3dir + "/v3_blosc_zstd_uint16.zarr", copy, std::filesystem::copy_options::recursive, ec);
+            auto listing = [&](){
+                std::vector<std::string> files;
+                for (const auto& f : std::filesystem::recursive_directory_iterator(copy)) files.push_back(f.path().string());
+                std::sort(files.begin(), files.end());
+                return files;
+            };
+            const std::vector<std::string> before = listing();
+            bool ok = !ec;
+            try{
+                zarr Z(copy);
+                std::vector<uint16_t> d(10*7*5, 1);
+                Z.set_chunkInfo({0, 0, 0}, {10, 7, 5});
+                ok = ok && parallelWriteZarr(Z, d.data(), {0, 0, 0}, {10, 7, 5}, {10, 7, 5}, 16, true, false, true) == 1 &&
+                     Z.get_errString().find("not supported yet") != std::string::npos;
+                zarr N;
+                N.set_fileName(copy);
+                N.set_shape({10, 7, 5});
+                try { N.write_zarray(); ok = false; }
+                catch (const std::string& e){ ok = ok && e.find("zarrV3NotWritable") == 0; }
+            }
+            catch (...){ ok = false; }
+            ok = ok && listing() == before;
+            std::printf("%s  writes into a Zarr v3 array are refused and change nothing\n", ok ? "PASS" : "FAIL");
+            if (!ok) failures++;
+            std::filesystem::remove_all(copy, ec);
+        }
     }
 
     std::printf("\n%d/%d round trips passed\n", total - failures, total);

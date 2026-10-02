@@ -60,6 +60,21 @@ public:
 
     const uint64_t get_chunkShardPosition(const std::vector<uint64_t> &cAV) const;
 
+    // Zarr format of the array's metadata: 2 (.zarray) or 3 (zarr.json). Zarr v3
+    // arrays are read through the same fields as v2 ones; writing them is not
+    // supported yet.
+    uint64_t get_zarr_format() const;
+    // Path of a chunk (or shard) file inside the array's folder: its name, after
+    // the "c" prefix of Zarr v3's default chunk key encoding
+    const std::string chunkKey(const std::string &chunkName) const;
+    // Axes of a stored chunk from slowest to fastest: 0..n-1 for C order,
+    // n-1..0 for F order, any permutation for a Zarr v3 transpose codec
+    const std::vector<uint64_t> get_chunkAxisOrder() const;
+    // How each stored chunk is compressed: "none", "blosc", "gzip" or "zstd"
+    // (Zarr v3 zstd codec, or numcodecs Zstd in v2)
+    const std::string get_compressor() const;
+    // Whether a CRC32C checksum follows each stored chunk (Zarr v3 crc32c codec)
+    bool get_chunkChecksum() const;
 
     const std::vector<uint64_t> get_chunkAxisVals(const std::string &fileName) const;
     void set_chunkInfo(const std::vector<uint64_t> &startCoords,
@@ -77,6 +92,7 @@ public:
     // chunk_shape 1.
     void normalizeDims();
 private:
+    void parseZarrJson();
     void set_jsonValues();
     void write_jsonValues();
     void set_shardData();

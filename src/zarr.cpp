@@ -1,4 +1,6 @@
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <omp.h>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -10,6 +12,269 @@
 #include <fstream>
 #include "zarr.h"
 #include "helperfunctions.h"
+
+// A metadata fill_value as the zarr class keeps it: integers in decimal, other
+// numbers in full precision, "NaN", "Infinity", "-Infinity" and Zarr v3's "0x..."
+// bit patterns as they are, and "0" for no fill value (null)
+static std::string fillValueString(const json &v){
+    if(v.is_null()) return "0";
+    if(v.is_boolean()) return v.get<bool>() ? "1" : "0";
+    if(v.is_number_unsigned()) return std::to_string(v.get<uint64_t>());
+    if(v.is_number_integer()) return std::to_string(v.get<int64_t>());
+    if(v.is_number_float()){
+        const double d = v.get<double>();
+        if(std::isfinite(d) && d == std::floor(d) && std::fabs(d) < 9e18) return std::to_string((int64_t)d);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.17g", d);
+        return buf;
+    }
+    if(v.is_string()){
+        const std::string s = v.get<std::string>();
+        return s.empty() || s == "null" ? "0" : s;
+    }
+    throw std::string("metadataIncomplete");
+}
+
+// ---- Zarr v3 metadata (zarr.json) ---------------------------------------------
+
+namespace {
+
+[[noreturn]] void unsupportedV3(const std::string &why){
+    throw std::string("metadataUnsupported:"+why);
+}
+
+// A Zarr v3 extension point (codec, chunk grid, chunk key encoding): an object
+// {"name": ..., "configuration": {...}}, or just its name as a string
+std::string extName(const json &e){
+    if(e.is_string()) return e.get<std::string>();
+    if(e.is_object()){
+        const auto n = e.find("name");
+        if(n != e.end() && n->is_string()) return n->get<std::string>();
+    }
+    throw std::string("metadataIncomplete");
+}
+
+json extConfig(const json &e){
+    if(e.is_object()){
+        const auto c = e.find("configuration");
+        if(c != e.end() && c->is_object()) return *c;
+    }
+    return json::object();
+}
+
+// What a list of Zarr v3 codecs does to a chunk: array -> array codecs
+// (transpose), one array -> bytes codec (bytes, or sharding_indexed), then
+// bytes -> bytes codecs (one compressor, then a crc32c checksum)
+struct V3Codecs {
+    std::vector<uint64_t> axisOrder;   // transpose: stored axes, slowest first (empty: C order)
+    bool bigEndian = false;           // bytes
+    bool sharded = false;             // sharding_indexed instead of bytes...
+    json sharding;                    // ...and its configuration
+    std::string compressor = "none";  // blosc, gzip or zstd
+    json compressorConfig;
+    bool checksum = false;            // crc32c
+};
+
+V3Codecs parseV3Codecs(const json &codecs, const uint64_t nDims, const bool allowSharding){
+    if(!codecs.is_array() || codecs.empty()) unsupportedV3("its list of codecs is empty");
+    V3Codecs c;
+    size_t i = 0;
+    for(; i < codecs.size() && extName(codecs[i]) == "transpose"; i++){
+        if(!c.axisOrder.empty()) unsupportedV3("it has more than one transpose codec");
+        const json order = extConfig(codecs[i]).value("order", json());
+        std::vector<uint64_t> axes(nDims);
+        if(order.is_string() && (order == "C" || order == "F")){
+            for(uint64_t d = 0; d < nDims; d++) axes[d] = order == "C" ? d : nDims-1-d;
+        }
+        else if(order.is_array() && order.size() == nDims){
+            std::vector<bool> seen(nDims, false);
+            for(uint64_t d = 0; d < nDims; d++){
+                if(!order[d].is_number_integer() || order[d].get<int64_t>() < 0 ||
+                   order[d].get<uint64_t>() >= nDims || seen[order[d].get<uint64_t>()]){
+                    unsupportedV3("its transpose order is not a permutation of the axes");
+                }
+                axes[d] = order[d].get<uint64_t>();
+                seen[axes[d]] = true;
+            }
+        }
+        else unsupportedV3("its transpose order is not a permutation of the axes");
+        c.axisOrder = axes;
+    }
+    if(i == codecs.size()) unsupportedV3("it has no bytes codec");
+    const std::string arrayToBytes = extName(codecs[i]);
+    if(arrayToBytes == "bytes"){
+        const std::string endian = extConfig(codecs[i]).value("endian", "little");
+        if(endian != "little" && endian != "big") unsupportedV3("its bytes codec has endian \""+endian+"\"");
+        c.bigEndian = endian == "big";
+    }
+    else if(arrayToBytes == "sharding_indexed"){
+        if(!allowSharding) unsupportedV3("it has shards inside shards");
+        if(!c.axisOrder.empty()) unsupportedV3("it has a transpose codec outside its shards");
+        c.sharded = true;
+        c.sharding = extConfig(codecs[i]);
+    }
+    else unsupportedV3("the \""+arrayToBytes+"\" codec is not supported");
+    for(i++; i < codecs.size(); i++){
+        const std::string name = extName(codecs[i]);
+        if(c.sharded) unsupportedV3("it has codecs after sharding_indexed");
+        if(c.checksum) unsupportedV3("it has codecs after crc32c");
+        if(name == "crc32c") c.checksum = true;
+        else if(name == "blosc" || name == "gzip" || name == "zstd"){
+            if(c.compressor != "none") unsupportedV3("it has more than one compressor");
+            c.compressor = name;
+            c.compressorConfig = extConfig(codecs[i]);
+        }
+        else unsupportedV3("the \""+name+"\" codec is not supported");
+    }
+    return c;
+}
+
+// The codecs of each stored chunk: a sharded array's inner codecs
+json chunkCodecsV3(const json &meta){
+    const json &codecs = meta.at("codecs");
+    if(codecs.is_array() && !codecs.empty() && extName(codecs[0]) == "sharding_indexed"){
+        return extConfig(codecs[0]).at("codecs");
+    }
+    return codecs;
+}
+
+// The fields of Zarr v3 array metadata; others must be understood, unless they
+// say otherwise (must_understand: false)
+const char* const v3Fields[] = {"zarr_format", "node_type", "shape", "data_type", "chunk_grid",
+                                "chunk_key_encoding", "fill_value", "codecs", "attributes",
+                                "dimension_names", "storage_transformers"};
+
+} // namespace
+
+// Zarr v3 array metadata (zarr.json, already in zarray) into the fields a v2
+// .zarray fills. Anything cpp-zarr cannot read throws "metadataUnsupported:why".
+void zarr::parseZarrJson(){
+    try{
+        const json &m = zarray;
+        if(!m.is_object() || !m.contains("zarr_format") || m.at("zarr_format") != 3) throw std::string("metadataIncomplete");
+        const std::string nodeType = m.value("node_type", "");
+        if(nodeType == "group") unsupportedV3("it is a Zarr v3 group, not an array");
+        if(nodeType != "array") throw std::string("metadataIncomplete");
+        for(auto it = m.begin(); it != m.end(); ++it){
+            bool known = false;
+            for(const char* f : v3Fields) known = known || it.key() == f;
+            if(!known && !(it->is_object() && it->value("must_understand", true) == false)){
+                unsupportedV3("its metadata has a field cpp-zarr does not know (\""+it.key()+"\")");
+            }
+        }
+        const auto transformers = m.find("storage_transformers");
+        if(transformers != m.end() && !(transformers->is_array() && transformers->empty())){
+            unsupportedV3("it has storage transformers");
+        }
+
+        shape = m.at("shape").get<std::vector<uint64_t>>();
+        const uint64_t n = shape.size();
+        const json &grid = m.at("chunk_grid");
+        if(extName(grid) != "regular") unsupportedV3("its chunk grid is not regular");
+        chunks = extConfig(grid).at("chunk_shape").get<std::vector<uint64_t>>();
+        if(chunks.size() != n) throw std::string("metadataIncomplete");
+        for(uint64_t c : chunks) if(!c) throw std::string("metadataIncomplete");
+
+        // Chunk keys: "c/0/0/0" (default) or "0.0.0" (v2), with either separator
+        const json &keys = m.at("chunk_key_encoding");
+        const std::string encoding = extName(keys);
+        if(encoding != "default" && encoding != "v2") unsupportedV3("its chunk key encoding \""+encoding+"\" is not supported");
+        dimension_separator = extConfig(keys).value("separator", encoding == "default" ? "/" : ".");
+        if(dimension_separator != "/" && dimension_separator != ".") unsupportedV3("its chunk key separator is not \"/\" or \".\"");
+
+        // Codecs, and for a sharded array its inner chunks and shard index
+        const V3Codecs outer = parseV3Codecs(m.at("codecs"), n, true);
+        V3Codecs inner = outer;
+        shard = outer.sharded;
+        chunk_shape.clear();
+        if(shard){
+            if(n == 0) unsupportedV3("sharding is not supported for 0-dimensional arrays");
+            chunk_shape = outer.sharding.at("chunk_shape").get<std::vector<uint64_t>>();
+            if(chunk_shape.size() != n) throw std::string("metadataIncomplete");
+            for(uint64_t d = 0; d < n; d++){
+                if(!chunk_shape[d] || chunks[d]%chunk_shape[d]) unsupportedV3("its inner chunk shape does not divide its shard shape");
+            }
+            inner = parseV3Codecs(outer.sharding.at("codecs"), n, false);
+            const json indexCodecs = outer.sharding.value("index_codecs", json::array({{{"name", "bytes"}, {"configuration", {{"endian", "little"}}}}, {{"name", "crc32c"}}}));
+            bool indexOk = indexCodecs.is_array() && !indexCodecs.empty() && indexCodecs.size() <= 2 &&
+                           extName(indexCodecs[0]) == "bytes" && extConfig(indexCodecs[0]).value("endian", "little") == "little";
+            if(indexOk && indexCodecs.size() == 2) indexOk = extName(indexCodecs[1]) == "crc32c";
+            if(!indexOk) unsupportedV3("its shard index codecs are not little-endian bytes and an optional crc32c");
+            const std::string location = outer.sharding.value("index_location", "end");
+            if(location != "start" && location != "end") unsupportedV3("its shard index location is not \"start\" or \"end\"");
+        }
+
+        // Data type, and the byte order of the stored chunks
+        const json &dataType = m.at("data_type");
+        if(!dataType.is_string()) unsupportedV3("its data type is not supported");
+        const std::string t = dataType.get<std::string>();
+        char kind = 0;
+        int size = 0;
+        if(t == "bool"){ kind = 'b'; size = 1; }
+        else if(t == "int8" || t == "int16" || t == "int32" || t == "int64"){ kind = 'i'; size = std::stoi(t.substr(3))/8; }
+        else if(t == "uint8" || t == "uint16" || t == "uint32" || t == "uint64"){ kind = 'u'; size = std::stoi(t.substr(4))/8; }
+        else if(t == "float32" || t == "float64"){ kind = 'f'; size = std::stoi(t.substr(5))/8; }
+        else unsupportedV3("its data type \""+t+"\" is not supported");
+        dtype = std::string(size == 1 ? "|" : inner.bigEndian ? ">" : "<")+kind+std::to_string(size);
+
+        // Each chunk's storage order: C, F, or another transpose
+        order = "C";
+        if(!inner.axisOrder.empty() && n > 1){
+            bool reversed = true;
+            for(uint64_t d = 0; d < n; d++) reversed = reversed && inner.axisOrder[d] == n-1-d;
+            if(reversed) order = "F";
+        }
+
+        // Compressor, as the v2 fields name it
+        const json &cc = inner.compressorConfig;
+        cname = "none"; id = ""; clevel = 0; shuffle = 0; blocksize = 0;
+        if(inner.compressor == "blosc"){
+            cname = cc.at("cname").get<std::string>();
+            id = "blosc";
+            clevel = cc.value("clevel", 5);
+            blocksize = cc.value("blocksize", 0);
+            const json sh = cc.value("shuffle", json("noshuffle"));
+            if(sh.is_string()) shuffle = sh == "shuffle" ? 1 : sh == "bitshuffle" ? 2 : 0;
+            else shuffle = sh.get<uint64_t>();
+        }
+        else if(inner.compressor == "gzip"){
+            cname = "gzip";
+            id = "gzip";
+            clevel = cc.value("level", 1);
+        }
+        else if(inner.compressor == "zstd"){
+            cname = "zstd";
+            id = "zstd";
+            clevel = (uint64_t)std::max<int64_t>(cc.value("level", 0), 0);
+        }
+
+        // Fill value: a number, true/false, or for floats "NaN", "Infinity",
+        // "-Infinity" or a "0x..." bit pattern
+        const json &fv = m.at("fill_value");
+        if(kind == 'b'){
+            if(!fv.is_boolean()) throw std::string("metadataIncomplete");
+            fill_value = fv.get<bool>() ? "1" : "0";
+        }
+        else if(fv.is_string()){
+            const std::string f = fv.get<std::string>();
+            const bool bits = f.size() == 2+2*(size_t)size && f[0] == '0' && (f[1] == 'x' || f[1] == 'X');
+            if(kind != 'f' || !(f == "NaN" || f == "Infinity" || f == "-Infinity" || bits)) throw std::string("metadataIncomplete");
+            fill_value = f;
+        }
+        else if(fv.is_number()) fill_value = fillValueString(fv);
+        else throw std::string("metadataIncomplete");
+
+        zarr_format = 3;
+        subfolders.assign(n, 0);
+        normalizeDims();
+    }
+    catch(const std::string &){
+        throw;
+    }
+    catch(...){
+        throw std::string("metadataIncomplete");
+    }
+}
 
 // Create a blank zarr object with default values
 zarr::zarr() :
@@ -28,12 +293,29 @@ clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
 fill_value("0"), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
 {
+    // A v2 array (.zarray) is read as before; without one, a Zarr v3 array (zarr.json)
     if(!fileExists(fileName+"/.zarray")){
+        if(fileExists(fileName+"/zarr.json")){
+            try{
+                std::ifstream f(fileName+"/zarr.json");
+                zarray = json::parse(f);
+            }
+            catch(...){
+                throw std::string("metadataIncomplete");
+            }
+            parseZarrJson();
+            return;
+        }
         throw std::string("metadataFileMissing:"+fileName);
         //mexErrMsgIdAndTxt("zarr:zarrayError","Metadata file in \"%s\" is missing. Does the file exist?",fileName.c_str());
     }
-    std::ifstream f(fileName+"/.zarray");
-    zarray = json::parse(f);
+    try{
+        std::ifstream f(fileName+"/.zarray");
+        zarray = json::parse(f);
+    }
+    catch(...){
+        throw std::string("metadataIncomplete");
+    }
 
     try{
         // Check for Sharding
@@ -67,11 +349,12 @@ zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
             shuffle = zarray.at("compressor").at("shuffle");
         }
         catch(...){
-            // Try gzip
+            // Other compressors with a level: gzip, and the numcodecs zlib and zstd
+            // codecs (read only)
             clevel = zarray.at("compressor").at("level");
             cname = zarray.at("compressor").at("id");
             blocksize = 0;
-            id = "";
+            id = cname;
             shuffle = 0;
         }
         // If dimension_separator does not exist then assume it is "."
@@ -86,25 +369,23 @@ zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
         }
 
         dtype = zarray.at("dtype");
-        if(zarray.at("fill_value").empty()) fill_value = "0";
-        else{
-            if(zarray.at("fill_value").type() == json::value_t::number_integer || 
-               zarray.at("fill_value").type() == json::value_t::number_unsigned || 
-               zarray.at("fill_value").type() == json::value_t::number_float)
-            {
-                fill_value = std::to_string((int64_t)zarray.at("fill_value"));
-            }
-            else fill_value = zarray.at("fill_value");
-            // TODO: Make NaN actually NaN here and in other functions
-            if(fill_value == "null" || fill_value == "NaN") fill_value = "0";
-            else if(fill_value == "Infinity") fill_value = std::to_string(std::numeric_limits<int64_t>::max());
-            else if(fill_value == "-Infinity") fill_value = std::to_string(std::numeric_limits<int64_t>::min());
+        fill_value = fillValueString(zarray.at("fill_value"));
+        // Filters (numcodecs Delta, Shuffle, ...) change the stored values, and
+        // are not applied: such arrays cannot be read
+        const auto filtersIt = zarray.find("filters");
+        if(filtersIt != zarray.end() && !filtersIt->is_null() && !(filtersIt->is_array() && filtersIt->empty())){
+            throw std::string("metadataUnsupported:it has filters, which are not supported");
         }
         //filters = "";
 
         order = zarray.at("order");
         shape = zarray.at("shape").get<std::vector<uint64_t>>();
         zarr_format = zarray.at("zarr_format");
+    }
+    catch(const std::string &e){
+        // (a reason the array cannot be read)
+        if(e.rfind("metadataUnsupported:", 0) == 0) throw;
+        throw std::string("metadataIncomplete");
     }
     catch(...){
         throw std::string("metadataIncomplete");
@@ -144,6 +425,10 @@ zarr::~zarr(){
 
 // Write the current Metadata to the .zarray and create subfolders if needed
 void zarr::write_zarray(){
+    // A Zarr v3 array (zarr.json) is never turned into a v2 one in place
+    if(!fileExists(fileName+"/.zarray") && fileExists(fileName+"/zarr.json")){
+        throw std::string("zarrV3NotWritable:"+fileName);
+    }
     normalizeDims();
     createSubfolders();
     set_jsonValues();
@@ -510,6 +795,43 @@ bool zarr::get_shardIndexChecksum() const{
         if(c.is_object() && c.value("name", "") == "crc32c") return true;
     }
     return false;
+}
+
+uint64_t zarr::get_zarr_format() const{
+    return zarr_format;
+}
+
+const std::string zarr::chunkKey(const std::string &chunkName) const{
+    if(zarr_format != 3) return chunkName;
+    const auto keys = zarray.find("chunk_key_encoding");
+    if(keys == zarray.end() || extName(*keys) != "default") return chunkName;
+    // A 0-dimensional array's single chunk is "c"
+    return shape.empty() ? std::string("c") : "c"+dimension_separator+chunkName;
+}
+
+const std::vector<uint64_t> zarr::get_chunkAxisOrder() const{
+    const uint64_t n = shape.size();
+    std::vector<uint64_t> axes(n);
+    for(uint64_t d = 0; d < n; d++) axes[d] = order == "C" ? d : n-1-d;
+    if(zarr_format == 3){
+        const V3Codecs c = parseV3Codecs(chunkCodecsV3(zarray), n, false);
+        if(!c.axisOrder.empty()) axes = c.axisOrder;
+    }
+    return axes;
+}
+
+const std::string zarr::get_compressor() const{
+    if(cname == "none") return "none";
+    // (zlib streams decode the same way as gzip)
+    if(cname == "gzip" || id == "gzip" || id == "zlib") return "gzip";
+    if(id == "zstd") return "zstd";
+    if(id.empty() || id == "blosc") return "blosc";
+    return id;
+}
+
+bool zarr::get_chunkChecksum() const{
+    if(zarr_format != 3) return false;
+    return parseV3Codecs(chunkCodecsV3(zarray), shape.size(), false).checksum;
 }
 
 const uint64_t zarr::get_ShardPosition(const std::vector<uint64_t> &cAV) const{

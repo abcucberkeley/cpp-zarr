@@ -37,6 +37,9 @@ static zarr openZarr(const std::string &fileName) {
         return zarr(fileName);
     }
     catch (const std::string &e) {
+        if (e.rfind("metadataUnsupported:", 0) == 0) {
+            throw std::runtime_error("Cannot read " + fileName + ": " + e.substr(e.find(':') + 1));
+        }
         throw std::runtime_error("Cannot read the zarr metadata of " + fileName + " (" + e + ")");
     }
 }
@@ -46,6 +49,9 @@ static void writeZarray(zarr &Zarr) {
         Zarr.write_zarray();
     }
     catch (const std::string &e) {
+        if (e.rfind("zarrV3NotWritable:", 0) == 0) {
+            throw std::runtime_error(Zarr.get_fileName() + " is a Zarr v3 array. Writing Zarr v3 arrays is not supported yet");
+        }
         throw std::runtime_error("Cannot write the zarr metadata of " + Zarr.get_fileName() + " (" + e + ")");
     }
 }
@@ -122,6 +128,7 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
         if (dsize == '4') return create_pybind11_array<float>(data, dims, cOrder);
         if (dsize == '8') return create_pybind11_array<double>(data, dims, cOrder);
     }
+    else if (kind == 'b' && dsize == '1') return create_pybind11_array<bool>(data, dims, cOrder);
     free(data);
     throw std::runtime_error("Unsupported data type: " + dtype);
 }

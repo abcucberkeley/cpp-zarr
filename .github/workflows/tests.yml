@@ -27,6 +27,10 @@ jobs:
     defaults:
       run:
         shell: ${{ matrix.shell }}
+    # The tests read arrays written by zarr-python and TensorStore (made below), and
+    # fail here if they are missing (elsewhere they are skipped)
+    env:
+      CPPZARR_REQUIRE_TEST_ARRAYS: '1'
     steps:
       - uses: actions/checkout@v7
 
@@ -36,7 +40,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y uuid-dev
 
       # The library's build flags and OpenMP setup are GCC-only, so Windows uses
-      # MinGW. Python comes from MSYS2 too, so everything shares one toolchain.
+      # MinGW. The Python tests use MSYS2's Python, so they share one toolchain.
       # MSYS2 packages GCC's OpenMP runtime (libgomp) separately from gcc.
       - name: Set up MinGW (Windows)
         if: runner.os == 'Windows'
@@ -55,10 +59,19 @@ jobs:
           echo "CXX=$(brew --prefix gcc@13)/bin/g++-13" >> "$GITHUB_ENV"
 
       - name: Set up Python
-        if: runner.os != 'Windows'
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+
+      # Zarr v3 test arrays (and v2 ones with codecs cpp-zarr does not write) from
+      # zarr-python and TensorStore, for the tests to read. Pinned versions, so a new
+      # release cannot change the test data. On Windows this is the Python from
+      # setup-python (Git Bash), since MSYS2's has no TensorStore or numcodecs.
+      - name: Make the test arrays
+        shell: bash
+        run: |
+          python -m pip install "zarr==3.1.6" "numcodecs==0.16.5" "tensorstore==0.1.85" numpy
+          python tests/make_test_arrays.py
 
       - name: Build library and C++ tests
         run: |
@@ -107,6 +120,10 @@ jobs:
     defaults:
       run:
         shell: ${{ matrix.shell }}
+    # The tests read arrays written by zarr-python and TensorStore (made below), and
+    # fail here if they are missing (elsewhere they are skipped)
+    env:
+      CPPZARR_REQUIRE_TEST_ARRAYS: '1'
     steps:
       - uses: actions/checkout@v7
 
@@ -135,6 +152,21 @@ jobs:
           brew list gcc@13 > /dev/null 2>&1 || brew install gcc@13
           echo "CC=$(brew --prefix gcc@13)/bin/gcc-13" >> "$GITHUB_ENV"
           echo "CXX=$(brew --prefix gcc@13)/bin/g++-13" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # Zarr v3 test arrays (and v2 ones with codecs cpp-zarr does not write) from
+      # zarr-python and TensorStore, for the tests to read. Pinned versions, so a new
+      # release cannot change the test data. On Windows this is the Python from
+      # setup-python (Git Bash), since MSYS2's has no TensorStore or numcodecs.
+      - name: Make the test arrays
+        shell: bash
+        run: |
+          python -m pip install "zarr==3.1.6" "numcodecs==0.16.5" "tensorstore==0.1.85" numpy
+          python tests/make_test_arrays.py
 
       - name: Build library
         run: |

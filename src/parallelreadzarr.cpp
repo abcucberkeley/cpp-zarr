@@ -7,6 +7,7 @@
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "zlib.h"
+#include "zstd.h"
 
 // zarrArr should be initialized to all zeros if you have empty chunks
 uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
@@ -86,22 +87,27 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     const bool indexAtStart = Zarr.get_shardIndexAtStart();
     const bool indexChecksum = Zarr.get_shardIndexChecksum();
     const uint64_t emptyEntry = std::numeric_limits<uint64_t>::max();
+    // How each stored chunk is encoded: a compressor (v2's, or a Zarr v3 codec),
+    // and a CRC32C checksum after it (Zarr v3 crc32c codec)
+    const std::string compressor = Zarr.get_compressor();
+    const bool chunkChecksum = Zarr.get_chunkChecksum();
+    if(compressor != "none" && compressor != "blosc" && compressor != "gzip" && compressor != "zstd"){
+        Zarr.set_errString("The \""+compressor+"\" compressor is not supported\n");
+        return 1;
+    }
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     uint64_t s = 1;
     for(uint64_t d = 0; d < nDims; d++) s *= Zarr.get_chunks(d);
     const uint64_t sB = s*bytes;
 
-    // Element strides of a decompressed chunk and of the output (each F or C order)
+    // Element strides of a decompressed chunk (its stored axes, slowest first: C or
+    // F order, or a Zarr v3 transpose) and of the output (F or C order)
     std::vector<uint64_t> chunkStrides(nDims), outStrides(nDims);
     {
+        const std::vector<uint64_t> axes = Zarr.get_chunkAxisOrder();
         uint64_t acc = 1;
-        if(Zarr.get_order() == "C"){
-            for(int64_t d = (int64_t)nDims-1; d >= 0; d--){ chunkStrides[d] = acc; acc *= Zarr.get_chunks(d); }
-        }
-        else{
-            for(uint64_t d = 0; d < nDims; d++){ chunkStrides[d] = acc; acc *= Zarr.get_chunks(d); }
-        }
+        for(int64_t i = (int64_t)nDims-1; i >= 0; i--){ chunkStrides[axes[i]] = acc; acc *= Zarr.get_chunks(axes[i]); }
         acc = 1;
         if(cOrder){
             for(int64_t d = (int64_t)nDims-1; d >= 0; d--){ outStrides[d] = acc; acc *= readShape[d]; }
@@ -111,8 +117,10 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         }
     }
 
+    // Sparse reads skip all-zero chunks, which the output already holds when the
+    // fill value is zero
     void* zeroChunkUnc = NULL;
-    if(sparse){
+    if(sparse && fillValueIsZero(Zarr.get_fill_value())){
         zeroChunkUnc = calloc(s,bytes);
     }
 
@@ -142,7 +150,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             std::string fileName;
             
             if(!Zarr.get_shard()){
-                fileName = (Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
+                fileName = (Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkKey(Zarr.get_chunkNames(f)));
             }
             else{
                 // Can change this to the check for zeros maybe
@@ -154,7 +162,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 if(pad) {
                     continue;
                 }
-                fileName = Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f));
+                fileName = Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkKey(Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
             }
             // If we cannot open the file then set to all zeros
             // Can make this better by checking the errno
@@ -240,8 +248,23 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     file.close();
                 }
                 
+                // A crc32c codec's checksum follows the chunk's bytes
+                if(chunkChecksum){
+                    uint32_t stored = 0;
+                    if(fileLen >= 4) memcpy(&stored, (const uint8_t*)buffer+fileLen-4, 4);
+                    if(fileLen < 4 || stored != crc32c((const uint8_t*)buffer, (size_t)fileLen-4)){
+                        #pragma omp critical
+                        {
+                        err = 1;
+                        errString = "The chunk "+fileName+" does not match its checksum (it may be damaged)\n";
+                        }
+                        break;
+                    }
+                    fileLen -= 4;
+                }
+
                 // Decompress
-                if(Zarr.get_cname() == "none"){
+                if(compressor == "none"){
                     // Uncompressed chunk: used straight from the file buffer
                     if(fileLen != (std::streamsize)sB){
                         #pragma omp critical
@@ -256,7 +279,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     }
                     dsize = sB;
                 }
-                else if(Zarr.get_cname() != "gzip"){
+                else if(compressor == "zstd"){
+                    const size_t zsize = ZSTD_decompress(bufferDest, sB, buffer, (size_t)fileLen);
+                    dsize = (!ZSTD_isError(zsize) && zsize == sB) ? (int64_t)sB : -1;
+                }
+                else if(compressor == "blosc"){
                     if(!useCtx){
                         dsize = blosc2_decompress(buffer, fileLen, bufferDest, sB);
                     }
@@ -337,8 +364,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
             }
             // Uncompressed chunks are used straight from the file buffer
-            const void* chunkData = Zarr.get_cname() == "none" ? buffer : bufferDest;
-            if(sparse){
+            const void* chunkData = compressor == "none" ? buffer : bufferDest;
+            if(zeroChunkUnc){
                 // If the chunk is all zeros (memcmp == 0) then we skip it
                 const bool allZeros = memcmp(zeroChunkUnc,chunkData,sB);
                 if(!allZeros) continue;
@@ -415,23 +442,26 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     Zarr.set_chunkInfo(startCoords, endCoords);
 
     // The chunk read/copy machinery is element-width based, so one generic path
-    // covers every supported dtype: signed/unsigned 8/16/32/64-bit integers and
-    // 32/64-bit floats.
+    // covers every supported dtype: signed/unsigned 8/16/32/64-bit integers,
+    // 32/64-bit floats and booleans.
     const std::string &dtype = Zarr.get_dtype();
     const uint64_t bytes = Zarr.dtypeBytes();
     const char kind = dtype.size() == 3 ? dtype[1] : '\0';
-    if(!bytes || (kind != 'u' && kind != 'i' && kind != 'f') ||
-       (kind == 'f' && bytes < 4)){
+    if(!bytes || (kind != 'u' && kind != 'i' && kind != 'f' && kind != 'b') ||
+       (kind == 'f' && bytes < 4) || (kind == 'b' && bytes != 1)){
         return NULL;
     }
 
+    // The output starts as the fill value, which is what missing chunks read as
+    uint8_t fillElem[8];
+    fillValueElement(Zarr.get_fill_value(), dtype, fillElem);
     void* zarrArr = nullptr;
-    const int fillValue = fillValueToInt(Zarr.get_fill_value());
-    if(fillValue){
+    if(std::any_of(fillElem, fillElem+bytes, [](uint8_t b){ return b != 0; })){
         zarrArr = malloc(readSize*bytes);
-        memset(zarrArr,fillValue,readSize*bytes);
+        if(zarrArr) fillElements(bytes, zarrArr, readSize, fillElem);
     }
     else zarrArr = calloc(readSize,bytes);
+    if(!zarrArr) return NULL;
     uint8_t err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,true,false,cOrder);
     if(err){
         free(zarrArr);

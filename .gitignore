@@ -1,0 +1,2 @@
+# Test arrays made by tests/make_test_arrays.py (zarr-python and TensorStore)
+tests/test_arrays/

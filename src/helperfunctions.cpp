@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include "helperfunctions.h"
 #include "zarr.h"
 
@@ -222,6 +223,53 @@ uint32_t crc32c(const uint8_t* data, size_t length){
     uint32_t crc = 0xFFFFFFFF;
     for(size_t i = 0; i < length; i++) crc = (crc >> 8) ^ crc32cTable[(crc ^ data[i]) & 0xFF];
     return ~crc;
+}
+
+void fillValueElement(const std::string &fillValue, const std::string &dtype, uint8_t elem[8]){
+    memset(elem, 0, 8);
+    if(dtype.size() != 3) return;
+    const char kind = dtype[1];
+    const int bytes = dtype[2]-'0';
+    if(bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) return;
+    const std::string &s = fillValue;
+    const bool inf = s == "Infinity", negInf = s == "-Infinity";
+    if(s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')){
+        // A bit pattern (Zarr v3 floats), most significant digit first
+        const uint64_t bits = strtoull(s.c_str()+2, NULL, 16);
+        if(bytes == 8) memcpy(elem, &bits, 8);
+        else if(bytes == 4){ const uint32_t v = (uint32_t)bits; memcpy(elem, &v, 4); }
+        else if(bytes == 2){ const uint16_t v = (uint16_t)bits; memcpy(elem, &v, 2); }
+        else elem[0] = (uint8_t)bits;
+    }
+    else if(kind == 'f'){
+        double v = 0;
+        if(s == "NaN") v = std::numeric_limits<double>::quiet_NaN();
+        else if(inf || negInf) v = inf ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
+        else{
+            char* end = NULL;
+            v = strtod(s.c_str(), &end);
+            if(end == s.c_str()) v = 0;
+        }
+        if(bytes == 8) memcpy(elem, &v, 8);
+        else if(bytes == 4){ const float f = (float)v; memcpy(elem, &f, 4); }
+    }
+    else if(kind == 'b') elem[0] = (s == "1" || s == "true") ? 1 : 0;
+    else if(kind == 'u' || kind == 'i'){
+        // Infinity and -Infinity (from older metadata) are the type's limits
+        uint64_t v = 0;
+        if(inf || negInf){
+            const uint64_t umax = bytes == 8 ? UINT64_MAX : (1ULL << (8*bytes))-1;
+            if(kind == 'u') v = inf ? umax : 0;
+            else v = inf ? umax >> 1 : ~(umax >> 1);
+        }
+        else if(!s.empty() && s[0] == '-') v = (uint64_t)strtoll(s.c_str(), NULL, 10);
+        else v = strtoull(s.c_str(), NULL, 10);
+        if(bytes == 8) memcpy(elem, &v, 8);
+        else if(bytes == 4){ const uint32_t x = (uint32_t)v; memcpy(elem, &x, 4); }
+        else if(bytes == 2){ const uint16_t x = (uint16_t)v; memcpy(elem, &x, 2); }
+        else elem[0] = (uint8_t)v;
+    }
+    if(oppositeEndianness(dtype)) std::reverse(elem, elem+bytes);
 }
 
 bool fillValueIsZero(const std::string &fillValue){

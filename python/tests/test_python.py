@@ -4,11 +4,15 @@ Writes small random volumes, reads them back, and checks the data survives the
 round trip -- across dtypes, compressors, both storage orders (F and C), plus a
 region (cropped) read, arrays of 0 to 40 dimensions with region reads and crop
 writes, and arrays in any memory layout (C order, F order, strided views) read
-back in either order. Run automatically by cibuildwheel against the freshly
+back in either order, and test arrays written by zarr-python 3 and TensorStore
+(tests/test_arrays: Zarr v3, and v2 with other codecs and fill values). Run
+automatically by cibuildwheel against the freshly
 built+installed wheel, so it also verifies the wheel imports and bundles its
 native library. Exits non-zero on any failure.
 """
+import json
 import os
+import shutil
 import sys
 import tempfile
 
@@ -160,6 +164,61 @@ def main():
     good = np.array_equal(cppzarr.read_zarr(p2, [3, 5, 0], [40, 30, 1]), d2[3:40, 5:30])
     print(f"2D 3-value args  {'OK' if good else 'FAIL'}")
     ok = ok and good
+
+    # Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
+    # arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
+    # Reads in every order and a region read match what zarr-python reads; arrays
+    # cpp-zarr cannot read are rejected; writing into a v3 array is refused and changes
+    # nothing
+    v3dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'test_arrays')
+    if not os.path.isfile(os.path.join(v3dir, 'arrays.json')):
+        # made by tests/make_test_arrays.py; CI makes them and requires them
+        required = bool(os.environ.get('CPPZARR_REQUIRE_TEST_ARRAYS'))
+        print(f"test arrays not found, {'FAIL' if required else 'skipped'} (make them with tests/make_test_arrays.py)")
+        ok = ok and not required
+    else:
+        with open(os.path.join(v3dir, 'arrays.json')) as f:
+            fixtures = json.load(f)['arrays']
+        for fx in fixtures:
+            path = os.path.join(v3dir, fx['name'] + '.zarr')
+            if 'error' in fx:
+                try:
+                    cppzarr.read_zarr(path)
+                    good = False
+                except Exception as e:
+                    good = fx['error'] in str(e)
+                print(f"test array {fx['name']:36s} rejected  {'OK' if good else 'FAIL'}")
+                ok = ok and good
+                continue
+            exp = np.fromfile(os.path.join(v3dir, fx['name'] + '.bin'), dtype=fx['dtype']).reshape(fx['shape'])
+            good = True
+            for o in (None, 'F', 'C'):
+                a = cppzarr.read_zarr(path, order=o)
+                good = good and a.dtype == exp.dtype and np.array_equal(a, exp, equal_nan=exp.dtype.kind == 'f')
+            if exp.ndim:
+                s = [1 if n > 2 else 0 for n in exp.shape]
+                e = [n - 1 if n > 2 else n for n in exp.shape]
+                region = tuple(slice(a, b) for a, b in zip(s, e))
+                good = good and np.array_equal(cppzarr.read_zarr(path, s, e), exp[region], equal_nan=exp.dtype.kind == 'f')
+            print(f"test array {fx['name']:36s}           {'OK' if good else 'FAIL'}")
+            ok = ok and good
+        copy = os.path.join(tmp, 'v3_write.zarr')
+        shutil.copytree(os.path.join(v3dir, 'v3_blosc_zstd_uint16.zarr'), copy)
+        before = sorted(os.path.relpath(os.path.join(dp, f), copy) for dp, _, fs in os.walk(copy) for f in fs)
+        good = True
+        for crop in (False, True):
+            try:
+                if crop:
+                    cppzarr.write_zarr(copy, np.ones((2, 2, 2), np.uint16), start_coords=[0, 0, 0], end_coords=[2, 2, 2])
+                else:
+                    cppzarr.write_zarr(copy, np.ones((10, 7, 5), np.uint16))
+                good = False
+            except Exception as e:
+                good = good and 'Zarr v3' in str(e)
+        after = sorted(os.path.relpath(os.path.join(dp, f), copy) for dp, _, fs in os.walk(copy) for f in fs)
+        good = good and before == after
+        print(f"writes into a Zarr v3 array refused  {'OK' if good else 'FAIL'}")
+        ok = ok and good
 
     if not ok:
         sys.exit("cppzarr Python round-trip test FAILED")

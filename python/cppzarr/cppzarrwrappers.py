@@ -24,8 +24,8 @@ def read_zarr(file_name, start_coords=None, end_coords=None, order=None):
     # order is the memory layout of the returned array: 'F' (first axis
     # contiguous), 'C' (last axis contiguous), or None (the default) for the
     # file's own storage order, like zarr-python
-    if not os.path.isfile(os.path.join(file_name, '.zarray')):
-        raise Exception(f'{file_name} does not exist. The .zarray metadata file was not found')
+    if not (os.path.isfile(os.path.join(file_name, '.zarray')) or os.path.isfile(os.path.join(file_name, 'zarr.json'))):
+        raise Exception(f'{file_name} does not exist. No .zarray or zarr.json metadata file was found')
     if order not in (None, 'F', 'C'):
         raise Exception(f"order must be 'F', 'C' or None, not {order!r}")
     # All-zero coordinates mean the whole array, for any number of dimensions

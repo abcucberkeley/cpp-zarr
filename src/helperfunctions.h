@@ -61,6 +61,11 @@ void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void*
 // CRC32C (Castagnoli) checksum, as Zarr v3 uses for shard indexes.
 uint32_t crc32c(const uint8_t* data, size_t length);
 
+// The fill_value string as one element of the dtype ("<u2", ">f4", "|b1", ...),
+// in the dtype's own byte order: a number, "NaN", "Infinity", "-Infinity" or a
+// "0x..." bit pattern (Zarr v3). Writes 1 to 8 bytes; unparsable values give 0.
+void fillValueElement(const std::string &fillValue, const std::string &dtype, uint8_t elem[8]);
+
 // True when the fill_value string is a numeric zero ("0", "0.0", ...): chunks of
 // zeros can then be left unwritten, since every reader fills a missing chunk with
 // zeros. ("NaN", null and nonzero fill values are not.)

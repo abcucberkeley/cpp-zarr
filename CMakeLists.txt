@@ -73,6 +73,10 @@ set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+# The reader also calls zstd itself (Zarr v3's zstd codec), using the zstd bundled
+# with c-blosc2 that its library already contains
+set(DEACTIVATE_ZSTD OFF CACHE BOOL "" FORCE)
+set(PREFER_EXTERNAL_ZSTD OFF CACHE BOOL "" FORCE)
 # nlohmann/json: don't build its test suite
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 # c-blosc still declares cmake_minimum_required(VERSION 2.8.12), which CMake 4
@@ -135,9 +139,12 @@ if(UNIX)
 endif()
 
 # blosc/blosc2 propagate their include dirs through their targets, but stay explicit.
+# zstd.h comes from the zstd bundled with c-blosc2.
+file(GLOB CPPZARR_ZSTD_DIR LIST_DIRECTORIES true "${cblosc2_SOURCE_DIR}/internal-complibs/zstd-*")
 target_include_directories(cppZarr_shared PRIVATE
     ${cblosc_SOURCE_DIR}/blosc
     ${cblosc2_SOURCE_DIR}/include
+    ${CPPZARR_ZSTD_DIR}
 )
 
 # Link against the fetched static libraries by target name.
@@ -177,6 +184,8 @@ if(CPPZARR_BUILD_TESTS)
     add_executable(roundtripTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.cpp)
     set_target_properties(roundtripTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     target_include_directories(roundtripTest PRIVATE ${SRC_DIR} ${nlohmann_json_SOURCE_DIR}/include)
+    # Arrays written by zarr-python and TensorStore (made by tests/make_test_arrays.py)
+    target_compile_definitions(roundtripTest PRIVATE CPPZARR_TEST_ARRAYS="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_arrays")
     target_link_libraries(roundtripTest PRIVATE cppZarr_shared OpenMP::OpenMP_CXX)
     add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
 endif()

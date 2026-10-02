@@ -200,5 +200,82 @@ function test_matlab(mexDir)
     assert(isequal(size(z), sz) && isa(z, 'uint16') && ~any(z(:)), 'createZarrFile mismatch');
     fprintf('PASS  createZarrFile\n');
 
+    % Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
+    % arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
+    % Full and region reads match what zarr-python reads, arrays cpp-zarr cannot read
+    % are rejected, and writing into a v3 array is refused and changes nothing
+    v3dir = fullfile(fileparts(mfilename('fullpath')), 'test_arrays');
+    if isfile(fullfile(v3dir, 'arrays.json'))
+        checkTestArrays(v3dir, tmp);
+    else
+        % made by tests/make_test_arrays.py; CI makes them and requires them
+        assert(isempty(getenv('CPPZARR_REQUIRE_TEST_ARRAYS')), 'test arrays not found in %s', v3dir);
+        fprintf('SKIP  test arrays not found (make them with tests/make_test_arrays.py)\n');
+    end
+
     disp('MATLAB round-trip tests PASSED');
+end
+
+function checkTestArrays(v3dir, tmp)
+% Read every test array (arrays.json) and compare with the values zarr-python reads;
+% check the rejected ones are rejected, and that writes into a v3 array are refused
+    fixtures = jsondecode(fileread(fullfile(v3dir, 'arrays.json'))).arrays;
+    classes = struct('u1', 'uint8', 'i1', 'int8', 'u2', 'uint16', 'i2', 'int16', 'u4', 'uint32', ...
+                     'i4', 'int32', 'u8', 'uint64', 'i8', 'int64', 'f4', 'single', 'f8', 'double', 'b1', 'logical');
+    nRead = 0;  nRejected = 0;
+    for k = 1 : numel(fixtures)
+        if iscell(fixtures), fx = fixtures{k}; else, fx = fixtures(k); end
+        fz = fullfile(v3dir, [fx.name '.zarr']);
+        if isfield(fx, 'error')
+            try
+                parallelReadZarr(fz);
+                rejected = false;
+            catch ME
+                rejected = contains(ME.message, fx.error);
+            end
+            assert(rejected, 'test array %s was not rejected', fx.name);
+            nRejected = nRejected + 1;
+            continue;
+        end
+        cls = classes.(fx.dtype(2:3));
+        fid = fopen(fullfile(v3dir, [fx.name '.bin']), 'r', 'ieee-le');
+        if strcmp(cls, 'logical'), v = fread(fid, Inf, 'uint8=>uint8') ~= 0; else, v = fread(fid, Inf, [cls '=>' cls]); end
+        fclose(fid);
+        shp = fx.shape(:)';
+        % the expected values are in C order: reverse the axes for MATLAB's F order
+        if numel(shp) >= 2
+            e = permute(reshape(v, fliplr(shp)), numel(shp):-1:1);
+        else
+            e = v;
+        end
+        a = parallelReadZarr(fz);
+        assert(isa(a, cls) && isequaln(a, e), 'test array %s read mismatch', fx.name);
+        if ~isempty(shp)
+            s = ones(1, numel(shp));  t = shp;
+            s(shp > 2) = 2;  t(shp > 2) = shp(shp > 2) - 1;
+            idx = arrayfun(@(p, q) p:q, s, t, 'UniformOutput', false);
+            assert(isequaln(parallelReadZarr(fz, 'bbox', [s t]), e(idx{:})), 'test array %s bbox read mismatch', fx.name);
+        end
+        nRead = nRead + 1;
+    end
+    fw = fullfile(tmp, 'v3_write.zarr');
+    copyfile(fullfile(v3dir, 'v3_blosc_zstd_uint16.zarr'), fw);
+    before = dir(fullfile(fw, '**', '*'));
+    for attempt = 1 : 3
+        try
+            switch attempt
+                case 1, parallelWriteZarr(fw, ones([10 7 5], 'uint16'));
+                case 2, parallelWriteZarr(fw, ones([2 2 2], 'uint16'), 'bbox', [1 1 1 2 2 2]);
+                case 3, createZarrFile(fw, 'shape', [10 7 5], 'dtype', '<u2');
+            end
+            refused = false;
+        catch ME
+            refused = contains(ME.message, 'Zarr v3');
+        end
+        assert(refused, 'write %d into a Zarr v3 array was not refused', attempt);
+    end
+    after = dir(fullfile(fw, '**', '*'));
+    assert(isequal(sort({before.name}), sort({after.name})) && isequal(sort([before.bytes]), sort([after.bytes])), ...
+           'a refused write changed the Zarr v3 array');
+    fprintf('PASS  zarr-python and TensorStore test arrays (%d read, %d rejected, writes into v3 refused)\n', nRead, nRejected);
 end

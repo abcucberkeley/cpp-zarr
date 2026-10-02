@@ -116,9 +116,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions or the file path.\n",e.substr(e.find(':')+1).c_str());
             }
             else if(e == "metadataIncomplete"){
-                mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
+                mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray or zarr.json file");
             }
-            else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+            else mexZarrError(e);
         }
     }
 
@@ -241,7 +241,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             else if(e.find("cannotOpenZarray") != std::string::npos){
                 mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions and path.\n",e.substr(e.find(':')+1).c_str());
             }
-            else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+            else mexZarrError(e);
         }
     }
     else{
@@ -263,7 +263,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 else if(e.find("cannotOpenZarray") != std::string::npos){
                     mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions and path.\n",e.substr(e.find(':')+1).c_str());
                 }
-                else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+                else mexZarrError(e);
             }
         }
 
@@ -276,9 +276,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for writing. Try checking permissions or the file path.\n",e.substr(e.find(':')+1).c_str());
             }
             else if(e == "metadataIncomplete"){
-                mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
+                mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray or zarr.json file");
             }
-            else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+            else mexZarrError(e);
         }
         
         if(dtypeT != Zarr.get_dtype()){

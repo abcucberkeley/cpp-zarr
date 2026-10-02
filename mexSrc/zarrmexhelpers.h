@@ -54,4 +54,16 @@ static bool mexParseRegion(const std::vector<uint64_t> &b, const uint64_t nDims,
     }
     return true;
 }
+// Report an error the zarr class threw (as a string) that the caller does not
+// handle itself
+static void mexZarrError(const std::string &e){
+    const std::string detail = e.substr(e.find(':')+1);
+    if(e.rfind("metadataUnsupported:", 0) == 0){
+        mexErrMsgIdAndTxt("zarr:zarrayError","This zarr array cannot be read: %s\n",detail.c_str());
+    }
+    if(e.rfind("zarrV3NotWritable:", 0) == 0){
+        mexErrMsgIdAndTxt("zarr:zarrayError","%s is a Zarr v3 array. Writing Zarr v3 arrays is not supported yet\n",detail.c_str());
+    }
+    mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred (%s)\n",e.c_str());
+}
 #endif

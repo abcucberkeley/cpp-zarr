@@ -53,6 +53,22 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         Zarr.set_errString("Sharding is not supported for 0-dimensional arrays\n");
         return 1;
     }
+    // Only what the writer produces can be written: not Zarr v3 arrays (yet), and
+    // not v2 arrays read with another compressor (numcodecs zlib or zstd) or byte
+    // order (big-endian on this machine), which would end up with mixed chunks
+    if(Zarr.get_zarr_format() == 3){
+        Zarr.set_errString("Writing Zarr v3 arrays is not supported yet: "+Zarr.get_fileName()+"\n");
+        return 1;
+    }
+    const std::string compressor = Zarr.get_compressor();
+    if(!(compressor == "none" || compressor == "blosc" || (compressor == "gzip" && Zarr.get_cname() == "gzip"))){
+        Zarr.set_errString("Writing arrays with the \""+Zarr.get_cname()+"\" compressor is not supported\n");
+        return 1;
+    }
+    if(oppositeEndianness(Zarr.get_dtype())){
+        Zarr.set_errString("Writing arrays of data type \""+Zarr.get_dtype()+"\" (opposite byte order) is not supported\n");
+        return 1;
+    }
     const uint64_t bytes = (bits/8);
 
     int32_t numWorkers = omp_get_max_threads();

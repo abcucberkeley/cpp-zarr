@@ -54,9 +54,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexErrMsgIdAndTxt("zarr:zarrayError","Cannot open %s for reading. Try checking permissions or the file path.\n",e.substr(e.find(':')+1).c_str());
         }
         else if(e == "metadataIncomplete"){
-            mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
+            mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray or zarr.json file");
         }
-        else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+        else mexZarrError(e);
     }
 
     const uint64_t nDims = Zarr.get_ndims();
@@ -101,7 +101,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     // Map the zarr dtype to the matching MATLAB class. The read machinery is
     // element-width based, so one generic path covers every supported dtype:
-    // signed/unsigned 8/16/32/64-bit integers and 32/64-bit floats.
+    // signed/unsigned 8/16/32/64-bit integers, 32/64-bit floats and booleans.
     const std::string dtype = Zarr.get_dtype();
     const char kind = dtype.size() == 3 ? dtype[1] : '\0';
     const char dsize = dtype.size() == 3 ? dtype[2] : '\0';
@@ -122,20 +122,20 @@ void mexFunction(int nlhs, mxArray *plhs[],
         if(dsize == '4') mxClass = mxSINGLE_CLASS;
         else if(dsize == '8') mxClass = mxDOUBLE_CLASS;
     }
+    else if(kind == 'b' && dsize == '1') mxClass = mxLOGICAL_CLASS;
     if(mxClass == mxUNKNOWN_CLASS) mexErrMsgIdAndTxt("zarr:dataTypeError","Data type \"%s\" is not supported",dtype.c_str());
 
+    // The output starts as the fill value, which is what missing chunks read as
     const uint64_t bytes = Zarr.dtypeBytes();
-    void* zarrArr = NULL;
-    const int fillValue = fillValueToInt(Zarr.get_fill_value());
-    if(fillValue){
-        plhs[0] = mxCreateUninitNumericArray(dim.size(),dim.data(),mxClass, mxREAL);
-        zarrArr = mxGetData(plhs[0]);
-        memset(zarrArr,fillValue,readSize*bytes);
-    }
-    else{
-        plhs[0] = mxCreateNumericArray(dim.size(),dim.data(),mxClass, mxREAL);
-        zarrArr = mxGetData(plhs[0]);
-    }
+    uint8_t fillElem[8];
+    fillValueElement(Zarr.get_fill_value(), dtype, fillElem);
+    bool fill = false;
+    for(uint64_t b = 0; b < bytes; b++) fill = fill || fillElem[b];
+    if(mxClass == mxLOGICAL_CLASS) plhs[0] = mxCreateLogicalArray(dim.size(),dim.data());
+    else if(fill) plhs[0] = mxCreateUninitNumericArray(dim.size(),dim.data(),mxClass, mxREAL);
+    else plhs[0] = mxCreateNumericArray(dim.size(),dim.data(),mxClass, mxREAL);
+    void* zarrArr = mxGetData(plhs[0]);
+    if(fill) fillElements(bytes, zarrArr, readSize, fillElem);
     err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,useCtx,sparse);
 
     if(err) mexErrMsgIdAndTxt("zarr:readError",Zarr.get_errString().c_str());
