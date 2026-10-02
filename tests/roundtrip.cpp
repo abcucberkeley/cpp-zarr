@@ -962,34 +962,44 @@ int main(int argc, char** argv){
                 if (!ok) failures++;
             }
 
-            // Writing into a Zarr v3 array is refused before anything is written
+            // Writing into a Zarr v3 array is refused before anything is written. (The array is
+            // copied file by file with streams: on macOS, std::filesystem::copy aborts in this
+            // program, which has Homebrew's libstdc++ next to the copy libcppZarr exports.)
             total++;
-            const std::string copy = dir + "/rt_v3_write.zarr";
+            const std::string src = v3dir + "/v3_blosc_zstd_uint16.zarr", copy = dir + "/rt_v3_write.zarr";
             std::error_code ec;
-            std::filesystem::remove_all(copy, ec);
-            std::filesystem::copy(v3dir + "/v3_blosc_zstd_uint16.zarr", copy, std::filesystem::copy_options::recursive, ec);
-            auto listing = [&](){
-                std::vector<std::string> files;
-                for (const auto& f : std::filesystem::recursive_directory_iterator(copy)) files.push_back(f.path().string());
-                std::sort(files.begin(), files.end());
-                return files;
-            };
-            const std::vector<std::string> before = listing();
-            bool ok = !ec;
+            bool ok = true;
             try{
+                std::filesystem::remove_all(copy, ec);
+                for (const auto& f : std::filesystem::recursive_directory_iterator(src)){
+                    const std::string to = copy + f.path().string().substr(src.size());
+                    std::filesystem::create_directories(f.is_directory() ? std::filesystem::path(to) : std::filesystem::path(to).parent_path());
+                    if (f.is_directory()) continue;
+                    std::ifstream in(f.path().string(), std::ios::binary);
+                    std::ofstream out(to, std::ios::binary);
+                    out << in.rdbuf();
+                }
+                auto listing = [&](){
+                    std::vector<std::string> files;
+                    for (const auto& f : std::filesystem::recursive_directory_iterator(copy)) files.push_back(f.path().string());
+                    std::sort(files.begin(), files.end());
+                    return files;
+                };
+                const std::vector<std::string> before = listing();
                 zarr Z(copy);
                 std::vector<uint16_t> d(10*7*5, 1);
                 Z.set_chunkInfo({0, 0, 0}, {10, 7, 5});
-                ok = ok && parallelWriteZarr(Z, d.data(), {0, 0, 0}, {10, 7, 5}, {10, 7, 5}, 16, true, false, true) == 1 &&
+                ok = before.size() > 1 && parallelWriteZarr(Z, d.data(), {0, 0, 0}, {10, 7, 5}, {10, 7, 5}, 16, true, false, true) == 1 &&
                      Z.get_errString().find("not supported yet") != std::string::npos;
                 zarr N;
                 N.set_fileName(copy);
                 N.set_shape({10, 7, 5});
                 try { N.write_zarray(); ok = false; }
                 catch (const std::string& e){ ok = ok && e.find("zarrV3NotWritable") == 0; }
+                ok = ok && listing() == before;
             }
+            catch (const std::exception& e){ ok = false; std::fprintf(stderr, "    %s\n", e.what()); }
             catch (...){ ok = false; }
-            ok = ok && listing() == before;
             std::printf("%s  writes into a Zarr v3 array are refused and change nothing\n", ok ? "PASS" : "FAIL");
             if (!ok) failures++;
             std::filesystem::remove_all(copy, ec);
