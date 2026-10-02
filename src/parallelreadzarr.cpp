@@ -64,13 +64,28 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     }
     */
 
-    // The chunk size is actually the inner chunk size if the zarr file is sharded
+    // A sharded array is read with its inner chunk shape (the shard shape is
+    // restored on return). Each shard's index is at the start or, by default, the
+    // end of its file, optionally followed by a CRC32C of it.
     const uint64_t nDims = Zarr.get_ndims();
+    std::vector<uint64_t> shardChunks;
     if(Zarr.get_shard()){
         std::vector<uint64_t> innerChunks(nDims);
-        for(uint64_t d = 0; d < nDims; d++) innerChunks[d] = Zarr.get_chunk_shape(d);
+        for(uint64_t d = 0; d < nDims; d++){
+            shardChunks.push_back(Zarr.get_chunks(d));
+            innerChunks[d] = Zarr.get_chunk_shape(d);
+        }
         Zarr.set_chunks(innerChunks);
     }
+    struct RestoreChunks {
+        zarr &z;
+        const std::vector<uint64_t> chunks;
+        ~RestoreChunks(){ if(!chunks.empty()) z.set_chunks(chunks); }
+    } restoreChunks{Zarr, shardChunks};
+    const uint64_t nInner = Zarr.get_shard() ? Zarr.get_numChunksPerShard() : 0;
+    const bool indexAtStart = Zarr.get_shardIndexAtStart();
+    const bool indexChecksum = Zarr.get_shardIndexChecksum();
+    const uint64_t emptyEntry = std::numeric_limits<uint64_t>::max();
     
     const int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
     uint64_t s = 1;
@@ -106,8 +121,14 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
 
     #pragma omp parallel for
     for(int32_t w = 0; w < numWorkers; w++){
-        void* bufferDest = operator new(sB);
+        void* bufferDest = nullptr;
         void* buffer = NULL;
+        // An exception cannot leave the parallel loop: report it as an error
+        try{
+        bufferDest = operator new(sB);
+        // The index of the shard this worker read last
+        std::vector<uint64_t> shardIndex(2*nInner);
+        std::string indexShard;
         std::streamsize lastFileLen = 0;
         int64_t dsize = -1;
         int uncErr = 0;
@@ -115,7 +136,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
             if(f>=Zarr.get_numChunks() || err) break;
             const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
-            const std::string subfolderName = Zarr.get_subfoldersString(cAV);
+            // (a shard's subfolder comes from the shard's own indices)
+            const std::string subfolderName = Zarr.get_subfoldersString(Zarr.get_shard() ? Zarr.chunkToShard(cAV) : cAV);
 
             std::string fileName;
             
@@ -157,25 +179,62 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
                 // Sharding
                 else{
-                    uint64_t currChunkShardPosition = Zarr.get_chunkShardPosition(cAV);
-                    uint64_t offsetNBytes[2];
-                    
-                    file.seekg(-(int64_t)(((Zarr.get_numChunksPerShard()*2*sizeof(uint64_t))+4)-(currChunkShardPosition*2*sizeof(uint64_t))), std::ios::end);
-                    file.read(reinterpret_cast<char*>(offsetNBytes), sizeof(offsetNBytes));
-                    
-                    // All zeros or skippable chunk
-                    if(offsetNBytes[0]== std::numeric_limits<uint64_t>::max() &&
-                       offsetNBytes[1] == std::numeric_limits<uint64_t>::max()){
+                    // Load the shard's index once per shard, checking its checksum and
+                    // that every entry lies inside the file
+                    if(fileName != indexShard){
+                        indexShard = fileName;
+                        file.seekg(0, std::ios::end);
+                        const uint64_t shardLen = (uint64_t)file.tellg();
+                        const uint64_t entryBytes = 2*nInner*sizeof(uint64_t);
+                        const uint64_t indexBytes = entryBytes+(indexChecksum ? 4 : 0);
+                        std::string problem;
+                        if(shardLen < indexBytes) problem = "is smaller than its index";
+                        else{
+                            file.seekg(indexAtStart ? 0 : (std::streamoff)(shardLen-indexBytes), std::ios::beg);
+                            file.read(reinterpret_cast<char*>(shardIndex.data()), entryBytes);
+                            uint32_t crc = 0;
+                            if(indexChecksum) file.read(reinterpret_cast<char*>(&crc), sizeof(crc));
+                            if(!file) problem = "could not be read";
+                            else if(indexChecksum && crc != crc32c(reinterpret_cast<const uint8_t*>(shardIndex.data()), entryBytes)){
+                                problem = "has an index that does not match its checksum";
+                            }
+                            else{
+                                // chunk data lies after the index when it is at the start, else before it
+                                const uint64_t lo = indexAtStart ? indexBytes : 0;
+                                const uint64_t hi = indexAtStart ? shardLen : shardLen-indexBytes;
+                                for(uint64_t i = 0; i < nInner && problem.empty(); i++){
+                                    const uint64_t off = shardIndex[2*i], n = shardIndex[(2*i)+1];
+                                    if(off == emptyEntry && n == emptyEntry) continue;
+                                    if(off < lo || off > hi || n > hi-off) problem = "has an index entry outside the file";
+                                }
+                            }
+                        }
+                        if(!problem.empty()){
+                            indexShard.clear();
+                            #pragma omp critical
+                            {
+                                err = 1;
+                                errString = "The shard "+fileName+" "+problem+
+                                            " (it may be damaged, or not match the array's metadata)\n";
+                            }
+                            break;
+                        }
+                    }
+                    const uint64_t pos = Zarr.get_chunkShardPosition(cAV);
+                    const uint64_t offset = shardIndex[2*pos], nbytes = shardIndex[(2*pos)+1];
+                    // An inner chunk that was never written reads as the fill value
+                    if(offset == emptyEntry && nbytes == emptyEntry){
                         file.close();
                         continue;
                     }
-                    fileLen = offsetNBytes[1];
+                    fileLen = (std::streamsize)nbytes;
                     if(lastFileLen < fileLen){
                         operator delete(buffer);
                         buffer = operator new(fileLen);
                         lastFileLen = fileLen;
                     }
-                    file.seekg(offsetNBytes[0], std::ios::beg);
+                    file.clear();
+                    file.seekg((std::streamoff)offset, std::ios::beg);
                     file.read(reinterpret_cast<char*>(buffer), fileLen);
 
                     file.close();
@@ -299,6 +358,14 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             }
             copyBoxND(bytes, (const uint8_t*)chunkData+srcOff*bytes, (uint8_t*)zarrArr+dstOff*bytes,
                       boxExt, chunkStrides, outStrides, true);
+        }
+        }
+        catch(const std::exception &e){
+            #pragma omp critical
+            {
+                err = 1;
+                errString = std::string("Read error: ")+e.what()+"\n";
+            }
         }
         operator delete(bufferDest);
         operator delete(buffer);

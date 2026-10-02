@@ -179,6 +179,28 @@ int fillValueToInt(const std::string &fillValue){
     return (int)v;
 }
 
+uint32_t crc32c(const uint8_t* data, size_t length){
+    // Table for the reflected Castagnoli polynomial, one byte at a time
+    static const std::vector<uint32_t> table = [](){
+        std::vector<uint32_t> t(256);
+        for(uint32_t i = 0; i < 256; i++){
+            uint32_t crc = i;
+            for(int j = 0; j < 8; j++) crc = (crc >> 1) ^ (-(crc & 1) & 0x82F63B78);
+            t[i] = crc;
+        }
+        return t;
+    }();
+    uint32_t crc = 0xFFFFFFFF;
+    for(size_t i = 0; i < length; i++) crc = (crc >> 8) ^ table[(crc ^ data[i]) & 0xFF];
+    return ~crc;
+}
+
+bool fillValueIsZero(const std::string &fillValue){
+    char* end = NULL;
+    const double v = strtod(fillValue.c_str(), &end);
+    return end != fillValue.c_str() && *end == '\0' && v == 0.0;
+}
+
 void swapArrayEndianness(void* array, const size_t elementSize, const size_t numElements){
     uint8_t* data = reinterpret_cast<uint8_t*>(array); // Cast array to byte pointer
 

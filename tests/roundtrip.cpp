@@ -3,8 +3,8 @@
 // dtype (signed/unsigned 8-64 bit ints, f4/f8), each compressor, and both storage
 // orders (F and C), using shapes that do not divide the chunk size so partial edge
 // chunks are exercised, plus chunks large enough for the full-tile F<->C paths,
-// and 1D/2D/4D/5D arrays (region reads, crop writes, sharding, subfolders, and
-// C-order input and output).
+// 1D/2D/4D/5D arrays (region reads, crop writes, sharding, subfolders, and C-order
+// input and output), and sharded and sparse writes (see that section).
 //
 // Exits 0 if every case passes, 1 otherwise, so CTest reports pass/fail.
 // Usage: roundtripTest [output_dir]   (defaults to the current directory)
@@ -18,11 +18,15 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "zarr.h"
+#include "helperfunctions.h"
 #include "parallelreadzarr.h"
 #include "parallelwritezarr.h"
 
@@ -491,6 +495,355 @@ int main(int argc, char** argv){
                 }
             }
         }
+    }
+
+    // Sharding and sparse writes: crop writes into sharded arrays, empty inner chunks
+    // (including the first one of a shard, and whole empty shards), rewrites without
+    // temporary files, sharding with subfolders, shard shapes that are not a multiple of
+    // the inner chunk shape, writes into arrays whose folders are missing, shard indexes
+    // at the start of the file and without a checksum (read and written), damaged shards
+    // (an error, not a crash), and rewrites in which chunks become all zero (fill value
+    // 0, and 7)
+    {
+        typedef std::vector<uint64_t> V;
+        std::mt19937 srng(5150);
+        // F-order uint16 data; zero marks inner chunks (of size `inner`) to leave empty
+        auto makeData = [&](const V& shape, const V& inner, std::function<bool(const V&)> zero){
+            std::vector<uint16_t> d(shape[0]*shape[1]*shape[2]);
+            for (uint64_t z = 0; z < shape[2]; z++) for (uint64_t y = 0; y < shape[1]; y++) for (uint64_t x = 0; x < shape[0]; x++)
+                d[x + y*shape[0] + z*shape[0]*shape[1]] = zero({x/inner[0], y/inner[1], z/inner[2]}) ? 0 : (uint16_t)(1 + srng() % 60000);
+            return d;
+        };
+        auto create = [&](const std::string& path, const V& shape, const V& chunks, const V& inner, const V& sub,
+                          const char* order, const std::string& fill, const char* sep = "."){
+            std::error_code ec; std::filesystem::remove_all(path, ec);
+            zarr Z;
+            Z.set_fileName(path); Z.set_cname("zstd"); Z.set_clevel(1); Z.set_order(order); Z.set_chunks(chunks);
+            Z.set_dtype("<u2"); Z.set_shape(shape); Z.set_fill_value(fill); Z.set_dimension_separator(sep);
+            if (!inner.empty()){ Z.set_shard(true); Z.set_chunk_shape(inner); }
+            if (!sub.empty()) Z.set_subfolders(sub);
+            Z.write_zarray();
+        };
+        auto write = [&](const std::string& path, std::vector<uint16_t>& d, const V& s, const V& e, bool crop, bool uuid){
+            zarr Z(path);
+            Z.set_chunkInfo(s, e);
+            const V ws = {e[0]-s[0], e[1]-s[1], e[2]-s[2]};
+            if (parallelWriteZarr(Z, d.data(), s, e, ws, 16, uuid, crop, true)) throw std::string("write: ") + Z.get_errString();
+        };
+        // read the whole array; empty if the read fails (the error goes in errOut)
+        auto read = [&](const std::string& path, std::string* errOut = nullptr){
+            zarr Z(path);
+            const V shape = {Z.get_shape(0), Z.get_shape(1), Z.get_shape(2)};
+            std::vector<uint16_t> d(shape[0]*shape[1]*shape[2], 0);
+            Z.set_chunkInfo({0, 0, 0}, shape);
+            if (parallelReadZarr(Z, d.data(), {0, 0, 0}, shape, shape, 16, true, false)){
+                if (errOut) *errOut = Z.get_errString();
+                d.clear();
+            }
+            return d;
+        };
+        // read the region [s, e); empty if the read fails
+        auto readRegion = [&](const std::string& path, const V& s, const V& e){
+            zarr Z(path);
+            const V ws = {e[0]-s[0], e[1]-s[1], e[2]-s[2]};
+            std::vector<uint16_t> d(ws[0]*ws[1]*ws[2], 0);
+            Z.set_chunkInfo(s, e);
+            if (parallelReadZarr(Z, d.data(), s, e, ws, 16, true, false)) d.clear();
+            return d;
+        };
+        auto cut = [](const std::vector<uint16_t>& full, const V& shape, const V& s, const V& e){
+            const V ws = {e[0]-s[0], e[1]-s[1], e[2]-s[2]};
+            std::vector<uint16_t> out(ws[0]*ws[1]*ws[2]);
+            for (uint64_t z = 0; z < ws[2]; z++) for (uint64_t y = 0; y < ws[1]; y++) for (uint64_t x = 0; x < ws[0]; x++)
+                out[x + y*ws[0] + z*ws[0]*ws[1]] = full[(s[0]+x) + (s[1]+y)*shape[0] + (s[2]+z)*shape[0]*shape[1]];
+            return out;
+        };
+        auto paste = [](std::vector<uint16_t>& full, const V& shape, const std::vector<uint16_t>& patch, const V& s, const V& e){
+            const V ws = {e[0]-s[0], e[1]-s[1], e[2]-s[2]};
+            for (uint64_t z = 0; z < ws[2]; z++) for (uint64_t y = 0; y < ws[1]; y++) for (uint64_t x = 0; x < ws[0]; x++)
+                full[(s[0]+x) + (s[1]+y)*shape[0] + (s[2]+z)*shape[0]*shape[1]] = patch[x + y*ws[0] + z*ws[0]*ws[1]];
+        };
+        // shard files of an array (every file but the metadata)
+        auto shardFiles = [](const std::string& path){
+            std::vector<std::string> out;
+            for (const auto& p : std::filesystem::recursive_directory_iterator(path))
+                if (p.is_regular_file() && p.path().filename() != ".zarray") out.push_back(p.path().string());
+            return out;
+        };
+        auto readFile = [](const std::string& p){
+            std::ifstream f(p, std::ios::binary);
+            return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        auto writeFile = [](const std::string& p, const std::vector<uint8_t>& b){
+            std::ofstream(p, std::ios::binary | std::ios::trunc).write((const char*)b.data(), b.size());
+        };
+        // set a key of the sharding codec's configuration in the metadata
+        auto setShardConfig = [](const std::string& path, const std::string& key, const json& value){
+            json meta;
+            { std::ifstream f(path + "/.zarray"); f >> meta; }
+            meta["codecs"][0]["configuration"][key] = value;
+            std::ofstream(path + "/.zarray") << meta.dump();
+        };
+        auto check = [&](const char* name, std::function<bool()> test){
+            total++;
+            bool ok = false;
+            try { ok = test(); }
+            catch (const std::string& e) { std::fprintf(stderr, "    exception: %s\n", e.c_str()); }
+            catch (...) {}
+            std::printf("%s  %s\n", ok ? "PASS" : "FAIL", name);
+            if (!ok) failures++;
+        };
+        const V shape = {70, 45, 33}, zero3 = {0, 0, 0};
+        auto none = [](const V&){ return false; };
+
+        for (const char* order : {"F", "C"}){
+            const std::string base = dir + "/rt_shard_" + order;
+            const std::string tag = std::string(" (") + order + " order)";
+
+            check(("shard crop writes: unaligned, across shards, at the edge, with and without temporary files" + tag).c_str(), [&](){
+                bool ok = true;
+                for (bool uuid : {true, false}){
+                    const std::string p = base + "_crop.zarr";
+                    create(p, shape, {32, 32, 20}, {16, 16, 10}, {}, order, "0");
+                    std::vector<uint16_t> exp = makeData(shape, {16, 16, 10}, none);
+                    write(p, exp, zero3, shape, false, uuid);
+                    ok = ok && read(p) == exp;
+                    // (the first region covers several inner chunks of a shard partly)
+                    for (const auto& region : std::vector<std::pair<V, V>>{{{5, 7, 3}, {61, 40, 29}}, {{64, 32, 30}, {70, 45, 33}}, {{0, 0, 0}, {16, 16, 10}}}){
+                        const V s = region.first, e = region.second;
+                        std::vector<uint16_t> patch = makeData({e[0]-s[0], e[1]-s[1], e[2]-s[2]}, {1, 1, 1}, none);
+                        write(p, patch, s, e, true, uuid);
+                        paste(exp, shape, patch, s, e);
+                        ok = ok && read(p) == exp;
+                    }
+                    // and no temporary files are left behind: only the metadata and the 3x2x2 shards
+                    std::set<std::string> names, want = {".zarray"};
+                    for (const auto& f : std::filesystem::directory_iterator(p)) names.insert(f.path().filename().string());
+                    for (int i = 0; i < 3; i++) for (int j = 0; j < 2; j++) for (int k = 0; k < 2; k++)
+                        want.insert(std::to_string(i) + "." + std::to_string(j) + "." + std::to_string(k));
+                    ok = ok && names == want;
+                }
+                return ok;
+            });
+
+            check(("shard empty inner chunks: first of each shard, a whole shard" + tag).c_str(), [&](){
+                const std::string p = base + "_sparse.zarr";
+                create(p, shape, {32, 32, 20}, {16, 16, 10}, {}, order, "0");
+                // inner chunk grid is 5x3x4: zero the first inner chunk of every shard,
+                // every other chunk of the second shard row, and the whole shard (0, 1, 0)
+                std::vector<uint16_t> exp = makeData(shape, {16, 16, 10}, [](const V& c){
+                    return (c[0] % 2 == 0 && c[1] % 2 == 0 && c[2] % 2 == 0) || (c[1] == 1 && (c[0] + c[2]) % 2 == 1) ||
+                           (c[0] < 2 && c[1] >= 2 && c[2] < 2);
+                });
+                write(p, exp, zero3, shape, false, true);
+                return read(p) == exp;
+            });
+
+            check(("shard rewrite without temporary files, first inner chunks emptied" + tag).c_str(), [&](){
+                const std::string p = base + "_rewrite.zarr";
+                create(p, shape, {32, 32, 20}, {16, 16, 10}, {}, order, "0");
+                std::vector<uint16_t> a = makeData(shape, {16, 16, 10}, none);
+                write(p, a, zero3, shape, false, false);
+                std::vector<uint16_t> b = makeData(shape, {16, 16, 10}, [](const V& c){ return c[0] % 2 == 0 && c[1] % 2 == 0 && c[2] % 2 == 0; });
+                write(p, b, zero3, shape, false, false);
+                return read(p) == b;
+            });
+
+            check(("shards in subfolders" + tag).c_str(), [&](){
+                const std::string p = base + "_subf.zarr";
+                create(p, shape, {16, 16, 16}, {8, 8, 8}, {2, 2, 1}, order, "0");
+                std::vector<uint16_t> exp = makeData(shape, {8, 8, 8}, none);
+                write(p, exp, zero3, shape, false, true);
+                std::vector<uint16_t> patch = makeData({30, 20, 10}, {1, 1, 1}, none);
+                write(p, patch, {20, 10, 5}, {50, 30, 15}, true, true);
+                paste(exp, shape, patch, {20, 10, 5}, {50, 30, 15});
+                return read(p) == exp;
+            });
+
+            check(("shard shapes that are not a multiple of the inner chunk shape" + tag).c_str(), [&](){
+                // a 24x20x15 shard of 16x16x10 inner chunks holds 2x2x2 whole inner chunks,
+                // so it spans 32x32x20; these regions start in a different shard than
+                // their coordinates divided by the shard shape would say
+                const std::string p = base + "_nondiv.zarr";
+                create(p, shape, {24, 20, 15}, {16, 16, 10}, {}, order, "0");
+                std::vector<uint16_t> exp = makeData(shape, {16, 16, 10}, none);
+                write(p, exp, zero3, shape, false, true);
+                bool ok = read(p) == exp;
+                for (const auto& region : std::vector<std::pair<V, V>>{{{50, 21, 16}, {60, 30, 19}}, {{40, 30, 25}, {70, 45, 33}}}){
+                    const V s = region.first, e = region.second;
+                    ok = ok && readRegion(p, s, e) == cut(exp, shape, s, e);
+                    std::vector<uint16_t> patch = makeData({e[0]-s[0], e[1]-s[1], e[2]-s[2]}, {1, 1, 1}, none);
+                    write(p, patch, s, e, true, true);
+                    paste(exp, shape, patch, s, e);
+                    ok = ok && read(p) == exp && readRegion(p, s, e) == patch;
+                }
+                return ok;
+            });
+
+            check(("writes into arrays whose folders are missing ('/' separator, subfolders)" + tag).c_str(), [&](){
+                struct Layout { V chunks, inner, sub; const char* sep; };
+                bool ok = true;
+                for (const Layout& l : {Layout{{16, 16, 10}, {}, {}, "/"}, Layout{{32, 32, 20}, {16, 16, 10}, {}, "/"},
+                                        Layout{{16, 16, 10}, {}, {2, 2, 1}, "."}, Layout{{32, 32, 20}, {16, 16, 10}, {2, 1, 2}, "/"}}){
+                    const std::string p = base + "_nofolders.zarr";
+                    // remove the folders write_zarray made, as if another program had made the array
+                    auto removeFolders = [&](){
+                        std::vector<std::filesystem::path> folders;
+                        for (const auto& e : std::filesystem::directory_iterator(p)) if (e.is_directory()) folders.push_back(e.path());
+                        for (const auto& f : folders) std::filesystem::remove_all(f);
+                    };
+                    create(p, shape, l.chunks, l.inner, l.sub, order, "0", l.sep);
+                    removeFolders();
+                    std::vector<uint16_t> exp = makeData(shape, {16, 16, 10}, none);
+                    write(p, exp, zero3, shape, false, true);
+                    ok = ok && read(p) == exp;
+                    // and a crop write into an empty one
+                    create(p, shape, l.chunks, l.inner, l.sub, order, "0", l.sep);
+                    removeFolders();
+                    std::vector<uint16_t> patch = makeData({30, 20, 10}, {1, 1, 1}, none);
+                    write(p, patch, {20, 10, 5}, {50, 30, 15}, true, true);
+                    exp.assign(exp.size(), 0);
+                    paste(exp, shape, patch, {20, 10, 5}, {50, 30, 15});
+                    ok = ok && read(p) == exp;
+                }
+                return ok;
+            });
+
+            check(("shard index at the start, and without a checksum" + tag).c_str(), [&](){
+                const std::string p = base + "_sparse.zarr";   // written above, some inner chunks empty
+                const std::vector<uint16_t> exp = read(p);
+                const uint64_t n = 2*2*2, ib = n*16;            // 2x2x2 inner chunks per shard
+                // move each index to the front of its shard (offsets shift by the index size)
+                for (const std::string& f : shardFiles(p)){
+                    const std::vector<uint8_t> b = readFile(f);
+                    std::vector<uint64_t> idx(2*n);
+                    std::memcpy(idx.data(), &b[b.size()-ib-4], ib);
+                    for (uint64_t i = 0; i < n; i++) if (idx[2*i] != UINT64_MAX) idx[2*i] += ib + 4;
+                    const uint32_t crc = crc32c((const uint8_t*)idx.data(), ib);
+                    std::vector<uint8_t> out(ib + 4);
+                    std::memcpy(out.data(), idx.data(), ib);
+                    std::memcpy(&out[ib], &crc, 4);
+                    out.insert(out.end(), b.begin(), b.end()-ib-4);
+                    writeFile(f, out);
+                }
+                setShardConfig(p, "index_location", "start");
+                bool ok = !exp.empty() && read(p) == exp;
+                // and with no checksum after the index
+                for (const std::string& f : shardFiles(p)){
+                    std::vector<uint8_t> b = readFile(f);
+                    std::vector<uint64_t> idx(2*n);
+                    std::memcpy(idx.data(), b.data(), ib);
+                    for (uint64_t i = 0; i < n; i++) if (idx[2*i] != UINT64_MAX) idx[2*i] -= 4;
+                    std::memcpy(b.data(), idx.data(), ib);
+                    b.erase(b.begin()+ib, b.begin()+ib+4);
+                    writeFile(f, b);
+                }
+                setShardConfig(p, "index_codecs", json::array({{{"name", "bytes"}, {"configuration", {{"endian", "little"}}}}}));
+                return ok && read(p) == exp;
+            });
+
+            check(("writes keep the array's index settings: at the start, without a checksum" + tag).c_str(), [&](){
+                bool ok = true;
+                for (int config = 0; config < 3; config++){
+                    const bool atStart = config < 2, checksum = config != 1;
+                    const std::string p = base + "_index.zarr";
+                    create(p, shape, {32, 32, 20}, {16, 16, 10}, {}, order, "0");
+                    if (atStart) setShardConfig(p, "index_location", "start");
+                    json codecs = json::array({{{"name", "bytes"}, {"configuration", {{"endian", "little"}}}}});
+                    if (checksum) codecs.push_back({{"name", "crc32c"}});
+                    setShardConfig(p, "index_codecs", codecs);
+                    // some empty inner chunks, then a crop write without temporary files
+                    std::vector<uint16_t> exp = makeData(shape, {16, 16, 10}, [](const V& c){ return (c[0] + c[1] + c[2]) % 3 == 0; });
+                    write(p, exp, zero3, shape, false, true);
+                    ok = ok && read(p) == exp;
+                    std::vector<uint16_t> patch = makeData({30, 20, 10}, {1, 1, 1}, none);
+                    write(p, patch, {20, 10, 5}, {50, 30, 15}, true, false);
+                    paste(exp, shape, patch, {20, 10, 5}, {50, 30, 15});
+                    ok = ok && read(p) == exp;
+                    // each shard has its index where the metadata says, with or without a
+                    // checksum, and its inner chunks fill the rest of the file
+                    const uint64_t n = 2*2*2, ib = n*16, total = ib + (checksum ? 4 : 0);
+                    for (const std::string& f : shardFiles(p)){
+                        const std::vector<uint8_t> b = readFile(f);
+                        if (b.size() < total){ ok = false; continue; }
+                        const uint64_t at = atStart ? 0 : b.size() - total;
+                        std::vector<uint64_t> idx(2*n);
+                        std::memcpy(idx.data(), &b[at], ib);
+                        if (checksum){
+                            uint32_t crc;
+                            std::memcpy(&crc, &b[at + ib], 4);
+                            ok = ok && crc == crc32c((const uint8_t*)idx.data(), ib);
+                        }
+                        uint64_t data = 0;
+                        for (uint64_t i = 0; i < n; i++){
+                            if (idx[2*i] == UINT64_MAX && idx[2*i+1] == UINT64_MAX) continue;
+                            ok = ok && idx[2*i] >= (atStart ? total : 0) && idx[2*i] + idx[2*i+1] <= (atStart ? b.size() : b.size() - total);
+                            data += idx[2*i+1];
+                        }
+                        ok = ok && data + total == b.size();
+                    }
+                }
+                return ok;
+            });
+
+            check(("damaged shards are reported, not read" + tag).c_str(), [&](){
+                const std::string p = base + "_damaged.zarr";
+                create(p, shape, {32, 32, 20}, {16, 16, 10}, {}, order, "0");
+                std::vector<uint16_t> d = makeData(shape, {16, 16, 10}, none);
+                write(p, d, zero3, shape, false, true);
+                const std::string f = p + "/1.0.0";
+                const std::vector<uint8_t> good = readFile(f);
+                const uint64_t ib = 8*16;
+                std::string e1, e2, e3;
+                std::vector<uint8_t> b = good;
+                b[b.size()-ib-4+3] ^= 0x40;                     // a flipped bit in the index
+                writeFile(f, b);
+                bool ok = read(p, &e1).empty() && e1.find("checksum") != std::string::npos;
+                b = good;                                        // an entry past the end, with a valid checksum
+                std::vector<uint64_t> idx(16);
+                std::memcpy(idx.data(), &b[b.size()-ib-4], ib);
+                idx[1] = 1ULL << 40;
+                const uint32_t crc = crc32c((const uint8_t*)idx.data(), ib);
+                std::memcpy(&b[b.size()-ib-4], idx.data(), ib);
+                std::memcpy(&b[b.size()-4], &crc, 4);
+                writeFile(f, b);
+                ok = ok && read(p, &e2).empty() && e2.find("outside the file") != std::string::npos;
+                writeFile(f, std::vector<uint8_t>(good.begin(), good.begin()+10));   // truncated
+                ok = ok && read(p, &e3).empty() && e3.find("smaller than its index") != std::string::npos;
+                writeFile(f, good);
+                return ok && read(p) == d;
+            });
+
+            check(("chunks rewritten as all zeros read back as zeros, sharded or not" + tag).c_str(), [&](){
+                bool ok = true;
+                for (bool sharded : {false, true}){
+                    const std::string p = base + (sharded ? "_zeros_shard.zarr" : "_zeros.zarr");
+                    create(p, shape, sharded ? V{32, 32, 20} : V{16, 16, 10}, sharded ? V{16, 16, 10} : V{}, {}, order, "0");
+                    std::vector<uint16_t> a = makeData(shape, {16, 16, 10}, none), z(a.size(), 0);
+                    write(p, a, zero3, shape, false, true);
+                    write(p, z, zero3, shape, false, true);
+                    ok = ok && read(p) == z;
+                    // and a crop that zeroes a region spanning whole chunks
+                    write(p, a, zero3, shape, false, true);
+                    std::vector<uint16_t> zp(48*32*20, 0);
+                    write(p, zp, {0, 0, 0}, {48, 32, 20}, true, true);
+                    paste(a, shape, zp, {0, 0, 0}, {48, 32, 20});
+                    ok = ok && read(p) == a;
+                }
+                return ok;
+            });
+
+            check(("all-zero data in an array with fill_value 7 reads back as zeros" + tag).c_str(), [&](){
+                const std::string p = base + "_fill7.zarr";
+                create(p, shape, {16, 16, 10}, {}, {}, order, "7");
+                std::vector<uint16_t> z(shape[0]*shape[1]*shape[2], 0);
+                write(p, z, zero3, shape, false, true);
+                return read(p) == z;
+            });
+        }
+        std::error_code ec;
+        for (const auto& p : std::filesystem::directory_iterator(dir))
+            if (p.path().filename().string().rfind("rt_shard_", 0) == 0) std::filesystem::remove_all(p.path(), ec);
     }
 
     // Sharding does not apply to a 0-dimensional array: the write must fail cleanly

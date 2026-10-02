@@ -366,7 +366,10 @@ void zarr::set_shardData(){
     numChunksPerShard = 1;
     for(uint64_t i = 0; i < n; i++){
         chunksPerShard[i] = fastCeilDiv(chunks[i],chunk_shape[i]);
-        shards[i] = ceil((double)shape[i]/(double)chunks[i]);
+        // A shard holds whole inner chunks, so it spans its shape rounded up to a
+        // multiple of the inner chunk shape
+        const uint64_t extent = chunksPerShard[i]*chunk_shape[i];
+        shards[i] = shape[i]/extent + (shape[i]%extent ? 1 : 0);
         numShards *= shards[i];
         numChunksPerShard *= chunksPerShard[i];
     }
@@ -476,14 +479,37 @@ const std::string zarr::chunkNameToShardName(const std::string &chunkName) const
     return name;
 }
 
+// Indices of the shard that holds the inner chunk with indices cAV
 const std::vector<uint64_t> zarr::chunkToShard(const std::vector<uint64_t> &cAV) const{
     std::vector<uint64_t> s(cAV.size());
-    for(uint64_t d = 0; d < cAV.size(); d++){
-        uint64_t v = ceil((double)cAV[d]/ceil((double)chunks[d]/(double)chunk_shape[d]));
-        if(v) v--;
-        s[d] = v;
-    }
+    for(uint64_t d = 0; d < cAV.size() && d < chunksPerShard.size(); d++) s[d] = cAV[d]/chunksPerShard[d];
     return s;
+}
+
+// The sharding codec's configuration (Zarr v3 sharding_indexed), if any
+static const json* shardingConfig(const json &zarray){
+    const auto codecs = zarray.find("codecs");
+    if(codecs == zarray.end() || !codecs->is_array() || codecs->empty()) return nullptr;
+    const json &c = codecs->at(0);
+    if(!c.is_object() || c.value("name", "") != "sharding_indexed") return nullptr;
+    const auto config = c.find("configuration");
+    return config != c.end() && config->is_object() ? &*config : nullptr;
+}
+
+bool zarr::get_shardIndexAtStart() const{
+    const json* config = shardingConfig(zarray);
+    return config && config->value("index_location", "end") == "start";
+}
+
+bool zarr::get_shardIndexChecksum() const{
+    const json* config = shardingConfig(zarray);
+    if(!config) return true;
+    const auto indexCodecs = config->find("index_codecs");
+    if(indexCodecs == config->end() || !indexCodecs->is_array()) return true;
+    for(const json &c : *indexCodecs){
+        if(c.is_object() && c.value("name", "") == "crc32c") return true;
+    }
+    return false;
 }
 
 const uint64_t zarr::get_ShardPosition(const std::vector<uint64_t> &cAV) const{
@@ -527,12 +553,15 @@ void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
         return;
     }
 
-    // Chunks (or shards when sharded) that the region touches along each axis
+    // Chunks (or shards when sharded) that the region touches along each axis. A
+    // shard spans its shape rounded up to a multiple of the inner chunk shape
+    if(shard) set_shardData();
     std::vector<uint64_t> first(n), count(n);
     uint64_t numOuter = 1;
     for(uint64_t d = 0; d < n; d++){
-        first[d] = startCoords[d]/chunks[d];
-        const uint64_t last = endCoords[d]/chunks[d] + (endCoords[d]%chunks[d] ? 1 : 0);
+        const uint64_t extent = shard ? chunksPerShard[d]*chunk_shape[d] : chunks[d];
+        first[d] = startCoords[d]/extent;
+        const uint64_t last = endCoords[d]/extent + (endCoords[d]%extent ? 1 : 0);
         count[d] = last > first[d] ? last-first[d] : 0;
         numOuter *= count[d];
     }
@@ -548,7 +577,6 @@ void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
     }
     // Sharding: every inner chunk of every shard, shard by shard (both last axis fastest)
     else{
-        set_shardData();
         numChunks = numOuter*numChunksPerShard;
         chunkNames = std::vector<std::string>(numChunks);
         #pragma omp parallel for

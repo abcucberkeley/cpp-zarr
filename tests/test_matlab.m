@@ -161,6 +161,37 @@ function test_matlab(mexDir)
     assert(isequal(parallelReadZarr(f1, 'bbox', [11 50]), v(11:50)), '1D bbox read mismatch');
     fprintf('PASS  1D\n');
 
+    % Sharding (chunk_shape): round trip, crop writes across shards (with and without
+    % temporary files), and a rewrite with all zeros, in both orders; shards in
+    % subfolders; and a non-sharded rewrite with all zeros (old chunks must not
+    % survive it)
+    a = cast(randi([1 200], [70 45 33]), 'uint16');
+    for order = {'F', 'C'}
+        fs = fullfile(tmp, ['shard_' order{1} '.zarr']);
+        createZarrFile(fs, 'shape', size(a), 'dtype', '<u2', 'chunks', [32 32 20], 'chunk_shape', [16 16 10], 'order', order{1});
+        parallelWriteZarr(fs, a, 'bbox', [1 1 1 size(a)]);
+        assert(isequal(parallelReadZarr(fs), a), 'sharded %s round-trip mismatch', order{1});
+        p = a(6:61, 8:40, 4:29) + 1;
+        parallelWriteZarr(fs, p, 'bbox', [6 8 4 61 40 29]);
+        e = a;  e(6:61, 8:40, 4:29) = p;
+        assert(isequal(parallelReadZarr(fs), e), 'sharded %s crop write mismatch', order{1});
+        p = a(3:50, 20:44, 2:15) + 2;
+        parallelWriteZarr(fs, p, 'bbox', [3 20 2 50 44 15], 'uuid', 0);
+        e(3:50, 20:44, 2:15) = p;
+        assert(isequal(parallelReadZarr(fs), e), 'sharded %s crop write without uuid mismatch', order{1});
+        parallelWriteZarr(fs, zeros(size(a), 'uint16'), 'bbox', [1 1 1 size(a)]);
+        assert(~any(parallelReadZarr(fs), 'all'), 'sharded %s zero rewrite mismatch', order{1});
+    end
+    fsub = fullfile(tmp, 'shard_subfolders.zarr');
+    createZarrFile(fsub, 'shape', size(a), 'dtype', '<u2', 'chunks', [16 16 16], 'chunk_shape', [8 8 8], 'subfolders', [2 2 1]);
+    parallelWriteZarr(fsub, a, 'bbox', [1 1 1 size(a)]);
+    assert(isequal(parallelReadZarr(fsub), a), 'sharded subfolders round-trip mismatch');
+    fz = fullfile(tmp, 'zero_rewrite.zarr');
+    parallelWriteZarr(fz, a, 'chunks', [16 16 16]);
+    parallelWriteZarr(fz, zeros(size(a), 'uint16'), 'chunks', [16 16 16]);
+    assert(~any(parallelReadZarr(fz), 'all'), 'zero rewrite mismatch');
+    fprintf('PASS  sharding and zero rewrites\n');
+
     % createZarrFile writes only .zarray metadata; reading it back (no chunks on
     % disk) must return an array of the fill value (0) with the right shape/type.
     fc = fullfile(tmp, 'meta_only.zarr');

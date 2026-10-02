@@ -15,19 +15,17 @@
 #include "zarr.h"
 #include "zlib.h"
 
-uint32_t crc32c(const uint8_t* data, size_t length) {
-    uint32_t crc = 0xFFFFFFFF;
-    // CRC32C
-    const uint32_t polynomial = 0x82F63B78;
-
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= data[i];
-        for (size_t j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ (-(crc & 1) & polynomial);
-        }
-    }
-
-    return ~crc;
+// Open a chunk or shard file for writing, making its folder first if it is missing
+// (an array whose metadata another program wrote may not have its folders yet)
+static bool openForWrite(std::ofstream &file, const std::string &path, const std::ios::openmode mode){
+    file.open(path, std::ios::binary | mode);
+    if(file.is_open()) return true;
+    const size_t slash = path.find_last_of("/\\");
+    if(slash == std::string::npos) return false;
+    mkdirRecursive(path.substr(0, slash).c_str());
+    file.clear();
+    file.open(path, std::ios::binary | mode);
+    return file.is_open();
 }
 
 uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
@@ -66,16 +64,26 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     }
 
     int32_t batchSize = (Zarr.get_numChunks()-1)/numWorkers+1;
+    // A sharded array is written with its inner chunk shape. The shard shape is
+    // kept to read existing data when cropping, and restored on return.
+    std::vector<uint64_t> shardChunks;
     if(Zarr.get_shard()){
         // batchSize has to align to a shard
         if(batchSize <= Zarr.get_numChunksPerShard()) batchSize = Zarr.get_numChunksPerShard();
         else batchSize += (Zarr.get_numChunksPerShard()-(batchSize%Zarr.get_numChunksPerShard()));
 
-        // The chunk size is actually the inner chunk size now
         std::vector<uint64_t> innerChunks(Zarr.get_ndims());
-        for(uint64_t d = 0; d < innerChunks.size(); d++) innerChunks[d] = Zarr.get_chunk_shape(d);
+        for(uint64_t d = 0; d < innerChunks.size(); d++){
+            shardChunks.push_back(Zarr.get_chunks(d));
+            innerChunks[d] = Zarr.get_chunk_shape(d);
+        }
         Zarr.set_chunks(innerChunks);
     }
+    struct RestoreChunks {
+        zarr &z;
+        const std::vector<uint64_t> chunks;
+        ~RestoreChunks(){ if(!chunks.empty()) z.set_chunks(chunks); }
+    } restoreChunks{Zarr, shardChunks};
 
     const uint64_t nDims = Zarr.get_ndims();
     std::vector<uint64_t> chunkDims(nDims);
@@ -148,9 +156,19 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     }
 
     const std::string uuid(generateUUID());
+    // A shard goes to a temporary file that is then moved into place when asked
+    // (useUuid), and always when cropping: the shard's current contents are read
+    // while its new ones are written
+    const bool shardTmpFile = useUuid || crop;
+    // Where a shard's index goes (the start or, by default, the end of its file)
+    // and whether a CRC32C of it follows, as the array's metadata says
+    const bool indexAtStart = Zarr.get_shardIndexAtStart();
+    const bool indexChecksum = Zarr.get_shardIndexChecksum();
 
+    // Sparse writes leave all-zero chunks unwritten, when that is how a missing
+    // chunk reads back (a fill value of zero)
     void* zeroChunkUnc = NULL;
-    if(sparse){
+    if(sparse && fillValueIsZero(Zarr.get_fill_value())){
         zeroChunkUnc = calloc(s,bytes);
     }
 
@@ -165,84 +183,92 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         const uint64_t chunkCCap = (uint64_t)compressBound(sB) + 64;
         void* chunkC = malloc(chunkCCap);
         void* cRegion = nullptr;
-        int64_t currChunk = -1;
-        uint64_t shardFooterSize;
-        uint64_t* shardFooter = nullptr;
-        std::vector<uint64_t> cAV;
-        if(Zarr.get_shard()){
-            shardFooterSize = Zarr.get_numChunksPerShard()*2;
-            shardFooter = (uint64_t*)malloc(shardFooterSize*sizeof(uint64_t));
+        if(!chunkUnC || !chunkC){
+            #pragma omp critical
+            {
+                err = 1;
+                errString = "Not enough memory for a chunk of "+std::to_string(sB)+" bytes\n";
+            }
+            free(chunkUnC);
+            free(chunkC);
+            continue;
         }
-        uint64_t lastF = 0;
-        bool unWritten = true;
+        // Sharding: the index of the shard being written, an (offset, nbytes) pair
+        // per inner chunk (empty unless the chunk is written), where its next inner
+        // chunk goes, and whether this write has started its file (a shard is always
+        // written whole, never appended to an earlier file)
+        const uint64_t emptyEntry = std::numeric_limits<uint64_t>::max();
+        std::vector<uint64_t> shardIndex(Zarr.get_shard() ? 2*Zarr.get_numChunksPerShard() : 0, emptyEntry);
+        const uint64_t indexBytes = shardIndex.size()*sizeof(uint64_t)+(indexChecksum ? sizeof(uint32_t) : 0);
+        int64_t currChunk = -1;
+        uint64_t shardBytes = 0;
+        bool shardStarted = false;
+        std::string shardPath;
+        // Write the shard's index (and its CRC32C) after its inner chunks, or in the
+        // room left for it at the start, then move the file into place
+        auto finishShard = [&]() -> bool {
+            const uint32_t crc = crc32c(reinterpret_cast<const uint8_t*>(shardIndex.data()), shardIndex.size()*sizeof(uint64_t));
+            const std::string tmpPath = shardTmpFile ? shardPath+uuid : shardPath;
+            std::ofstream file;
+            const std::ios::openmode mode = !shardStarted ? std::ios::trunc :
+                                            indexAtStart ? std::ios::in | std::ios::out : std::ios::app;
+            if(!openForWrite(file, tmpPath, mode)){
+                #pragma omp critical
+                {
+                    err = 1;
+                    errString = "Check permissions or filepath. Cannot write to path: "+tmpPath+"\n";
+                }
+                return false;
+            }
+            file.write(reinterpret_cast<const char*>(shardIndex.data()), shardIndex.size()*sizeof(uint64_t));
+            if(indexChecksum) file.write(reinterpret_cast<const char*>(&crc), sizeof(crc));
+            file.close();
+            if(!file){
+                if(shardTmpFile) remove(tmpPath.c_str());
+                #pragma omp critical
+                {
+                    err = 1;
+                    errString = "Could not write all of "+tmpPath+" (is the disk full?)\n";
+                }
+                return false;
+            }
+            if(shardTmpFile && !renameReplace(tmpPath, shardPath)){
+                remove(tmpPath.c_str());
+                #pragma omp critical
+                {
+                    err = 1;
+                    errString = "Cannot move the temporary file into place: "+shardPath+"\n";
+                }
+                return false;
+            }
+            return true;
+        };
+        std::vector<uint64_t> cAV;
         std::vector<uint64_t> boxLo(nDims), boxHi(nDims), boxExt(nDims), inArray(nDims);
         const std::vector<uint64_t> zeros(nDims, 0);
         for(int64_t f = w*batchSize; f < (w+1)*batchSize; f++){
             if(f>=Zarr.get_numChunks()  || err) break;
-            lastF = f;
 
             if(Zarr.get_shard()){
-                unWritten = true;
                 currChunk++;
-                std::vector<uint64_t> pAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
-                bool pad = false;
-                for(uint64_t d = 0; d < nDims; d++) pad = pad || pAV[d] > endCoords[d]/Zarr.get_chunk_shape(d);
-                
-                if(currChunk == Zarr.get_numChunksPerShard() || pad){
-                    if(pad){
-                        shardFooter[currChunk*2] = std::numeric_limits<uint64_t>::max();
-                        shardFooter[(currChunk*2)+1] = std::numeric_limits<uint64_t>::max();
-
-                        // Edge case for when we can't write because padded chunks are in the middle
-                        if(currChunk != Zarr.get_numChunksPerShard()){
-                            continue;
-                        }
-                    }
-                    unWritten = false;
-                    
-                    // calculate CRC32C
-                    uint32_t shardFooterCRC32C = crc32c(reinterpret_cast<uint8_t*>(shardFooter), shardFooterSize*sizeof(uint64_t));
-                    // Not sure how sharding interacts with the subfolders at the moment (cAV needs to be converted)
-                    const std::string subfolderName = Zarr.get_subfoldersString(cAV);
-                    std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f-1)));
-                    std::string fileNameFinal;
-                    if(useUuid){
-                        fileNameFinal = std::string(fileName);
-                        fileName.append(uuid);
-                    }
-                    std::ofstream file(fileName, std::ios::binary | std::ios::app);
-
-                    if(!file.is_open()){
-                            #pragma omp critical
-                            {
-                                err = 1;
-                                errString = "Check permissions or filepath. Cannot write to path: "+
-                                    fileName+"\n";
-                            }
-                            break;
-                    }
-                    file.write(reinterpret_cast<char*>(shardFooter),shardFooterSize*sizeof(uint64_t));
-                    file.write(reinterpret_cast<char*>(&shardFooterCRC32C),sizeof(uint32_t));
-                    file.close();
-                    if(useUuid && !renameReplace(fileName, fileNameFinal)){
-                        remove(fileName.c_str());
-                        #pragma omp critical
-                        {
-                            err = 1;
-                            errString = "Cannot move the temporary file into place: "+
-                                fileNameFinal+"\n";
-                        }
-                        break;
-                    }
-                    /*
-                    if(pad){
-                        f += (Zarr.get_numChunksPerShard()-currChunk-1);
-                        currChunk = -1;
-                        continue;
-                    }
-                    */
+                // Moving on to the next shard: finish the previous one
+                if(currChunk == (int64_t)Zarr.get_numChunksPerShard()){
+                    if(!finishShard()) break;
                     currChunk = 0;
                 }
+                if(currChunk == 0){
+                    std::fill(shardIndex.begin(), shardIndex.end(), emptyEntry);
+                    shardBytes = indexAtStart ? indexBytes : 0;
+                    shardStarted = false;
+                    const std::vector<uint64_t> sAV = Zarr.chunkToShard(Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f)));
+                    shardPath = Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(sAV)+"/"+
+                                Zarr.chunkNameToShardName(Zarr.get_chunkNames(f));
+                }
+                // Inner chunks past the array's edge are not stored
+                const std::vector<uint64_t> pAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
+                bool pad = false;
+                for(uint64_t d = 0; d < nDims; d++) pad = pad || pAV[d]*chunkDims[d] >= Zarr.get_shape(d);
+                if(pad) continue;
             }
             
             cAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
@@ -261,7 +287,13 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     cStart[d] = cAV[d]*chunkDims[d];
                     cEnd[d] = (cAV[d]+1)*chunkDims[d];
                 }
-                cRegion = parallelReadZarrWriteWrapper(Zarr, crop, cStart, cEnd);
+                if(Zarr.get_shard()){
+                    // read through the array's own (shard) chunk shape
+                    zarr shardZarr(Zarr);
+                    shardZarr.set_chunks(shardChunks);
+                    cRegion = parallelReadZarrWriteWrapper(std::move(shardZarr), crop, cStart, cEnd);
+                }
+                else cRegion = parallelReadZarrWriteWrapper(Zarr, crop, cStart, cEnd);
                 if(!cRegion){
                     err = 1;
                     errString = "Error in Writer Read. Chunk: "+Zarr.get_chunkNames(f)+"\n";
@@ -300,22 +332,17 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             copyBoxND(bytes, (const uint8_t*)zarrArr+srcOff*bytes, (uint8_t*)chunkUnC+dstOff*bytes,
                       boxExt, inStrides, chunkStrides);
 
-            if(sparse){
-                const bool allZeros = memcmp(zeroChunkUnc,chunkUnC,sB);
-                if(!allZeros){
-                    if(Zarr.get_shard()){
-                        shardFooter[(currChunk*2)] = std::numeric_limits<uint64_t>::max();
-                        shardFooter[(currChunk*2)+1] = std::numeric_limits<uint64_t>::max();
-                    } 
-                    free(cRegion);
-                    cRegion = nullptr;
-                    continue;
-                }
-
+            // An all-zero chunk is left unwritten (it reads back as zeros) and any
+            // earlier copy of it removed; in a shard its index entry stays empty
+            const std::string subfolderName = Zarr.get_subfoldersString(cAV);
+            if(zeroChunkUnc && !memcmp(zeroChunkUnc,chunkUnC,sB)){
+                if(!Zarr.get_shard()) remove((Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f)).c_str());
+                free(cRegion);
+                cRegion = nullptr;
+                continue;
             }
 
             // Use the same blosc compress as Zarr
-            const std::string subfolderName = Zarr.get_subfoldersString(cAV);
             int64_t csize = 0;
             // Uncompressed arrays store the chunk as is
             const void* chunkOut = chunkC;
@@ -409,19 +436,27 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     fileNameFinal = std::string(fileName);
                     fileName.append(uuid);
                 }
-                    std::ofstream file(fileName, std::ios::binary | std::ios::trunc);
-    
-                    if(!file.is_open()){
-                        #pragma omp critical
-                        {
-                            err = 1;
-                            errString = "Check permissions or filepath. Cannot write to path: "+
-                                fileName+"\n";
-                        }
-                        break;
+                std::ofstream file;
+                if(!openForWrite(file, fileName, std::ios::trunc)){
+                    #pragma omp critical
+                    {
+                        err = 1;
+                        errString = "Check permissions or filepath. Cannot write to path: "+
+                            fileName+"\n";
                     }
-                    file.write(reinterpret_cast<const char*>(chunkOut),csize);
-                    file.close();
+                    break;
+                }
+                file.write(reinterpret_cast<const char*>(chunkOut),csize);
+                file.close();
+                if(!file){
+                    if(useUuid) remove(fileName.c_str());
+                    #pragma omp critical
+                    {
+                        err = 1;
+                        errString = "Could not write all of "+fileName+" (is the disk full?)\n";
+                    }
+                    break;
+                }
                 if(useUuid && !renameReplace(fileName, fileNameFinal)){
                     remove(fileName.c_str());
                     #pragma omp critical
@@ -433,100 +468,49 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     break;
                 }
             }
-            // Sharding
+            // Sharding: add the inner chunk to its shard's file and record where it is
             else{
-                std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
-                if(useUuid){    
-                    fileName.append(uuid);
-                }
+                const std::string tmpPath = shardTmpFile ? shardPath+uuid : shardPath;
                 std::ofstream file;
-
-                if(currChunk > 0) {
-                    int64_t currInd = currChunk;
-                    while(currInd >= 0 && (shardFooter[((currInd-1)*2)] == std::numeric_limits<uint64_t>::max() &&
-                       shardFooter[((currInd-1)*2)+1] == std::numeric_limits<uint64_t>::max())){
-                       currInd--;
-                    }
-                    uint64_t shardOffset = 0; 
-                    if(currInd){
-                        shardOffset = shardFooter[((currInd-1)*2)]+
-                                      shardFooter[((currInd-1)*2)+1];
-                    }
-                    shardFooter[(currChunk*2)] = shardOffset;
-                    shardFooter[(currChunk*2)+1] = csize;
-                    file = std::ofstream(fileName, std::ios::binary | std::ios::app);
-
-                }
-                else{
-                    shardFooter[0] = 0;
-                    shardFooter[1] = csize;
-                    file = std::ofstream(fileName, std::ios::binary | std::ios::trunc);
-                }
-                if(!file.is_open()){
+                if(!openForWrite(file, tmpPath, shardStarted ? std::ios::app : std::ios::trunc)){
                     #pragma omp critical
                     {
                         err = 1;
                         errString = "Check permissions or filepath. Cannot write to path: "+
-                            fileName+"\n";
+                            tmpPath+"\n";
                     }
                     break;
                 }
+                // (room for an index at the start, written when the shard is finished)
+                if(!shardStarted && indexAtStart){
+                    const std::vector<char> room(indexBytes, 0);
+                    file.write(room.data(), room.size());
+                }
                 file.write(reinterpret_cast<const char*>(chunkOut),csize);
                 file.close();
-            
+                if(!file){
+                    #pragma omp critical
+                    {
+                        err = 1;
+                        errString = "Could not write all of "+tmpPath+" (is the disk full?)\n";
+                    }
+                    break;
+                }
+                shardIndex[currChunk*2] = shardBytes;
+                shardIndex[(currChunk*2)+1] = csize;
+                shardBytes += csize;
+                shardStarted = true;
             }
             free(cRegion);
             cRegion = nullptr;
         }
 
-        if(Zarr.get_shard() && unWritten && (((uint64_t)((w)*batchSize)))<(Zarr.get_numChunks())){
-            // calculate CRC32C
-            uint32_t shardFooterCRC32C = crc32c(reinterpret_cast<uint8_t*>(shardFooter), shardFooterSize*sizeof(uint64_t));
-            uint64_t f = lastF;
-            std::vector<uint64_t> pAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
-
-            bool pad = false;
-            for(uint64_t d = 0; d < nDims; d++) pad = pad || pAV[d] > endCoords[d]/Zarr.get_chunk_shape(d);
-
-            if(pad){
-                for(uint64_t i = currChunk; i < Zarr.get_numChunksPerShard(); i++){
-                    shardFooter[i*2] = std::numeric_limits<uint64_t>::max();
-                    shardFooter[(i*2)+1] = std::numeric_limits<uint64_t>::max();
-                }
-            }
-            const std::string subfolderName = Zarr.get_subfoldersString(cAV);
-            std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
-            std::string fileNameFinal;
-            if(useUuid){
-                fileNameFinal = std::string(fileName);
-                fileName.append(uuid);
-            }
-            
-            std::ofstream file(fileName, std::ios::binary | std::ios::app);
-
-            if(!file.is_open()){
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        errString = "Check permissions or filepath. Cannot write to path: "+
-                            fileName+"\n";
-                    }
-                    continue;
-            }
-            file.write(reinterpret_cast<char*>(shardFooter),shardFooterSize*sizeof(uint64_t));
-            file.write(reinterpret_cast<char*>(&shardFooterCRC32C),sizeof(uint32_t));
-            file.close();
-            if(useUuid && !renameReplace(fileName, fileNameFinal)){
-                remove(fileName.c_str());
-                #pragma omp critical
-                {
-                    err = 1;
-                    errString = "Cannot move the temporary file into place: "+
-                        fileNameFinal+"\n";
-                }
-            }
+        // Finish this worker's last shard, unless the write failed: a partly written
+        // shard is never moved into place (its temporary file is removed)
+        if(Zarr.get_shard() && currChunk >= 0){
+            if(!err) finishShard();
+            else if(shardTmpFile) remove((shardPath+uuid).c_str());
         }
-        free(shardFooter);
         free(chunkUnC);
         free(chunkC);
 

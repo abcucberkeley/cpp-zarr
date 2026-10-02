@@ -51,6 +51,11 @@ public:
     const std::string chunkNameToShardName(const std::string &chunkName) const;
 
     const std::vector<uint64_t> chunkToShard(const std::vector<uint64_t> &cAV) const;
+    // Shard index layout (Zarr v3 sharding_indexed index_location and
+    // index_codecs): at the start of each shard instead of the end (the
+    // default), and whether a CRC32C checksum follows it (the default)
+    bool get_shardIndexAtStart() const;
+    bool get_shardIndexChecksum() const;
     const uint64_t get_ShardPosition(const std::vector<uint64_t> &cAV) const;
 
     const uint64_t get_chunkShardPosition(const std::vector<uint64_t> &cAV) const;

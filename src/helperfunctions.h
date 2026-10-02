@@ -58,6 +58,14 @@ void copyBoxTransposed(const uint64_t bytes, const void* src, void* dst,
 // Set n elements of size `bytes` to the element whose bytes are at `elem`.
 void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void* elem);
 
+// CRC32C (Castagnoli) checksum, as Zarr v3 uses for shard indexes.
+uint32_t crc32c(const uint8_t* data, size_t length);
+
+// True when the fill_value string is a numeric zero ("0", "0.0", ...): chunks of
+// zeros can then be left unwritten, since every reader fills a missing chunk with
+// zeros. ("NaN", null and nonzero fill values are not.)
+bool fillValueIsZero(const std::string &fillValue);
+
 // Copy an N-dimensional box of elements between two strided layouts (strides in
 // elements, element size `bytes` = 1, 2, 4 or 8):
 //     dst[sum_d i_d*dstStrides[d]] = src[sum_d i_d*srcStrides[d]],  0 <= i_d < extents[d]

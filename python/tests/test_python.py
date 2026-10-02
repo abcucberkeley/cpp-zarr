@@ -144,6 +144,15 @@ def main():
     print(f"invalid order rejected  {'OK' if good else 'FAIL'}")
     ok = ok and good
 
+    # A chunk rewritten as all zeros reads back as zeros (its old file is removed)
+    zr = os.path.join(tmp, "zero_rewrite.zarr")
+    d = rng.integers(1, 1000, size=(40, 24, 18)).astype(np.uint16)
+    cppzarr.write_zarr(zr, d, chunks=[16, 16, 16])
+    cppzarr.write_zarr(zr, np.zeros_like(d), chunks=[16, 16, 16])
+    good = not cppzarr.read_zarr(zr).any()
+    print(f"zero rewrite     {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
     # 3-value coordinates and chunks keep working on a 2D array
     d2 = rng.integers(0, 60000, size=(70, 45)).astype(np.uint16)
     p2 = os.path.join(tmp, "nd2_3value_args.zarr")
