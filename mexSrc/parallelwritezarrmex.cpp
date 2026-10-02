@@ -89,6 +89,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // dimensions once it is known
     std::vector<uint64_t> bboxVals, chunksVals, subfoldersVals, chunkShapeVals;
     bool hasChunks = false, hasSubfolders = false, hasChunkShape = false;
+    // Applied after the Zarr format, which sets their Zarr v3 defaults
+    uint64_t zarrFormat = 0;
+    std::string order, dimension_separator;
 
     // Input data dimensions (MATLAB arrays have at least 2)
     const uint64_t nDataDims = (uint64_t)mxGetNumberOfDimensions(prhs[1]);
@@ -103,7 +106,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     
     // Check if metadata exists that we can use or if we have to create new metadata
     zarr Zarr;
-    const bool metadataExists = fileExists(folderName+"/.zarray");
+    const bool metadataExists = fileExists(folderName+"/.zarray") || fileExists(folderName+"/zarr.json");
     if(!metadataExists){
         Zarr.set_fileName(folderName);
     }
@@ -157,15 +160,28 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         else if(currInput == "dimension_separator"){
             if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a string\n");
-            const std::string dimension_separator(mxArrayToString(prhs[i+1]));
+            dimension_separator = mxArrayToString(prhs[i+1]);
             if(dimension_separator != "." && dimension_separator != "/") mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a . or /\n");
-            Zarr.set_dimension_separator(dimension_separator);
+        }
+        else if(currInput == "order"){
+            order = mexOrder(prhs[i+1]);
+        }
+        else if(currInput == "zarr_format"){
+            zarrFormat = mexZarrFormat(prhs[i+1]);
         }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: uuid, bbox, cname, subfolders, chunks, chunk_shape, sparse\n",currInput.c_str());
+            Currently Supported Names: uuid, bbox, cname, subfolders, chunks, chunk_shape, sparse, dimension_separator, order, zarr_format\n",currInput.c_str());
         }
     }
+
+    // The Zarr format: as given, or the existing array's (2 for a new array). A new
+    // format (a new array, or an existing one rewritten in the other format) starts
+    // from that format's defaults for order and dimension_separator.
+    const uint64_t existingFormat = metadataExists ? Zarr.get_zarr_format() : 0;
+    if(zarrFormat && zarrFormat != existingFormat) Zarr.set_zarr_format(zarrFormat);
+    if(!order.empty()) Zarr.set_order(order);
+    if(!dimension_separator.empty()) Zarr.set_dimension_separator(dimension_separator);
 
     // Number of dimensions of the array being written: a region written into an
     // existing array uses that array's; otherwise the input data's
@@ -201,6 +217,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(crop){
         for(uint64_t d = 0; d < nDims; d++){
             if(endCoords[d]-startCoords[d] > iDims[d]) mexErrMsgIdAndTxt("zarr:inputError","Bounds are invalid for the input data size");
+        }
+        // Writing a region into an existing array keeps its format
+        if(metadataExists && zarrFormat && zarrFormat != existingFormat){
+            mexErrMsgIdAndTxt("zarr:inputError","%s is a Zarr v%d array; writing a region keeps its format%s\n",folderName.c_str(),
+                              (int)existingFormat,existingFormat == 2 ? " (convert it with convertZarrToV3 first)" : "");
         }
     }
 
@@ -247,7 +268,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     else{
         Zarr.set_shape(endCoords);
 
-        if(fileExists(folderName+"/.zarray")){
+        if(metadataExists){
             for(uint64_t d = 0; d < nDims; d++){
                 if(endCoords[d]-startCoords[d] != iDims[d]) mexErrMsgIdAndTxt("zarr:inputError","Bounding box size does not match the size of the input data");
             }
@@ -281,7 +302,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
             else mexZarrError(e);
         }
         
-        if(dtypeT != Zarr.get_dtype()){
+        // (the byte order mark of 1-byte types, "<" or "|", does not matter)
+        const std::string &dtypeF = Zarr.get_dtype();
+        const bool sameType = dtypeT == dtypeF || (dtypeT.size() == 3 && dtypeF.size() == 3 &&
+                              dtypeT[2] == '1' && dtypeT.substr(1) == dtypeF.substr(1));
+        if(!sameType){
             uint64_t size = 1;
             for(uint64_t d = 0; d < nDims; d++) size *= endCoords[d]-startCoords[d];
             zarrC = convertMxToDtype(Zarr.get_dtype(), prhs[1], size);

@@ -5,10 +5,12 @@ round trip -- across dtypes, compressors, both storage orders (F and C), plus a
 region (cropped) read, arrays of 0 to 40 dimensions with region reads and crop
 writes, and arrays in any memory layout (C order, F order, strided views) read
 back in either order, and test arrays written by zarr-python 3 and TensorStore
-(tests/test_arrays: Zarr v3, and v2 with other codecs and fill values). Run
-automatically by cibuildwheel against the freshly
-built+installed wheel, so it also verifies the wheel imports and bundles its
-native library. Exits non-zero on any failure.
+(tests/test_arrays: Zarr v3, and v2 with other codecs and fill values), written into
+and converted to Zarr v3. Zarr v3 writing: round trips, shards, crop writes, the
+format of an existing array, conversion, and (when zarr-python and TensorStore are
+installed) reading what cpp-zarr wrote with them. Run automatically by cibuildwheel
+against the freshly built+installed wheel, so it also verifies the wheel imports and
+bundles its native library. Exits non-zero on any failure.
 """
 import json
 import os
@@ -18,6 +20,51 @@ import tempfile
 
 import numpy as np
 import cppzarr
+
+# zarr-python and TensorStore read what cpp-zarr writes, when they are installed
+try:
+    import zarr
+except ImportError:
+    zarr = None
+try:
+    import tensorstore as ts
+except ImportError:
+    ts = None
+
+
+def zarr_read(path):
+    # The array as zarr-python reads it (None without zarr-python)
+    return zarr.open_array(path, mode='r')[...] if zarr is not None else None
+
+
+def ts_read(path):
+    # The array as TensorStore reads it (None without TensorStore, and for Zarr v2)
+    if ts is None or not os.path.isfile(os.path.join(path, 'zarr.json')):
+        return None
+    return ts.open({'driver': 'zarr3', 'kvstore': {'driver': 'file', 'path': path}}).result().read().result()
+
+
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def same(a, b):
+    # Equal arrays (NaN equal to NaN); None (a reader that is not installed) means
+    # there is nothing to compare with
+    if a is None or b is None:
+        return True
+    a, b = np.asarray(a), np.asarray(b)
+    return a.shape == b.shape and a.dtype == b.dtype and np.array_equal(a, b, equal_nan=a.dtype.kind == 'f')
+
+
+def values_like(rng, a):
+    # Random values of a's dtype and shape (no NaNs)
+    a = np.asarray(a)
+    if a.dtype.kind == 'f':
+        return np.asarray(rng.standard_normal(a.shape) * 1000, dtype=a.dtype)
+    info = np.iinfo(a.dtype)
+    return np.asarray(rng.integers(max(info.min, -10**6), min(info.max, 10**6), size=a.shape, endpoint=True), dtype=a.dtype)
 
 
 def main():
@@ -168,8 +215,7 @@ def main():
     # Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
     # arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
     # Reads in every order and a region read match what zarr-python reads; arrays
-    # cpp-zarr cannot read are rejected; writing into a v3 array is refused and changes
-    # nothing
+    # cpp-zarr cannot read are rejected
     v3dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'test_arrays')
     if not os.path.isfile(os.path.join(v3dir, 'arrays.json')):
         # made by tests/make_test_arrays.py; CI makes them and requires them
@@ -202,23 +248,133 @@ def main():
                 good = good and np.array_equal(cppzarr.read_zarr(path, s, e), exp[region], equal_nan=exp.dtype.kind == 'f')
             print(f"test array {fx['name']:36s}           {'OK' if good else 'FAIL'}")
             ok = ok and good
-        copy = os.path.join(tmp, 'v3_write.zarr')
-        shutil.copytree(os.path.join(v3dir, 'v3_blosc_zstd_uint16.zarr'), copy)
-        before = sorted(os.path.relpath(os.path.join(dp, f), copy) for dp, _, fs in os.walk(copy) for f in fs)
-        good = True
-        for crop in (False, True):
+        # Writes into copies of them: a region, then the whole array (as the array's
+        # own type), read back by cpp-zarr and, when installed, zarr-python; arrays in
+        # the opposite byte order are refused. Then the v2 ones converted to Zarr v3
+        # (numcodecs zlib cannot be) read the same.
+        for fx in fixtures:
+            if 'error' in fx:
+                continue
+            exp = np.fromfile(os.path.join(v3dir, fx['name'] + '.bin'), dtype=fx['dtype']).reshape(fx['shape'])
+            if exp.dtype.kind == 'b':      # (cpp-zarr does not write booleans)
+                continue
+            copy = os.path.join(tmp, 'ta_' + fx['name'] + '.zarr')
+            shutil.copytree(os.path.join(v3dir, fx['name'] + '.zarr'), copy)
+            meta_file = os.path.join(copy, 'zarr.json')
+            big_endian = os.path.isfile(meta_file) and '"endian": "big"' in json.dumps(load_json(meta_file))
+            good = True
             try:
-                if crop:
-                    cppzarr.write_zarr(copy, np.ones((2, 2, 2), np.uint16), start_coords=[0, 0, 0], end_coords=[2, 2, 2])
-                else:
-                    cppzarr.write_zarr(copy, np.ones((10, 7, 5), np.uint16))
-                good = False
+                if exp.ndim:
+                    s = [1 if n > 2 else 0 for n in exp.shape]
+                    e = [n - 1 if n > 2 else n for n in exp.shape]
+                    region = tuple(slice(a, b) for a, b in zip(s, e))
+                    patch = values_like(rng, exp[region])
+                    cppzarr.write_zarr(copy, patch, start_coords=s, end_coords=e)
+                    exp[region] = patch
+                    good = good and same(cppzarr.read_zarr(copy), exp) and same(zarr_read(copy), exp) and same(ts_read(copy), exp)
+                whole = values_like(rng, exp)
+                cppzarr.write_zarr(copy, whole, start_coords=[0] * exp.ndim, end_coords=list(exp.shape))
+                good = good and same(cppzarr.read_zarr(copy), whole) and same(zarr_read(copy), whole) and \
+                    same(ts_read(copy), whole) and not big_endian
+                if fx['name'].startswith('v2_'):
+                    try:
+                        cppzarr.convert_to_v3(copy)
+                        good = good and 'zlib' not in fx['name'] and os.path.isfile(os.path.join(copy, 'zarr.json')) and \
+                            same(cppzarr.read_zarr(copy), whole) and same(zarr_read(copy), whole)
+                    except Exception as e:
+                        good = good and 'zlib' in fx['name'] and 'Zarr v3' in str(e)
             except Exception as e:
-                good = good and 'Zarr v3' in str(e)
-        after = sorted(os.path.relpath(os.path.join(dp, f), copy) for dp, _, fs in os.walk(copy) for f in fs)
-        good = good and before == after
-        print(f"writes into a Zarr v3 array refused  {'OK' if good else 'FAIL'}")
+                good = big_endian and 'byte order' in str(e)
+            print(f"writes into test array {fx['name']:36s} {'OK' if good else 'FAIL'}")
+            ok = ok and good
+
+    # Zarr v3 writing: every dtype and compressor; C order and c/0/0/0 chunk keys by
+    # default (F order and other separators when asked); read back by cpp-zarr and,
+    # when installed, by zarr-python and TensorStore
+    for dt in dtypes:
+        data = values_like(rng, np.zeros(shape, dt))
+        for cname, order in [("zstd", None), ("lz4", "F"), ("gzip", None), ("none", "F"), ("zlib", None)]:
+            path = os.path.join(tmp, f"v3_{np.dtype(dt).name}_{cname}_{order}.zarr")
+            cppzarr.write_zarr(path, data, cname=cname, order=order, chunks=chunks, zarr_format=3)
+            back = cppzarr.read_zarr(path)
+            meta = load_json(os.path.join(path, 'zarr.json'))
+            good = (np.array_equal(back, data) and back.flags[f'{order or "C"}_CONTIGUOUS'] and
+                    not os.path.exists(os.path.join(path, '.zarray')) and os.path.isfile(os.path.join(path, 'c', '0', '0', '0')) and
+                    meta['zarr_format'] == 3 and same(zarr_read(path), data) and same(ts_read(path), data))
+            print(f"v3 {np.dtype(dt).name:8s} {cname:5s} {order or 'C'}  {'OK' if good else 'FAIL'}")
+            ok = ok and good
+
+    # Shards (the shard shape; chunks are the inner chunks), crop writes into them, and
+    # into unsharded arrays; regions that are not chunk-aligned; '.' chunk keys
+    for shards, sep, order in [([32, 16, 18], None, None), ([16, 32, 18], '.', 'F'), (None, '.', None)]:
+        data = rng.integers(0, 60000, size=(70, 45, 33)).astype(np.uint16)
+        path = os.path.join(tmp, f"v3_shards_{shards}_{order}.zarr")
+        cppzarr.write_zarr(path, data, chunks=[16, 16, 9] if shards else [16, 8, 9], shards=shards, zarr_format=3,
+                           dimension_separator=sep, order=order)
+        good = np.array_equal(cppzarr.read_zarr(path), data)
+        for s, e in [([5, 7, 3], [61, 40, 29]), ([64, 32, 30], [70, 45, 33]), ([0, 0, 0], [16, 16, 9])]:
+            region = tuple(slice(a, b) for a, b in zip(s, e))
+            patch = rng.integers(0, 60000, size=[b - a for a, b in zip(s, e)]).astype(np.uint16)
+            cppzarr.write_zarr(path, patch, start_coords=s, end_coords=e)
+            data[region] = patch
+            good = good and np.array_equal(cppzarr.read_zarr(path), data) and np.array_equal(cppzarr.read_zarr(path, s, e), patch)
+        good = good and same(zarr_read(path), data) and same(ts_read(path), data)
+        print(f"v3 shards={shards} sep={sep} order={order}  {'OK' if good else 'FAIL'}")
         ok = ok and good
+
+    # Shards of arrays with more than three dimensions keep every axis's shard and
+    # inner chunk size
+    d4 = rng.integers(0, 60000, size=(6, 8, 10, 12, 14)).astype(np.uint16)
+    p4 = os.path.join(tmp, "v3_shards_5d.zarr")
+    cppzarr.write_zarr(p4, d4, chunks=[2, 3, 4, 5, 6], shards=[4, 6, 8, 10, 12], zarr_format=3)
+    meta = load_json(os.path.join(p4, 'zarr.json'))
+    good = (meta['chunk_grid']['configuration']['chunk_shape'] == [4, 6, 8, 10, 12] and
+            meta['codecs'][0]['configuration']['chunk_shape'] == [2, 3, 4, 5, 6] and
+            np.array_equal(cppzarr.read_zarr(p4), d4) and same(zarr_read(p4), d4) and same(ts_read(p4), d4))
+    print(f"v3 5D shards  {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
+    # The format of an existing array is kept: writes default to it, a crop write
+    # cannot change it, and a v2 write over a v3 array is refused. shards needs Zarr
+    # v3 and a multiple of the inner chunk shape. A v2 array converted to v3 reads the
+    # same, keeps its attributes, and can be written.
+    d = rng.integers(0, 60000, size=(40, 24, 18)).astype(np.uint16)
+    p3 = os.path.join(tmp, "v3_kept.zarr")
+    cppzarr.write_zarr(p3, d, zarr_format=3)
+    cppzarr.write_zarr(p3, d[::-1].copy())
+    good = os.path.isfile(os.path.join(p3, 'zarr.json')) and np.array_equal(cppzarr.read_zarr(p3), d[::-1])
+    cppzarr.write_zarr(p3, d[:4, :4, :4], start_coords=[1, 1, 1], end_coords=[5, 5, 5])
+    exp = d[::-1].copy()
+    exp[1:5, 1:5, 1:5] = d[:4, :4, :4]
+    good = good and np.array_equal(cppzarr.read_zarr(p3), exp) and not os.path.exists(os.path.join(p3, '.zarray'))
+    for kwargs in [dict(zarr_format=2, start_coords=[0, 0, 0], end_coords=[4, 4, 4]), dict(zarr_format=2),
+                   dict(shards=[8, 8, 8], zarr_format=2), dict(shards=[24, 24, 24], chunks=[16, 16, 16], zarr_format=3)]:
+        try:
+            data = d[:4, :4, :4] if 'start_coords' in kwargs else d
+            cppzarr.write_zarr(p3 if kwargs.get('zarr_format') != 3 else p3 + '_new', data, **kwargs)
+            good = False
+        except Exception as e:
+            good = good and any(w in str(e) for w in ('Zarr v3', 'zarr_format=3', 'multiple'))
+    good = good and np.array_equal(cppzarr.read_zarr(p3), exp)
+    p2 = os.path.join(tmp, "v2_to_v3.zarr")
+    cppzarr.write_zarr(p2, d, chunks=[16, 16, 8])
+    with open(os.path.join(p2, '.zattrs'), 'w') as f:
+        json.dump({'units': 'um'}, f)
+    cppzarr.convert_to_v3(p2)
+    meta = load_json(os.path.join(p2, 'zarr.json'))
+    good = good and meta['attributes'] == {'units': 'um'} and not os.path.exists(os.path.join(p2, '.zarray')) and \
+        np.array_equal(cppzarr.read_zarr(p2), d) and cppzarr.read_zarr(p2).flags['F_CONTIGUOUS'] and same(zarr_read(p2), d)
+    cppzarr.write_zarr(p2, d[:4, :4, :4], start_coords=[1, 1, 1], end_coords=[5, 5, 5])
+    exp = d.copy()
+    exp[1:5, 1:5, 1:5] = d[:4, :4, :4]
+    good = good and np.array_equal(cppzarr.read_zarr(p2), exp) and same(zarr_read(p2), exp)
+    try:
+        cppzarr.convert_to_v3(p2)
+        good = False
+    except Exception as e:
+        good = good and 'not a Zarr v2 array' in str(e)
+    print(f"v3 existing arrays and conversion  {'OK' if good else 'FAIL'}")
+    ok = ok and good
 
     if not ok:
         sys.exit("cppzarr Python round-trip test FAILED")

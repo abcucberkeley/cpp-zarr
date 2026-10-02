@@ -60,10 +60,20 @@ public:
 
     const uint64_t get_chunkShardPosition(const std::vector<uint64_t> &cAV) const;
 
-    // Zarr format of the array's metadata: 2 (.zarray) or 3 (zarr.json). Zarr v3
-    // arrays are read through the same fields as v2 ones; writing them is not
-    // supported yet.
+    // Zarr format of the array's metadata: 2 (.zarray) or 3 (zarr.json)
     uint64_t get_zarr_format() const;
+    // Write Zarr v3 metadata (zarr.json) instead of v2 (.zarray) from
+    // write_zarray(). Also sets v3's defaults, C order and "/" in chunk names
+    // ("c/0/0/0"); set_order or set_dimension_separator after it changes them.
+    void set_zarr_format(const uint64_t zarr_format);
+    // Blosc shuffle: 0 none, 1 byte, 2 bit
+    uint64_t get_shuffle() const;
+    // Turn the v2 array this object was opened from into a Zarr v3 array by
+    // writing a zarr.json that describes its existing chunk files (no data is
+    // rewritten) and removing its .zarray. Throws "v3Unsupported:why" for what
+    // v3 cannot describe (subfolders, zlib, shard shapes that are not a multiple
+    // of the inner chunk shape).
+    void convert_to_v3();
     // Path of a chunk (or shard) file inside the array's folder: its name, after
     // the "c" prefix of Zarr v3's default chunk key encoding
     const std::string chunkKey(const std::string &chunkName) const;
@@ -93,6 +103,7 @@ public:
     void normalizeDims();
 private:
     void parseZarrJson();
+    json v3Metadata(const bool existingChunks) const;
     void set_jsonValues();
     void write_jsonValues();
     void set_shardData();

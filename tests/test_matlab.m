@@ -1,12 +1,13 @@
 function test_matlab(mexDir)
 % Smoke test for the compiled MATLAB mex files: write small random volumes,
 % read them back, and check the data survives the round trip. Also checks a
-% bounding-box (region) read and createZarrFile. Errors (non-zero exit under
-% `matlab -batch`) on any failure so Jenkins fails the build.
+% bounding-box (region) read, createZarrFile, Zarr v3 writing and
+% convertZarrToV3. Errors (non-zero exit under `matlab -batch`) on any failure so
+% Jenkins fails the build.
 %
 % With no argument it auto-detects the platform's mex folder (matching the
 % compile_*.m scripts), so Jenkins can call it quote-free right after compiling:
-%   matlab -batch "compile_createZarrFile;compile_parallelReadZarr;compile_parallelWriteZarr;addpath ../tests;test_matlab;exit"
+%   matlab -batch "compile_createZarrFile;compile_parallelReadZarr;compile_parallelWriteZarr;compile_convertZarrToV3;addpath ../tests;test_matlab;exit"
 % Or pass an explicit folder: test_matlab('../linux')
     if nargin < 1
         if ispc
@@ -192,6 +193,104 @@ function test_matlab(mexDir)
     assert(~any(parallelReadZarr(fz), 'all'), 'zero rewrite mismatch');
     fprintf('PASS  sharding and zero rewrites\n');
 
+    % Zarr v3 ('zarr_format', 3): C order and c/0/0/0 chunk files by default, F order
+    % when asked; sharded arrays from createZarrFile with bbox writes into them; an
+    % existing array keeps its format; a v2 array converted with convertZarrToV3
+    a = cast(randi([1 200], [70 45 33]), 'uint16');
+    for order = {'', 'F'}
+        fv = fullfile(tmp, ['v3_' order{1} '.zarr']);
+        if isempty(order{1})
+            parallelWriteZarr(fv, a, 'zarr_format', 3, 'chunks', [32 16 16]);
+        else
+            parallelWriteZarr(fv, a, 'zarr_format', 3, 'chunks', [32 16 16], 'order', order{1}, 'cname', 'gzip');
+        end
+        meta = jsondecode(fileread(fullfile(fv, 'zarr.json')));
+        transposed = contains(fileread(fullfile(fv, 'zarr.json')), '"transpose"');
+        assert(meta.zarr_format == 3 && ~isfile(fullfile(fv, '.zarray')) && isfile(fullfile(fv, 'c', '0', '0', '0')) && ...
+               transposed == strcmp(order{1}, 'F'), 'v3 %s metadata mismatch', order{1});
+        assert(isequal(parallelReadZarr(fv), a), 'v3 %s round-trip mismatch', order{1});
+        p = a(6:61, 8:40, 4:29) + 1;
+        parallelWriteZarr(fv, p, 'bbox', [6 8 4 61 40 29]);
+        e = a;  e(6:61, 8:40, 4:29) = p;
+        assert(isequal(parallelReadZarr(fv), e), 'v3 %s bbox write mismatch', order{1});
+    end
+    for order = {'C', 'F'}
+        fs = fullfile(tmp, ['v3_shard_' order{1} '.zarr']);
+        createZarrFile(fs, 'shape', size(a), 'dtype', '<u2', 'chunks', [32 32 20], 'chunk_shape', [16 16 10], ...
+                       'order', order{1}, 'zarr_format', 3);
+        parallelWriteZarr(fs, a, 'bbox', [1 1 1 size(a)]);
+        assert(isequal(parallelReadZarr(fs), a), 'v3 sharded %s round-trip mismatch', order{1});
+        p = a(6:61, 8:40, 4:29) + 1;
+        parallelWriteZarr(fs, p, 'bbox', [6 8 4 61 40 29], 'uuid', 0);
+        e = a;  e(6:61, 8:40, 4:29) = p;
+        assert(isequal(parallelReadZarr(fs), e), 'v3 sharded %s crop write mismatch', order{1});
+    end
+    % (the last one: kept as v3 by writes and createZarrFile without zarr_format)
+    parallelWriteZarr(fs, a);
+    assert(isfile(fullfile(fs, 'zarr.json')) && ~isfile(fullfile(fs, '.zarray')) && isequal(parallelReadZarr(fs), a), ...
+           'v3 rewrite mismatch');
+    createZarrFile(fs, 'shape', [10 7 5], 'dtype', '<u2');
+    assert(isfile(fullfile(fs, 'zarr.json')) && ~isfile(fullfile(fs, '.zarray')), 'v3 createZarrFile did not keep the format');
+    for attempt = 1 : 4
+        try
+            switch attempt
+                case 1, parallelWriteZarr(fs, a(1:2, 1:2, 1:2), 'bbox', [1 1 1 2 2 2], 'zarr_format', 2);
+                case 2, parallelWriteZarr(fs, a, 'zarr_format', 2);
+                case 3, createZarrFile(fs, 'shape', [10 7 5], 'dtype', '<u2', 'zarr_format', 2);
+                case 4, parallelWriteZarr(fullfile(tmp, 'v3_bad.zarr'), a, 'zarr_format', 4);
+            end
+            refused = false;
+        catch ME
+            refused = contains(ME.message, 'Zarr v3') || contains(ME.message, 'zarr_format');
+        end
+        assert(refused, 'Zarr format mismatch %d was not refused', attempt);
+    end
+    fc2 = fullfile(tmp, 'v2_to_v3.zarr');
+    parallelWriteZarr(fc2, a, 'chunks', [32 16 16]);
+    fid = fopen(fullfile(fc2, '.zattrs'), 'w');  fprintf(fid, '{"units": "um"}');  fclose(fid);
+    convertZarrToV3(fc2);
+    meta = jsondecode(fileread(fullfile(fc2, 'zarr.json')));
+    assert(~isfile(fullfile(fc2, '.zarray')) && ~isfile(fullfile(fc2, '.zattrs')) && strcmp(meta.attributes.units, 'um') && ...
+           isequal(parallelReadZarr(fc2), a), 'converted array mismatch');
+    p = a(3:50, 20:44, 2:15) + 2;
+    parallelWriteZarr(fc2, p, 'bbox', [3 20 2 50 44 15]);
+    e = a;  e(3:50, 20:44, 2:15) = p;
+    assert(isequal(parallelReadZarr(fc2), e), 'converted array bbox write mismatch');
+    try
+        convertZarrToV3(fc2);
+        refused = false;
+    catch ME
+        refused = contains(ME.message, 'not a Zarr v2 array');
+    end
+    assert(refused, 'converting a v3 array was not refused');
+    % shard and inner chunk sizes on every axis of a 4D array (v2 and v3)
+    a4 = cast(randi([1 200], [8 12 16 20]), 'uint16');
+    for fmt = [2 3]
+        f4 = fullfile(tmp, sprintf('shard4d_v%d.zarr', fmt));
+        parallelWriteZarr(f4, a4, 'chunks', [4 6 8 10], 'chunk_shape', [2 3 4 5], 'zarr_format', fmt);
+        if fmt == 2
+            meta = jsondecode(fileread(fullfile(f4, '.zarray')));
+            shardShape = meta.chunks(:)';
+            innerShape = meta.codecs.configuration.chunk_shape(:)';
+        else
+            meta = jsondecode(fileread(fullfile(f4, 'zarr.json')));
+            shardShape = meta.chunk_grid.configuration.chunk_shape(:)';
+            innerShape = meta.codecs.configuration.chunk_shape(:)';
+        end
+        assert(isequal(shardShape, [4 6 8 10]) && isequal(innerShape, [2 3 4 5]), '4D v%d shard shapes mismatch', fmt);
+        assert(isequal(parallelReadZarr(f4), a4), '4D v%d sharded round-trip mismatch', fmt);
+    end
+    fsub = fullfile(tmp, 'v2_subfolders.zarr');
+    createZarrFile(fsub, 'shape', [70 45 33], 'dtype', '<u2', 'chunks', [16 16 16], 'subfolders', [2 2 1]);
+    try
+        convertZarrToV3(fsub);
+        refused = false;
+    catch ME
+        refused = contains(ME.message, 'subfolders') && isfile(fullfile(fsub, '.zarray'));
+    end
+    assert(refused, 'converting an array with subfolders was not refused');
+    fprintf('PASS  Zarr v3 writing and conversion\n');
+
     % createZarrFile writes only .zarray metadata; reading it back (no chunks on
     % disk) must return an array of the fill value (0) with the right shape/type.
     fc = fullfile(tmp, 'meta_only.zarr');
@@ -203,7 +302,7 @@ function test_matlab(mexDir)
     % Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
     % arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
     % Full and region reads match what zarr-python reads, arrays cpp-zarr cannot read
-    % are rejected, and writing into a v3 array is refused and changes nothing
+    % are rejected, and copies of them can be written into and converted
     v3dir = fullfile(fileparts(mfilename('fullpath')), 'test_arrays');
     if isfile(fullfile(v3dir, 'arrays.json'))
         checkTestArrays(v3dir, tmp);
@@ -218,7 +317,7 @@ end
 
 function checkTestArrays(v3dir, tmp)
 % Read every test array (arrays.json) and compare with the values zarr-python reads;
-% check the rejected ones are rejected, and that writes into a v3 array are refused
+% check the rejected ones are rejected; write into copies of them and convert those
     fixtures = jsondecode(fileread(fullfile(v3dir, 'arrays.json'))).arrays;
     classes = struct('u1', 'uint8', 'i1', 'int8', 'u2', 'uint16', 'i2', 'int16', 'u4', 'uint32', ...
                      'i4', 'int32', 'u8', 'uint64', 'i8', 'int64', 'f4', 'single', 'f8', 'double', 'b1', 'logical');
@@ -258,24 +357,54 @@ function checkTestArrays(v3dir, tmp)
         end
         nRead = nRead + 1;
     end
-    fw = fullfile(tmp, 'v3_write.zarr');
-    copyfile(fullfile(v3dir, 'v3_blosc_zstd_uint16.zarr'), fw);
-    before = dir(fullfile(fw, '**', '*'));
-    for attempt = 1 : 3
+    % Writes into copies of them: a region, then the whole array, read back; arrays in
+    % the opposite byte order are refused and left as they were. Then the v2 ones
+    % converted to Zarr v3 (numcodecs zlib cannot be) read the same.
+    nWritten = 0;
+    for k = 1 : numel(fixtures)
+        if iscell(fixtures), fx = fixtures{k}; else, fx = fixtures(k); end
+        if isfield(fx, 'error') || strcmp(fx.dtype(2:3), 'b1'), continue; end
+        cls = classes.(fx.dtype(2:3));
+        fw = fullfile(tmp, ['ta_' fx.name '.zarr']);
+        copyfile(fullfile(v3dir, [fx.name '.zarr']), fw);
+        e = parallelReadZarr(fw);
+        shp = size(e);
+        if isempty(fx.shape), shp = []; elseif isscalar(fx.shape), shp = fx.shape; end
+        bigEndian = isfile(fullfile(fw, 'zarr.json')) && contains(fileread(fullfile(fw, 'zarr.json')), '"big"');
+        before = dir(fullfile(fw, '**', '*'));
         try
-            switch attempt
-                case 1, parallelWriteZarr(fw, ones([10 7 5], 'uint16'));
-                case 2, parallelWriteZarr(fw, ones([2 2 2], 'uint16'), 'bbox', [1 1 1 2 2 2]);
-                case 3, createZarrFile(fw, 'shape', [10 7 5], 'dtype', '<u2');
+            if ~isempty(shp)
+                s = ones(1, numel(shp));  t = shp;
+                s(shp > 2) = 2;  t(shp > 2) = shp(shp > 2) - 1;
+                idx = arrayfun(@(p, q) p:q, s, t, 'UniformOutput', false);
+                p = cast(randi([0 100], size(e(idx{:}))), cls);
+                parallelWriteZarr(fw, p, 'bbox', [s t]);
+                e(idx{:}) = p;
+                assert(isequaln(parallelReadZarr(fw), e), 'region write into test array %s mismatch', fx.name);
+                w = cast(randi([0 100], size(e)), cls);
+                parallelWriteZarr(fw, w, 'bbox', [ones(1, numel(shp)) shp]);
+            else
+                w = cast(randi([0 100]), cls);
+                parallelWriteZarr(fw, w, 'bbox', [1 1]);
             end
-            refused = false;
+            assert(~bigEndian && isequaln(parallelReadZarr(fw), w), 'write into test array %s mismatch', fx.name);
         catch ME
-            refused = contains(ME.message, 'Zarr v3');
+            after = dir(fullfile(fw, '**', '*'));
+            assert(bigEndian && contains(ME.message, 'byte order') && isequal(sort({before.name}), sort({after.name})) && ...
+                   isequal(sort([before.bytes]), sort([after.bytes])), 'write into test array %s failed: %s', fx.name, ME.message);
+            continue;
         end
-        assert(refused, 'write %d into a Zarr v3 array was not refused', attempt);
+        if startsWith(fx.name, 'v2_')
+            try
+                convertZarrToV3(fw);
+                converted = true;
+            catch ME
+                converted = false;
+                assert(contains(fx.name, 'zlib') && contains(ME.message, 'Cannot convert'), 'converting %s failed: %s', fx.name, ME.message);
+            end
+            assert(~converted || (~contains(fx.name, 'zlib') && isequaln(parallelReadZarr(fw), w)), 'converted %s mismatch', fx.name);
+        end
+        nWritten = nWritten + 1;
     end
-    after = dir(fullfile(fw, '**', '*'));
-    assert(isequal(sort({before.name}), sort({after.name})) && isequal(sort([before.bytes]), sort([after.bytes])), ...
-           'a refused write changed the Zarr v3 array');
-    fprintf('PASS  zarr-python and TensorStore test arrays (%d read, %d rejected, writes into v3 refused)\n', nRead, nRejected);
+    fprintf('PASS  zarr-python and TensorStore test arrays (%d read, %d rejected, %d written into)\n', nRead, nRejected, nWritten);
 end

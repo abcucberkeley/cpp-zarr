@@ -54,6 +54,9 @@ import cppzarr
 im = cppzarr.read_zarr('filename.zarr')
 # Do some processing here
 cppzarr.write_zarr('outputFilename.zarr', im)
+
+# Write a Zarr v3 file instead
+cppzarr.write_zarr('outputFilename.zarr', im, zarr_format=3)
 ````
 
 #### Read a region of a Zarr file
@@ -71,7 +74,7 @@ im2 = cppzarr.read_zarr('filename.zarr', start_coords=[10, 10, 10], end_coords=[
 ````
 
 #### Memory layout
-read_zarr returns arrays in the file's own storage order by default, like zarr-python: C-order files as C-order arrays (the last axis is contiguous) and F-order files as F-order arrays (the first axis is contiguous). Pass order='C' or order='F' to choose the layout. write_zarr takes arrays in either order, and strided views, without copying them; its order argument sets the file's storage order (F by default).
+read_zarr returns arrays in the file's own storage order by default, like zarr-python: C-order files as C-order arrays (the last axis is contiguous) and F-order files as F-order arrays (the first axis is contiguous). Pass order='C' or order='F' to choose the layout. write_zarr takes arrays in either order, and strided views, without copying them; its order argument sets the file's storage order (F by default, C for Zarr v3).
 ````
 import cppzarr
 im = cppzarr.read_zarr('filename.zarr', order='C')
@@ -84,6 +87,10 @@ im = cppzarr.read_zarr('filename.zarr')
 
 # Optionally specify specific metadata
 cppzarr.write_zarr('outputFilename.zarr', im, cname='zstd', clevel=1, order='F', chunks=[256, 256, 256], dimension_separator='.')
+
+# Zarr v3 with 1024x1024x1024 shards made of 256x256x256 chunks (shards must be a multiple of chunks).
+# Zarr v3 files default to order='C' and dimension_separator='/' (chunk files named c/0/0/0)
+cppzarr.write_zarr('outputFilename.zarr', im, zarr_format=3, cname='zstd', clevel=1, chunks=[256, 256, 256], shards=[1024, 1024, 1024])
 ````
 
 #### Write a region to an existing Zarr file
@@ -94,8 +101,17 @@ im = cppzarr.read_zarr('filename.zarr')
 # Write the zarr file out normally
 cppzarr.write_zarr('filename.zarr', im)
 
-# Write to a specified region with different data
+# Write to a specified region with different data (the file keeps its Zarr version)
 cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0,0,0], end_coords=[100,100,100])
+````
+
+#### Convert a Zarr v2 file to Zarr v3
+````
+import cppzarr
+
+# Only the metadata is rewritten (.zarray and .zattrs become zarr.json); the chunk files are kept.
+# Files with subfolders or numcodecs zlib compression cannot be converted
+cppzarr.convert_to_v3('filename.zarr')
 ````
 
 ## CMake
@@ -135,6 +151,8 @@ make install
 ````
 % Note the created .zarray file is probably hidden by default on your system
 createZarrFile('path/to/file.zarr');
+% Zarr v3 metadata (zarr.json) instead, with 1024x1024x1024 shards made of 256x256x256 chunks
+createZarrFile('path/to/file.zarr','shape',[2048 2048 1024],'dtype','<u2','chunks',[1024 1024 1024],'chunk_shape',[256 256 256],'zarr_format',3);
 ````
 
 #### parallelReadZarr - Read a Zarr image into an array
@@ -150,8 +168,17 @@ im = rand(100,100,100);
 parallelWriteZarr('path/to/file.zarr',im);
 % Write with a chunk size (one value per axis)
 parallelWriteZarr('path/to/file.zarr',im,'chunks',[64 64 64]);
-% Write into a region of an existing Zarr file ([starts ends] as in parallelReadZarr)
+% Write into a region of an existing Zarr file ([starts ends] as in parallelReadZarr); the file keeps its Zarr version
 parallelWriteZarr('path/to/file.zarr',im(1:50,:,:),'bbox',[1 1 1 50 100 100]);
+% Write a Zarr v3 file (C order and chunk files named c/0/0/0 by default; 'order','F' still works)
+parallelWriteZarr('path/to/file.zarr',im,'zarr_format',3);
+````
+
+#### convertZarrToV3 - Convert a Zarr v2 file to Zarr v3
+````
+% Only the metadata is rewritten (.zarray and .zattrs become zarr.json); the chunk files are kept.
+% Files with subfolders or numcodecs zlib compression cannot be converted
+convertZarrToV3('path/to/file.zarr');
 ````
 
 ## Reference

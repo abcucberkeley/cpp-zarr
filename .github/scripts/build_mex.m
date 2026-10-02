@@ -1,8 +1,8 @@
 function build_mex(installDir, outDir)
 %BUILD_MEX Compile the cpp-zarr mex files for the GitHub Actions tests.
-%   BUILD_MEX(installDir, outDir) builds parallelReadZarr, parallelWriteZarr and
-%   createZarrFile into outDir, linked against the cpp-zarr library that CMake
-%   installed into installDir. The compile_*.m scripts in mexSrc build the
+%   BUILD_MEX(installDir, outDir) builds parallelReadZarr, parallelWriteZarr,
+%   createZarrFile and convertZarrToV3 into outDir, linked against the cpp-zarr
+%   library that CMake installed into installDir. The compile_*.m scripts in mexSrc build the
 %   release binaries from each Jenkins agent's own paths, so CI uses this.
     inc = fullfile(installDir, 'include');
     lib = fullfile(installDir, 'lib');
@@ -13,7 +13,8 @@ function build_mex(installDir, outDir)
 
     mexes = {'parallelreadzarrmex.cpp',  'parallelReadZarr'
              'parallelwritezarrmex.cpp', 'parallelWriteZarr'
-             'createzarrfilemex.cpp',    'createZarrFile'};
+             'createzarrfilemex.cpp',    'createZarrFile'
+             'convertzarrtov3mex.cpp',   'convertZarrToV3'};
     % Same optimization and OpenMP flags as the release compile scripts
     % (parallelWriteZarr has an OpenMP loop of its own)
     args = {'-outdir', outDir, ['-I' inc], ['-L' lib], 'CXXOPTIMFLAGS=-O2 -DNDEBUG'};

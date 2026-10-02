@@ -1,1 +1,1 @@
-from .cppzarrwrappers import read_zarr, write_zarr
+from .cppzarrwrappers import convert_to_v3, read_zarr, write_zarr

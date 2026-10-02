@@ -74,8 +74,10 @@ int main(int argc, char** argv){
 
         for (const char* comp : cfg.comps){
             for (const char* order : orders){
+            for (const int fmt : {2, 3}){
                 total++;
-                const std::string path = dir + "/rt_" + c.name + "_" + comp + "_" + order + cfg.tag + ".zarr";
+                const char* vtag = fmt == 3 ? " v3" : "";
+                const std::string path = dir + "/rt_" + c.name + "_" + comp + "_" + order + cfg.tag + (fmt == 3 ? "_v3" : "") + ".zarr";
                 std::error_code ec; std::filesystem::remove_all(path, ec);
 
                 bool metaOK = false, dataOK = false;
@@ -83,11 +85,13 @@ int main(int argc, char** argv){
                     step(c.name, comp, order, "write");
                     zarr Zw;
                     Zw.set_fileName(path);
+                    // (Zarr v3 with its default chunk keys, c/0/0/0)
+                    if (fmt == 3) Zw.set_zarr_format(3);
                     Zw.set_cname(comp);
                     Zw.set_clevel(5);
                     Zw.set_order(order);
                     Zw.set_chunks(chunks);
-                    Zw.set_dimension_separator(".");
+                    Zw.set_dimension_separator(fmt == 3 ? "/" : ".");
                     Zw.set_dtype(c.dtype);
                     Zw.set_shape(shape);
                     Zw.write_zarray();
@@ -96,12 +100,18 @@ int main(int argc, char** argv){
                                                      c.bits, /*useUuid*/false, /*crop*/false, /*sparse*/false);
                     if (werr) throw std::string("write error: ") + Zw.get_errString();
 
-                    // Metadata (.zarray) must round trip.
+                    // Metadata (.zarray, or zarr.json) must round trip.
                     step(c.name, comp, order, "read metadata");
                     zarr Zr(path);
-                    metaOK = Zr.get_dtype() == c.dtype && Zr.get_cname() == comp &&
+                    // (1-byte types have no byte order: "|u1" in v3)
+                    const std::string wantType = fmt == 3 && c.bits == 8 ? std::string("|") + (c.dtype+1) : c.dtype;
+                    metaOK = Zr.get_dtype() == wantType && Zr.get_cname() == comp &&
                              Zr.get_shape(0) == shape[0] && Zr.get_shape(1) == shape[1] &&
-                             Zr.get_shape(2) == shape[2];
+                             Zr.get_shape(2) == shape[2] && Zr.get_order() == order &&
+                             Zr.get_zarr_format() == (uint64_t)fmt &&
+                             fileExists(path + (fmt == 3 ? "/zarr.json" : "/.zarray")) &&
+                             !fileExists(path + (fmt == 3 ? "/.zarray" : "/zarr.json")) &&
+                             (fmt == 2 || fileExists(path + "/c/0/0/0"));
 
                     // Data must be byte-identical to what we wrote.
                     step(c.name, comp, order, "read data");
@@ -119,12 +129,13 @@ int main(int argc, char** argv){
                 std::filesystem::remove_all(path, ec);
 
                 if (metaOK && dataOK){
-                    std::printf("PASS  %-6s %-8s %s %s\n", c.name, comp, order, cfg.tag);
+                    std::printf("PASS  %-6s %-8s %s %s%s\n", c.name, comp, order, cfg.tag, vtag);
                 } else {
-                    std::printf("FAIL  %-6s %-8s %s %s  (meta=%d data=%d)\n",
-                                c.name, comp, order, cfg.tag, (int)metaOK, (int)dataOK);
+                    std::printf("FAIL  %-6s %-8s %s %s%s  (meta=%d data=%d)\n",
+                                c.name, comp, order, cfg.tag, vtag, (int)metaOK, (int)dataOK);
                     failures++;
                 }
+            }
             }
         }
     }
@@ -366,17 +377,21 @@ int main(int argc, char** argv){
         for (const NdCase& c : ndCases){
             for (const char* dtype : {"<u2", "<f8"}){
                 for (const char* order : {"F", "C"}){
+                for (const int fmt : {2, 3}){
+                    if (fmt == 3 && !c.sub.empty()) continue;
                     total++;
                     const uint64_t bytes = dtype[2]-'0', n = c.shape.size();
                     uint64_t count = 1; for (uint64_t v : c.shape) count *= v;
                     std::vector<uint8_t> orig(count*bytes);
                     for (auto& b : orig) b = (uint8_t)byteDist(rng);
-                    const std::string path = dir + "/rt_" + c.name + "_" + (dtype+1) + "_" + order + ".zarr";
+                    const std::string path = dir + "/rt_" + c.name + "_" + (dtype+1) + "_" + order + (fmt == 3 ? "_v3" : "") + ".zarr";
                     std::error_code ec; std::filesystem::remove_all(path, ec);
                     bool ok = false;
                     try {
                         zarr Zw;
-                        Zw.set_fileName(path); Zw.set_cname("lz4"); Zw.set_order(order); Zw.set_chunks(c.chunks);
+                        Zw.set_fileName(path);
+                        if (fmt == 3) Zw.set_zarr_format(3);
+                        Zw.set_cname("lz4"); Zw.set_order(order); Zw.set_chunks(c.chunks);
                         Zw.set_dimension_separator(c.sep); Zw.set_dtype(dtype); Zw.set_shape(c.shape);
                         if (!c.sub.empty()) Zw.set_subfolders(c.sub);
                         if (!c.inner.empty()){ Zw.set_shard(true); Zw.set_chunk_shape(c.inner); }
@@ -418,7 +433,9 @@ int main(int argc, char** argv){
                             const std::string cpath = path + "_cin";
                             std::filesystem::remove_all(cpath, ec);
                             zarr Zc;
-                            Zc.set_fileName(cpath); Zc.set_cname("lz4"); Zc.set_order(order); Zc.set_chunks(c.chunks);
+                            Zc.set_fileName(cpath);
+                            if (fmt == 3) Zc.set_zarr_format(3);
+                            Zc.set_cname("lz4"); Zc.set_order(order); Zc.set_chunks(c.chunks);
                             Zc.set_dimension_separator(c.sep); Zc.set_dtype(dtype); Zc.set_shape(c.shape);
                             if (!c.sub.empty()) Zc.set_subfolders(c.sub);
                             if (!c.inner.empty()){ Zc.set_shard(true); Zc.set_chunk_shape(c.inner); }
@@ -491,8 +508,9 @@ int main(int argc, char** argv){
                         std::fprintf(stderr, "    exception: %s\n", e.c_str()); ok = false;
                     } catch (...) { ok = false; }
                     std::filesystem::remove_all(path, ec);
-                    std::printf("%s  %-9s %s %s\n", ok ? "PASS" : "FAIL", c.name, dtype+1, order);
+                    std::printf("%s  %-9s %s %s%s\n", ok ? "PASS" : "FAIL", c.name, dtype+1, order, fmt == 3 ? " v3" : "");
                     if (!ok) failures++;
+                }
                 }
             }
         }
@@ -504,10 +522,19 @@ int main(int argc, char** argv){
     // the inner chunk shape, writes into arrays whose folders are missing, shard indexes
     // at the start of the file and without a checksum (read and written), damaged shards
     // (an error, not a crash), and rewrites in which chunks become all zero (fill value
-    // 0, and 7)
+    // 0, and 7). In Zarr v2 and v3 arrays (v3 has no subfolders, and needs shard shapes
+    // that are a multiple of the inner chunk shape).
     {
         typedef std::vector<uint64_t> V;
         std::mt19937 srng(5150);
+        // the format of the arrays being tested, their metadata file, and the name of
+        // the shard file at shard indices i, j, k
+        int fmt = 2;
+        auto metaName = [&](){ return std::string(fmt == 3 ? "zarr.json" : ".zarray"); };
+        auto shardKey = [&](int i, int j, int k){
+            const std::string sep = fmt == 3 ? "/" : ".";
+            return (fmt == 3 ? "c/" : "") + std::to_string(i) + sep + std::to_string(j) + sep + std::to_string(k);
+        };
         // F-order uint16 data; zero marks inner chunks (of size `inner`) to leave empty
         auto makeData = [&](const V& shape, const V& inner, std::function<bool(const V&)> zero){
             std::vector<uint16_t> d(shape[0]*shape[1]*shape[2]);
@@ -515,12 +542,16 @@ int main(int argc, char** argv){
                 d[x + y*shape[0] + z*shape[0]*shape[1]] = zero({x/inner[0], y/inner[1], z/inner[2]}) ? 0 : (uint16_t)(1 + srng() % 60000);
             return d;
         };
+        // (sep: "." in v2 and "/" in v3 when not given)
         auto create = [&](const std::string& path, const V& shape, const V& chunks, const V& inner, const V& sub,
-                          const char* order, const std::string& fill, const char* sep = "."){
+                          const char* order, const std::string& fill, const char* sep = nullptr){
             std::error_code ec; std::filesystem::remove_all(path, ec);
             zarr Z;
-            Z.set_fileName(path); Z.set_cname("zstd"); Z.set_clevel(1); Z.set_order(order); Z.set_chunks(chunks);
-            Z.set_dtype("<u2"); Z.set_shape(shape); Z.set_fill_value(fill); Z.set_dimension_separator(sep);
+            Z.set_fileName(path);
+            if (fmt == 3) Z.set_zarr_format(3);
+            Z.set_cname("zstd"); Z.set_clevel(1); Z.set_order(order); Z.set_chunks(chunks);
+            Z.set_dtype("<u2"); Z.set_shape(shape); Z.set_fill_value(fill);
+            Z.set_dimension_separator(sep ? sep : fmt == 3 ? "/" : ".");
             if (!inner.empty()){ Z.set_shard(true); Z.set_chunk_shape(inner); }
             if (!sub.empty()) Z.set_subfolders(sub);
             Z.write_zarray();
@@ -568,7 +599,8 @@ int main(int argc, char** argv){
         auto shardFiles = [](const std::string& path){
             std::vector<std::string> out;
             for (const auto& p : std::filesystem::recursive_directory_iterator(path))
-                if (p.is_regular_file() && p.path().filename() != ".zarray") out.push_back(p.path().string());
+                if (p.is_regular_file() && p.path().filename() != ".zarray" && p.path().filename() != "zarr.json")
+                    out.push_back(p.path().string());
             return out;
         };
         auto readFile = [](const std::string& p){
@@ -579,11 +611,11 @@ int main(int argc, char** argv){
             std::ofstream(p, std::ios::binary | std::ios::trunc).write((const char*)b.data(), b.size());
         };
         // set a key of the sharding codec's configuration in the metadata
-        auto setShardConfig = [](const std::string& path, const std::string& key, const json& value){
+        auto setShardConfig = [&](const std::string& path, const std::string& key, const json& value){
             json meta;
-            { std::ifstream f(path + "/.zarray"); f >> meta; }
+            { std::ifstream f(path + "/" + metaName()); f >> meta; }
             meta["codecs"][0]["configuration"][key] = value;
-            std::ofstream(path + "/.zarray") << meta.dump();
+            std::ofstream(path + "/" + metaName()) << meta.dump();
         };
         auto check = [&](const char* name, std::function<bool()> test){
             total++;
@@ -597,9 +629,10 @@ int main(int argc, char** argv){
         const V shape = {70, 45, 33}, zero3 = {0, 0, 0};
         auto none = [](const V&){ return false; };
 
-        for (const char* order : {"F", "C"}){
-            const std::string base = dir + "/rt_shard_" + order;
-            const std::string tag = std::string(" (") + order + " order)";
+        for (const int f : {2, 3}) for (const char* order : {"F", "C"}){
+            fmt = f;
+            const std::string base = dir + "/rt_shard_" + order + (fmt == 3 ? "_v3" : "");
+            const std::string tag = std::string(" (") + order + " order" + (fmt == 3 ? ", v3)" : ")");
 
             check(("shard crop writes: unaligned, across shards, at the edge, with and without temporary files" + tag).c_str(), [&](){
                 bool ok = true;
@@ -618,10 +651,15 @@ int main(int argc, char** argv){
                         ok = ok && read(p) == exp;
                     }
                     // and no temporary files are left behind: only the metadata and the 3x2x2 shards
-                    std::set<std::string> names, want = {".zarray"};
-                    for (const auto& f : std::filesystem::directory_iterator(p)) names.insert(f.path().filename().string());
+                    std::set<std::string> names, want = {metaName()};
+                    for (const auto& f : std::filesystem::recursive_directory_iterator(p)){
+                        if (!f.is_regular_file()) continue;
+                        std::string name = f.path().string().substr(p.size() + 1);
+                        std::replace(name.begin(), name.end(), '\\', '/');
+                        names.insert(name);
+                    }
                     for (int i = 0; i < 3; i++) for (int j = 0; j < 2; j++) for (int k = 0; k < 2; k++)
-                        want.insert(std::to_string(i) + "." + std::to_string(j) + "." + std::to_string(k));
+                        want.insert(shardKey(i, j, k));
                     ok = ok && names == want;
                 }
                 return ok;
@@ -652,6 +690,11 @@ int main(int argc, char** argv){
 
             check(("shards in subfolders" + tag).c_str(), [&](){
                 const std::string p = base + "_subf.zarr";
+                // (Zarr v3 cannot describe subfolders)
+                if (fmt == 3){
+                    try { create(p, shape, {16, 16, 16}, {8, 8, 8}, {2, 2, 1}, order, "0"); return false; }
+                    catch (const std::string& e){ return e.rfind("v3Unsupported:", 0) == 0 && !fileExists(p + "/zarr.json"); }
+                }
                 create(p, shape, {16, 16, 16}, {8, 8, 8}, {2, 2, 1}, order, "0");
                 std::vector<uint16_t> exp = makeData(shape, {8, 8, 8}, none);
                 write(p, exp, zero3, shape, false, true);
@@ -666,6 +709,11 @@ int main(int argc, char** argv){
                 // so it spans 32x32x20; these regions start in a different shard than
                 // their coordinates divided by the shard shape would say
                 const std::string p = base + "_nondiv.zarr";
+                // (Zarr v3 needs whole inner chunks in a shard)
+                if (fmt == 3){
+                    try { create(p, shape, {24, 20, 15}, {16, 16, 10}, {}, order, "0"); return false; }
+                    catch (const std::string& e){ return e.rfind("v3Unsupported:", 0) == 0 && !fileExists(p + "/zarr.json"); }
+                }
                 create(p, shape, {24, 20, 15}, {16, 16, 10}, {}, order, "0");
                 std::vector<uint16_t> exp = makeData(shape, {16, 16, 10}, none);
                 write(p, exp, zero3, shape, false, true);
@@ -686,6 +734,7 @@ int main(int argc, char** argv){
                 bool ok = true;
                 for (const Layout& l : {Layout{{16, 16, 10}, {}, {}, "/"}, Layout{{32, 32, 20}, {16, 16, 10}, {}, "/"},
                                         Layout{{16, 16, 10}, {}, {2, 2, 1}, "."}, Layout{{32, 32, 20}, {16, 16, 10}, {2, 1, 2}, "/"}}){
+                    if (fmt == 3 && !l.sub.empty()) continue;
                     const std::string p = base + "_nofolders.zarr";
                     // remove the folders write_zarray made, as if another program had made the array
                     auto removeFolders = [&](){
@@ -792,7 +841,7 @@ int main(int argc, char** argv){
                 create(p, shape, {32, 32, 20}, {16, 16, 10}, {}, order, "0");
                 std::vector<uint16_t> d = makeData(shape, {16, 16, 10}, none);
                 write(p, d, zero3, shape, false, true);
-                const std::string f = p + "/1.0.0";
+                const std::string f = p + "/" + shardKey(1, 0, 0);
                 const std::vector<uint8_t> good = readFile(f);
                 const uint64_t ib = 8*16;
                 std::string e1, e2, e3;
@@ -868,12 +917,287 @@ int main(int argc, char** argv){
         if (!ok) failures++;
     }
 
+    // Zarr v3 metadata and conversion: the zarr.json of new arrays; v2 arrays cpp-zarr
+    // wrote, converted to v3 (only the metadata changes, and the attributes move into
+    // zarr.json) and written again; what cannot be converted or written as v3; a v2 write
+    // over a v3 array is refused, and a v3 one over a v2 array replaces its metadata
+    {
+        typedef std::vector<uint64_t> V;
+        auto check = [&](const char* name, std::function<bool()> test){
+            total++;
+            bool ok = false;
+            try { ok = test(); }
+            catch (const std::string& e) { std::fprintf(stderr, "    exception: %s\n", e.c_str()); }
+            catch (const std::exception& e) { std::fprintf(stderr, "    exception: %s\n", e.what()); }
+            std::printf("%s  %s\n", ok ? "PASS" : "FAIL", name);
+            if (!ok) failures++;
+        };
+        auto readJson = [](const std::string& p){ std::ifstream f(p); return json::parse(f); };
+        // every file of an array but its metadata, with its contents
+        auto chunkFiles = [](const std::string& p){
+            std::vector<std::pair<std::string, std::string>> files;
+            for (const auto& f : std::filesystem::recursive_directory_iterator(p)){
+                const std::string name = f.path().filename().string();
+                if (!f.is_regular_file() || name == ".zarray" || name == "zarr.json" || name == ".zattrs") continue;
+                std::ifstream in(f.path().string(), std::ios::binary);
+                files.push_back({f.path().string(), std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>())});
+            }
+            std::sort(files.begin(), files.end());
+            return files;
+        };
+        struct Made { std::string path; V shape; std::vector<uint8_t> data; uint64_t bytes; };
+        // an array with random data (F order); sharded when inner is given. Over what is
+        // at its path, unless fresh.
+        auto make = [&](const std::string& name, int fmt, const V& shape, const V& chunks, const V& inner, const char* order,
+                        const char* comp, const char* sep, const char* dtype, const std::string& fill = "0", bool fresh = true){
+            Made m{dir + "/rt_v3_" + name + ".zarr", shape, {}, (uint64_t)(dtype[2] - '0')};
+            std::error_code ec;
+            if (fresh) std::filesystem::remove_all(m.path, ec);
+            zarr Z;
+            Z.set_fileName(m.path);
+            if (fmt == 3) Z.set_zarr_format(3);
+            Z.set_cname(comp); Z.set_order(order); Z.set_chunks(chunks); Z.set_dimension_separator(sep);
+            Z.set_dtype(dtype); Z.set_shape(shape); Z.set_fill_value(fill);
+            if (!inner.empty()){ Z.set_shard(true); Z.set_chunk_shape(inner); }
+            Z.write_zarray();
+            uint64_t count = 1;
+            for (uint64_t v : shape) count *= v;
+            m.data.resize(count * m.bytes);
+            for (auto& b : m.data) b = (uint8_t)byteDist(rng);
+            const V zeros(shape.size(), 0);
+            Z.set_chunkInfo(zeros, shape);
+            if (parallelWriteZarr(Z, m.data.data(), zeros, shape, shape, m.bytes * 8, true, false, false))
+                throw std::string("write: ") + Z.get_errString();
+            return m;
+        };
+        auto readsBack = [&](const Made& m){
+            zarr Z(m.path);
+            const V zeros(m.shape.size(), 0);
+            void* d = parallelReadZarrWriteWrapper(Z, false, zeros, m.shape);
+            const bool same = d && !std::memcmp(d, m.data.data(), m.data.size());
+            free(d);
+            return same;
+        };
+
+        check("Zarr v3 metadata of new arrays (C order, '/' keys by default; F order, shards, gzip, fill values)", [&](){
+            zarr D;
+            D.set_zarr_format(3);
+            bool ok = D.get_order() == "C" && D.get_dimension_separator() == "/" && D.get_zarr_format() == 3;
+            // (an array set to v3 but not written yet has v2-style metadata in memory)
+            ok = ok && D.chunkKey("0.0.0") == "0.0.0" && !D.get_chunkChecksum() && D.get_chunkAxisOrder().size() == 3;
+            try { D.set_zarr_format(4); ok = false; } catch (const std::string& e){ ok = ok && e.rfind("zarrFormatUnsupported:", 0) == 0; }
+
+            Made a = make("meta_default", 3, {20, 10, 6}, {8, 8, 6}, {}, "C", "zstd", "/", "<u2");
+            json m = readJson(a.path + "/zarr.json");
+            ok = ok && m.at("zarr_format") == 3 && m.at("node_type") == "array" && m.at("shape") == json({20, 10, 6}) &&
+                 m.at("data_type") == "uint16" && m.at("chunk_grid") == json({{"name", "regular"}, {"configuration", {{"chunk_shape", {8, 8, 6}}}}}) &&
+                 m.at("chunk_key_encoding") == json({{"name", "default"}, {"configuration", {{"separator", "/"}}}}) &&
+                 m.at("fill_value") == 0 && m.at("attributes") == json::object() &&
+                 m.at("codecs") == json::parse(R"([{"name": "bytes", "configuration": {"endian": "little"}},
+                    {"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5, "shuffle": "shuffle", "typesize": 2, "blocksize": 0}}])") &&
+                 fileExists(a.path + "/c/2/1/0") && !fileExists(a.path + "/.zarray") && readsBack(a);
+
+            Made b = make("meta_sharded_f", 3, {20, 10, 6}, {16, 8, 6}, {8, 4, 3}, "F", "gzip", ".", "<f4", "NaN");
+            m = readJson(b.path + "/zarr.json");
+            ok = ok && m.at("data_type") == "float32" && m.at("fill_value") == "NaN" &&
+                 m.at("chunk_key_encoding") == json({{"name", "default"}, {"configuration", {{"separator", "."}}}}) &&
+                 m.at("codecs") == json::parse(R"([{"name": "sharding_indexed", "configuration": {"chunk_shape": [8, 4, 3],
+                    "codecs": [{"name": "transpose", "configuration": {"order": [2, 1, 0]}}, {"name": "bytes", "configuration": {"endian": "little"}},
+                               {"name": "gzip", "configuration": {"level": 5}}],
+                    "index_codecs": [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "crc32c"}],
+                    "index_location": "end"}}])") &&
+                 fileExists(b.path + "/c.1.1.0") && readsBack(b);
+
+            // 1-byte types have no byte order, uncompressed chunks no compressor; a 0-D
+            // array's one chunk is "c"
+            Made c = make("meta_int8", 3, {5, 4}, {4, 4}, {}, "C", "none", "/", "<i1", "-3");
+            m = readJson(c.path + "/zarr.json");
+            ok = ok && m.at("data_type") == "int8" && m.at("fill_value") == -3 && m.at("codecs") == json::parse(R"([{"name": "bytes"}])") && readsBack(c);
+            Made d = make("meta_0d", 3, {}, {}, {}, "C", "lz4", "/", "<f8", "1.5");
+            m = readJson(d.path + "/zarr.json");
+            ok = ok && m.at("shape") == json::array() && m.at("fill_value") == 1.5 && fileExists(d.path + "/c") && readsBack(d);
+            for (const Made* x : {&a, &b, &c, &d}){ std::error_code ec; std::filesystem::remove_all(x->path, ec); }
+            return ok;
+        });
+
+        check("shard and inner chunk shapes set before the shape (as the MATLAB and Python writers do) keep every axis", [&](){
+            bool ok = true;
+            for (const int fmt : {2, 3}) for (const V& shape : {V{8, 12, 16, 20}, V{6, 8, 10, 12, 14}}){
+                const uint64_t n = shape.size();
+                V shards(n), inner(n);
+                for (uint64_t d = 0; d < n; d++){ inner[d] = 2 + d; shards[d] = 2*inner[d]; }
+                const std::string p = dir + "/rt_v3_axes.zarr";
+                std::error_code ec; std::filesystem::remove_all(p, ec);
+                zarr Z;
+                Z.set_fileName(p);
+                if (fmt == 3) Z.set_zarr_format(3);
+                Z.set_chunks(shards); Z.set_shard(true); Z.set_chunk_shape(inner);
+                Z.set_shape(shape); Z.set_dtype("<u2");
+                Z.write_zarray();
+                const json m = readJson(p + (fmt == 3 ? "/zarr.json" : "/.zarray"));
+                const json gotShards = fmt == 3 ? m.at("chunk_grid").at("configuration").at("chunk_shape") : m.at("chunks");
+                ok = ok && gotShards == json(shards) && m.at("codecs").at(0).at("configuration").at("chunk_shape") == json(inner);
+                // and the data round trips
+                uint64_t count = 1;
+                for (uint64_t v : shape) count *= v;
+                Made a{p, shape, std::vector<uint8_t>(count*2), 2};
+                for (auto& b : a.data) b = (uint8_t)byteDist(rng);
+                const V zeros(n, 0);
+                Z.set_chunkInfo(zeros, shape);
+                ok = ok && parallelWriteZarr(Z, a.data.data(), zeros, shape, shape, 16, true, false, false) == 0 && readsBack(a);
+                std::filesystem::remove_all(p, ec);
+            }
+            return ok;
+        });
+
+        check("v2 arrays converted to Zarr v3 keep their chunk files, read the same and can be written", [&](){
+            struct Conv { const char* name; V shape, chunks, inner; const char* order; const char* comp; const char* sep; const char* dtype; const char* fill; };
+            const Conv convs[] = {
+                {"f_dot_lz4", {30, 20, 7}, {16, 8, 4}, {}, "F", "lz4", ".", "<u2", "0"},
+                {"c_slash_zstd", {30, 20, 7}, {16, 8, 4}, {}, "C", "zstd", "/", "<i4", "7"},
+                {"f_gzip", {30, 20, 7}, {16, 8, 4}, {}, "F", "gzip", ".", "<f8", "0"},
+                {"c_none", {30, 20, 7}, {16, 8, 4}, {}, "C", "none", ".", "<u1", "0"},
+                {"sharded_f", {30, 20, 7}, {16, 8, 4}, {8, 4, 2}, "F", "zstd", ".", "<u2", "0"},
+                {"sharded_c_slash", {30, 20, 7}, {32, 16, 8}, {16, 8, 4}, "C", "lz4", "/", "<f4", "0"},
+                {"1d", {1000}, {128}, {}, "F", "zstd", ".", "<u8", "0"},
+                {"4d", {5, 6, 7, 8}, {2, 4, 4, 3}, {}, "F", "zlib", ".", "<i2", "0"},
+                {"0d", {}, {}, {}, "F", "lz4", ".", "<f4", "0"},
+            };
+            bool ok = true;
+            for (const Conv& c : convs){
+                Made m = make(std::string("conv_") + c.name, 2, c.shape, c.chunks, c.inner, c.order, c.comp, c.sep, c.dtype, c.fill);
+                std::ofstream(m.path + "/.zattrs") << R"({"units": "um", "n": 3})";
+                const auto before = chunkFiles(m.path);
+                zarr Z(m.path);
+                Z.convert_to_v3();
+                const json meta = readJson(m.path + "/zarr.json");
+                bool good = Z.get_zarr_format() == 3 && !fileExists(m.path + "/.zarray") && !fileExists(m.path + "/.zattrs") &&
+                            meta.at("attributes") == json({{"units", "um"}, {"n", 3}}) && meta.at("chunk_key_encoding").at("name") == "v2" &&
+                            chunkFiles(m.path) == before && zarr(m.path).get_zarr_format() == 3 && readsBack(m);
+                // and written again (a region, in its v2-named chunk files)
+                const uint64_t n = c.shape.size();
+                if (good && n){
+                    V s(n), e(n), ws(n);
+                    uint64_t pc = 1;
+                    for (uint64_t d = 0; d < n; d++){ s[d] = c.shape[d] / 3; e[d] = c.shape[d] - c.shape[d] / 4; ws[d] = e[d] - s[d]; pc *= ws[d]; }
+                    std::vector<uint8_t> patch(pc * m.bytes);
+                    for (auto& b : patch) b = (uint8_t)byteDist(rng);
+                    for (uint64_t i = 0; i < pc; i++){
+                        uint64_t r = i, off = 0, stride = 1;
+                        for (uint64_t d = 0; d < n; d++){ off += (s[d] + r % ws[d]) * stride; r /= ws[d]; stride *= c.shape[d]; }
+                        std::memcpy(&m.data[off * m.bytes], &patch[i * m.bytes], m.bytes);
+                    }
+                    zarr W(m.path);
+                    W.set_chunkInfo(s, e);
+                    good = parallelWriteZarr(W, patch.data(), s, e, ws, m.bytes * 8, true, true, false) == 0 && readsBack(m) &&
+                           chunkFiles(m.path).size() == before.size();
+                }
+                if (!good) std::fprintf(stderr, "    conversion %s failed\n", c.name);
+                ok = ok && good;
+                std::error_code ec; std::filesystem::remove_all(m.path, ec);
+            }
+            return ok;
+        });
+
+        check("conversion keeps negative zstd levels and removes an empty .zattrs; rewritten metadata takes a new order", [&](){
+            // a v2 array with numcodecs Zstd at level -3 (as zarr-python writes it)
+            const std::string p = dir + "/rt_v3_zstd_negative.zarr";
+            std::error_code ec; std::filesystem::remove_all(p, ec);
+            std::filesystem::create_directories(p);
+            std::ofstream(p + "/.zarray") << R"({"chunks": [8, 8, 8], "compressor": {"id": "zstd", "level": -3, "checksum": false},
+                "dimension_separator": ".", "dtype": "<u2", "fill_value": 0, "filters": null, "order": "C", "shape": [20, 10, 6],
+                "zarr_format": 2})";
+            std::ofstream(p + "/.zattrs") << "{}";
+            Made m{p, {20, 10, 6}, std::vector<uint8_t>(20*10*6*2), 2};
+            for (auto& b : m.data) b = (uint8_t)byteDist(rng);
+            zarr W(p);
+            W.set_chunkInfo({0, 0, 0}, m.shape);
+            bool ok = parallelWriteZarr(W, m.data.data(), {0, 0, 0}, m.shape, m.shape, 16, true, false, false) == 0;
+            zarr(p).convert_to_v3();
+            json meta = readJson(p + "/zarr.json");
+            ok = ok && meta.at("codecs").back() == json({{"name", "zstd"}, {"configuration", {{"level", -3}, {"checksum", false}}}}) &&
+                 !fileExists(p + "/.zattrs") && !fileExists(p + "/.zarray") && readsBack(m);
+            std::filesystem::remove_all(p, ec);
+            // an F-order v3 array whose metadata is rewritten in C order (as a full
+            // rewrite from MATLAB with 'order', 'C' does): no transpose
+            Made f = make("rewrite_order", 3, {20, 10, 6}, {8, 8, 6}, {}, "F", "lz4", "/", "<u2");
+            ok = ok && readJson(f.path + "/zarr.json").dump().find("transpose") != std::string::npos;
+            zarr R(f.path);
+            R.set_order("C");
+            R.write_zarray();
+            ok = ok && readJson(f.path + "/zarr.json").dump().find("transpose") == std::string::npos && R.get_chunkAxisOrder() == V({0, 1, 2});
+            std::filesystem::remove_all(f.path, ec);
+            return ok;
+        });
+
+        check("what Zarr v3 cannot describe is refused, and changes nothing", [&](){
+            bool ok = true;
+            // conversion: subfolders, shard shapes that are not a multiple of the inner
+            // chunk shape, and an array that is already v3
+            for (int k = 0; k < 2; k++){
+                const std::string p = dir + "/rt_v3_refused.zarr";
+                std::error_code ec; std::filesystem::remove_all(p, ec);
+                zarr Z;
+                Z.set_fileName(p); Z.set_shape({30, 20, 7}); Z.set_chunks({16, 8, 4});
+                if (k == 0) Z.set_subfolders({2, 1, 1});
+                else { Z.set_shard(true); Z.set_chunk_shape({6, 8, 4}); }
+                Z.write_zarray();
+                const std::string meta = readJson(p + "/.zarray").dump();
+                zarr R(p);
+                try { R.convert_to_v3(); ok = false; }
+                catch (const std::string& e){ ok = ok && e.rfind("v3Unsupported:", 0) == 0; }
+                ok = ok && readJson(p + "/.zarray").dump() == meta && !fileExists(p + "/zarr.json");
+                // nor written as v3 from the start
+                std::filesystem::remove_all(p, ec);
+                Z.set_zarr_format(3);
+                try { Z.write_zarray(); ok = false; }
+                catch (const std::string& e){ ok = ok && e.rfind("v3Unsupported:", 0) == 0; }
+                ok = ok && !fileExists(p + "/zarr.json");
+                std::filesystem::remove_all(p, ec);
+            }
+            Made v3 = make("refused_v3", 3, {10, 7, 5}, {4, 4, 5}, {}, "C", "lz4", "/", "<u2");
+            zarr Z3(v3.path);
+            try { Z3.convert_to_v3(); ok = false; }
+            catch (const std::string& e){ ok = ok && e.rfind("v3Unsupported:", 0) == 0; }
+            // an unknown compressor
+            zarr B;
+            B.set_fileName(dir + "/rt_v3_badcname.zarr"); B.set_zarr_format(3); B.set_cname("snappy"); B.set_shape({4, 4, 4});
+            try { B.write_zarray(); ok = false; }
+            catch (const std::string& e){ ok = ok && e == "unsupportedCompressor"; }
+            // a v2 write over a v3 array is refused before anything changes
+            const auto before = chunkFiles(v3.path);
+            const std::string meta = readJson(v3.path + "/zarr.json").dump();
+            zarr N;
+            N.set_fileName(v3.path); N.set_shape({10, 7, 5});
+            try { N.write_zarray(); ok = false; }
+            catch (const std::string& e){ ok = ok && e.rfind("zarrV3NotWritable:", 0) == 0; }
+            ok = ok && chunkFiles(v3.path) == before && readJson(v3.path + "/zarr.json").dump() == meta && !fileExists(v3.path + "/.zarray") &&
+                 readsBack(v3);
+            std::error_code ec; std::filesystem::remove_all(v3.path, ec);
+            return ok;
+        });
+
+        check("a Zarr v3 array written over a v2 one replaces its .zarray, keeping its attributes", [&](){
+            Made v2 = make("over_v2", 2, {10, 7, 5}, {4, 4, 5}, {}, "F", "lz4", ".", "<u2");
+            std::ofstream(v2.path + "/.zattrs") << R"({"a": [1, 2]})";
+            Made v3 = make("over_v2", 3, {10, 7, 5}, {4, 4, 5}, {}, "C", "zstd", "/", "<u2", "0", false);
+            (void)v2;
+            const json m = readJson(v3.path + "/zarr.json");
+            bool ok = !fileExists(v3.path + "/.zarray") && !fileExists(v3.path + "/.zattrs") && m.at("attributes") == json({{"a", {1, 2}}}) &&
+                      readsBack(v3);
+            // and rewritten as v3 again, it keeps them
+            Made again = make("over_v2", 3, {10, 7, 5}, {4, 4, 5}, {}, "F", "gzip", ".", "<u2", "0", false);
+            ok = ok && readJson(again.path + "/zarr.json").at("attributes") == json({{"a", {1, 2}}}) && readsBack(again);
+            std::error_code ec; std::filesystem::remove_all(v3.path, ec);
+            return ok;
+        });
+    }
+
     // Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays, made by
     // tests/make_test_arrays.py): Zarr v3 arrays, and v2 arrays with codecs and fill
     // values cpp-zarr does not write itself. Full reads in C and F order and a region read
     // must match the values zarr-python reads, and the arrays cpp-zarr cannot read must
-    // be rejected with an error that names the reason. Writing into a v3 array (a copy)
-    // must fail before anything is written.
+    // be rejected with an error that names the reason. Then writes into copies of them.
     {
 #ifdef CPPZARR_TEST_ARRAYS
         const std::string v3dir = CPPZARR_TEST_ARRAYS;
@@ -962,47 +1286,177 @@ int main(int argc, char** argv){
                 if (!ok) failures++;
             }
 
-            // Writing into a Zarr v3 array is refused before anything is written. (The array is
-            // copied file by file with streams: on macOS, std::filesystem::copy aborts in this
-            // program, which has Homebrew's libstdc++ next to the copy libcppZarr exports.)
-            total++;
-            const std::string src = v3dir + "/v3_blosc_zstd_uint16.zarr", copy = dir + "/rt_v3_write.zarr";
-            std::error_code ec;
-            bool ok = true;
-            try{
-                std::filesystem::remove_all(copy, ec);
+            // Writes into copies of the test arrays, which cpp-zarr did not make: a region
+            // (partly covering chunks, and shards in the sharded arrays), then the whole
+            // array, read back by cpp-zarr; every codec, chunk key encoding, axis order and
+            // shard layout above. Arrays in the opposite byte order are refused before
+            // anything is written. Then the v2 arrays are converted to Zarr v3 (numcodecs
+            // zlib cannot be) and read and written again, and rewriting a v3 array's
+            // metadata keeps its chunk key encoding, checksums, axis order and attributes.
+            // (Arrays are copied file by file with streams: on macOS, std::filesystem::copy
+            // aborts in this program, which has Homebrew's libstdc++ next to the copy
+            // libcppZarr exports.)
+            auto copyArray = [](const std::string& src, const std::string& to){
+                std::error_code ec;
+                std::filesystem::remove_all(to, ec);
+                std::filesystem::create_directories(to);
                 for (const auto& f : std::filesystem::recursive_directory_iterator(src)){
-                    const std::string to = copy + f.path().string().substr(src.size());
-                    std::filesystem::create_directories(f.is_directory() ? std::filesystem::path(to) : std::filesystem::path(to).parent_path());
-                    if (f.is_directory()) continue;
+                    const std::string t = to + f.path().string().substr(src.size());
+                    if (f.is_directory()){ std::filesystem::create_directories(t); continue; }
                     std::ifstream in(f.path().string(), std::ios::binary);
-                    std::ofstream out(to, std::ios::binary);
+                    std::ofstream out(t, std::ios::binary);
                     out << in.rdbuf();
                 }
-                auto listing = [&](){
-                    std::vector<std::string> files;
-                    for (const auto& f : std::filesystem::recursive_directory_iterator(copy)) files.push_back(f.path().string());
-                    std::sort(files.begin(), files.end());
-                    return files;
+            };
+            // every file of an array, with its contents
+            auto snapshot = [](const std::string& p){
+                std::vector<std::pair<std::string, std::string>> files;
+                for (const auto& f : std::filesystem::recursive_directory_iterator(p)){
+                    if (!f.is_regular_file()) continue;
+                    std::ifstream in(f.path().string(), std::ios::binary);
+                    files.push_back({f.path().string(), std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>())});
+                }
+                std::sort(files.begin(), files.end());
+                return files;
+            };
+            auto readText = [](const std::string& p){
+                std::ifstream in(p, std::ios::binary);
+                return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            };
+            std::mt19937 wrng(20261002u);
+            for (const json& fx : manifest.at("arrays")){
+                if (fx.contains("error")) continue;
+                total++;
+                const std::string name = fx.at("name"), path = dir + "/rt_ta_" + name + ".zarr";
+                const std::string dt = fx.at("dtype");
+                const std::vector<uint64_t> shape = fx.at("shape").get<std::vector<uint64_t>>();
+                const uint64_t nd = shape.size(), bytes = dt[2] - '0';
+                uint64_t count = 1;
+                for (uint64_t v : shape) count *= v;
+                std::ifstream bf(v3dir + "/" + name + ".bin", std::ios::binary);
+                std::vector<uint8_t> exp((std::istreambuf_iterator<char>(bf)), std::istreambuf_iterator<char>());
+                bool ok = exp.size() == count * bytes;
+                std::string detail;
+                // new values, F order (booleans 0 or 1)
+                auto values = [&](uint64_t n){
+                    std::vector<uint8_t> v(n * bytes);
+                    for (auto& b : v) b = dt[1] == 'b' ? (uint8_t)(wrng() & 1) : (uint8_t)wrng();
+                    return v;
                 };
-                const std::vector<std::string> before = listing();
-                zarr Z(copy);
-                std::vector<uint16_t> d(10*7*5, 1);
-                Z.set_chunkInfo({0, 0, 0}, {10, 7, 5});
-                ok = before.size() > 1 && parallelWriteZarr(Z, d.data(), {0, 0, 0}, {10, 7, 5}, {10, 7, 5}, 16, true, false, true) == 1 &&
-                     Z.get_errString().find("not supported yet") != std::string::npos;
-                zarr N;
-                N.set_fileName(copy);
-                N.set_shape({10, 7, 5});
-                try { N.write_zarray(); ok = false; }
-                catch (const std::string& e){ ok = ok && e.find("zarrV3NotWritable") == 0; }
-                ok = ok && listing() == before;
+                // put an F-order region [s, e) into exp (C order)
+                auto paste = [&](const std::vector<uint8_t>& f, const std::vector<uint64_t>& s, const std::vector<uint64_t>& e){
+                    uint64_t n = 1;
+                    for (uint64_t d = 0; d < nd; d++) n *= e[d] - s[d];
+                    for (uint64_t i = 0; i < n; i++){
+                        uint64_t r = i, off = 0;
+                        std::vector<uint64_t> idx(nd);
+                        for (uint64_t d = 0; d < nd; d++){ idx[d] = s[d] + r % (e[d] - s[d]); r /= e[d] - s[d]; }
+                        for (uint64_t d = 0; d < nd; d++) off = off * shape[d] + idx[d];
+                        std::memcpy(&exp[off * bytes], &f[i * bytes], bytes);
+                    }
+                };
+                // the whole array read by cpp-zarr matches exp (NaN equal to NaN)
+                auto matches = [&](const std::string& p){
+                    zarr Z(p);
+                    const std::vector<uint64_t> zeros(nd, 0);
+                    uint8_t* got = (uint8_t*)parallelReadZarrWriteWrapper(Z, false, zeros, shape, true);
+                    bool same = got != nullptr;
+                    for (uint64_t i = 0; same && i < count; i++){
+                        const uint8_t *a = got + i * bytes, *b = &exp[i * bytes];
+                        same = !std::memcmp(a, b, bytes);
+                        if (!same && dt[1] == 'f'){
+                            if (bytes == 4){ float x, y; std::memcpy(&x, a, 4); std::memcpy(&y, b, 4); same = std::isnan(x) && std::isnan(y); }
+                            else { double x, y; std::memcpy(&x, a, 8); std::memcpy(&y, b, 8); same = std::isnan(x) && std::isnan(y); }
+                        }
+                    }
+                    free(got);
+                    return same;
+                };
+                // write F-order data into the region [s, e) (the whole array when not crop)
+                auto writeRegion = [&](const std::string& p, const std::vector<uint8_t>& f, const std::vector<uint64_t>& s,
+                                       const std::vector<uint64_t>& e, bool crop, std::string* err){
+                    zarr Z(p);
+                    std::vector<uint64_t> ws(nd);
+                    for (uint64_t d = 0; d < nd; d++) ws[d] = e[d] - s[d];
+                    Z.set_chunkInfo(s, e);
+                    const bool failed = parallelWriteZarr(Z, (void*)f.data(), s, e, ws, bytes * 8, true, crop, true) != 0;
+                    if (failed && err) *err = Z.get_errString();
+                    return !failed;
+                };
+                try{
+                    copyArray(v3dir + "/" + name + ".zarr", path);
+                    const std::string metaFile = path + (name.rfind("v3_", 0) == 0 ? "/zarr.json" : "/.zarray");
+                    const std::string meta = readText(metaFile);
+                    std::vector<uint64_t> s(nd), e(nd), zeros(nd, 0);
+                    uint64_t n = 1;
+                    for (uint64_t d = 0; d < nd; d++){
+                        s[d] = shape[d] > 2 ? 1 : 0; e[d] = shape[d] > 2 ? shape[d] - 1 : shape[d];
+                        n *= e[d] - s[d];
+                    }
+                    const std::vector<uint8_t> patch = values(n);
+                    if (oppositeEndianness(zarr(path).get_dtype())){
+                        // refused, and nothing changes
+                        const auto before = snapshot(path);
+                        std::string err;
+                        ok = ok && !writeRegion(path, patch, s, e, nd > 0, &err) && err.find("byte order") != std::string::npos &&
+                             snapshot(path) == before;
+                        if (!ok) detail = "write into an array in the opposite byte order: " + err;
+                    }
+                    else{
+                        std::string err;
+                        ok = ok && writeRegion(path, patch, s, e, nd > 0, &err);
+                        paste(patch, s, e);
+                        ok = ok && matches(path) && readText(metaFile) == meta;
+                        if (!ok && detail.empty()) detail = "region write: " + err;
+                        const std::vector<uint8_t> all = values(count);
+                        ok = ok && writeRegion(path, all, zeros, shape, false, &err);
+                        paste(all, zeros, shape);
+                        ok = ok && matches(path) && readText(metaFile) == meta;
+                        if (!ok && detail.empty()) detail = "whole array write: " + err;
+                        // a v2 array converted to Zarr v3 reads the same and can be written
+                        if (ok && name.rfind("v2_", 0) == 0){
+                            zarr Z(path);
+                            bool converted = false;
+                            try { Z.convert_to_v3(); converted = true; }
+                            catch (const std::string& x){
+                                // (numcodecs zlib streams have no Zarr v3 codec)
+                                ok = name.find("zlib") != std::string::npos && x.rfind("v3Unsupported:", 0) == 0 &&
+                                     readText(metaFile) == meta && !fileExists(path + "/zarr.json");
+                                if (!ok) detail = "conversion: " + x;
+                            }
+                            if (converted){
+                                ok = name.find("zlib") == std::string::npos && !fileExists(metaFile) &&
+                                     zarr(path).get_zarr_format() == 3 && matches(path);
+                                const std::vector<uint8_t> patch2 = values(n);
+                                ok = ok && writeRegion(path, patch2, s, e, nd > 0, &err);
+                                paste(patch2, s, e);
+                                ok = ok && matches(path);
+                                if (!ok && detail.empty()) detail = "converted array: " + err;
+                            }
+                        }
+                        // rewriting a v3 array's metadata (with attributes and dimension names
+                        // added) keeps what describes its chunks, and its attributes
+                        if (ok && name.rfind("v3_", 0) == 0){
+                            json m = json::parse(meta);
+                            m["attributes"] = {{"note", "kept"}};
+                            if (nd) m["dimension_names"] = std::vector<std::string>(nd, "axis");
+                            std::ofstream(path + "/zarr.json") << m.dump();
+                            zarr(path).write_zarray();
+                            const json r = json::parse(readText(path + "/zarr.json"));
+                            ok = r.at("attributes") == m.at("attributes") && r.value("dimension_names", json()) == m.value("dimension_names", json()) &&
+                                 r.at("chunk_key_encoding").at("name") == m.at("chunk_key_encoding").at("name") &&
+                                 r.at("shape") == m.at("shape") && r.at("data_type") == m.at("data_type") && matches(path);
+                            if (!ok) detail = "rewritten metadata: " + r.dump();
+                        }
+                    }
+                }
+                catch (const std::string& x){ ok = false; detail = x; }
+                catch (const std::exception& x){ ok = false; detail = x.what(); }
+                std::printf("%s  writes into test array %s%s%s\n", ok ? "PASS" : "FAIL", name.c_str(), ok ? "" : ": ", detail.c_str());
+                if (!ok) failures++;
+                std::error_code ec;
+                std::filesystem::remove_all(path, ec);
             }
-            catch (const std::exception& e){ ok = false; std::fprintf(stderr, "    %s\n", e.what()); }
-            catch (...){ ok = false; }
-            std::printf("%s  writes into a Zarr v3 array are refused and change nothing\n", ok ? "PASS" : "FAIL");
-            if (!ok) failures++;
-            std::filesystem::remove_all(copy, ec);
         }
     }
 

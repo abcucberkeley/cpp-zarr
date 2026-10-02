@@ -22,6 +22,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // Per-axis options are fit to the number of dimensions after all options are read
     std::vector<uint64_t> chunksVals, subfoldersVals, chunkShapeVals;
     bool hasChunks = false, hasSubfolders = false, hasChunkShape = false;
+    // Applied after the Zarr format, which sets their Zarr v3 defaults
+    uint64_t zarrFormat = 0;
+    std::string order, dimension_separator;
 
     for(int i = 1; i < nrhs; i+=2){
         if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);
@@ -62,21 +65,15 @@ void mexFunction(int nlhs, mxArray *plhs[],
             Zarr.set_dtype(dtype);
         }
         else if(currInput == "order"){
-            if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","order must be a string\n");
-            std::string order = mxArrayToString(prhs[i+1]);
-            if(order.size() > 1) mexErrMsgIdAndTxt("zarr:inputError","order must be of length 1\n");
-            if(order[0] != 'F' || order[0] != 'C' || order[0] != 'f' || order[0] != 'c'){
-                if(order[0] == 'f') order = "F";
-                else if(order [0] == 'c') order = "C";
-            }
-            else mexErrMsgIdAndTxt("zarr:inputError","order must be \"F\" or \"C\"\n");
-            Zarr.set_order(order);
+            order = mexOrder(prhs[i+1]);
         }
         else if(currInput == "dimension_separator"){
             if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a string\n");
-            const std::string dimension_separator(mxArrayToString(prhs[i+1]));
+            dimension_separator = mxArrayToString(prhs[i+1]);
             if(dimension_separator != "." && dimension_separator != "/") mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a . or /\n");
-            Zarr.set_dimension_separator(dimension_separator);
+        }
+        else if(currInput == "zarr_format"){
+            zarrFormat = mexZarrFormat(prhs[i+1]);
         }
         else if(currInput == "shape"){
             const std::vector<uint64_t> shape = mexVector(prhs[i+1]);
@@ -97,9 +94,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: chunks, cname, dtype, order, shape, clevel, subfolders, chunk_shape\n",currInput.c_str());
+            Currently Supported Names: chunks, cname, dtype, order, dimension_separator, shape, clevel, subfolders, chunk_shape, zarr_format\n",currInput.c_str());
         }
     }
+
+    // The Zarr format: as given, or that of the array already at this path (2 for
+    // a new one). Zarr v3 defaults to C order and "/" (chunk files c/0/0/0).
+    // (set_fileName expanded a leading ~)
+    const std::string &folderName = Zarr.get_fileName();
+    if(!zarrFormat && !fileExists(folderName+"/.zarray") && fileExists(folderName+"/zarr.json")) zarrFormat = 3;
+    if(zarrFormat) Zarr.set_zarr_format(zarrFormat);
+    if(!order.empty()) Zarr.set_order(order);
+    if(!dimension_separator.empty()) Zarr.set_dimension_separator(dimension_separator);
 
     const uint64_t nDims = Zarr.get_ndims();
     if(hasSubfolders) Zarr.set_subfolders(mexFitAxes(subfoldersVals, nDims, "subfolders"));

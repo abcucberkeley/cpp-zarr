@@ -412,6 +412,70 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     return 0;
 }
 
+uint8_t decodeChunk(const std::string &compressor, const bool chunkChecksum,
+                    const void* src, uint64_t srcLen, void* dst, const uint64_t dstLen,
+                    std::string &why){
+    const uint8_t* in = static_cast<const uint8_t*>(src);
+    if(chunkChecksum){
+        uint32_t stored = 0;
+        if(srcLen >= 4) memcpy(&stored, in+srcLen-4, 4);
+        if(srcLen < 4 || stored != crc32c(in, (size_t)srcLen-4)){
+            why = "does not match its checksum (it may be damaged)";
+            return 1;
+        }
+        srcLen -= 4;
+    }
+    if(compressor == "none"){
+        if(srcLen != dstLen){
+            why = "is "+std::to_string(srcLen)+" bytes instead of "+std::to_string(dstLen);
+            return 1;
+        }
+        memcpy(dst, in, dstLen);
+        return 0;
+    }
+    if(compressor == "zstd"){
+        const size_t n = ZSTD_decompress(dst, dstLen, in, srcLen);
+        if(ZSTD_isError(n) || n != dstLen){
+            why = "could not be decompressed (zstd)";
+            return 1;
+        }
+        return 0;
+    }
+    if(compressor == "blosc"){
+        blosc2_dparams dparams = {1,NULL,NULL,NULL};
+        blosc2_context* dctx = blosc2_create_dctx(dparams);
+        const int n = blosc2_decompress_ctx(dctx, in, (int32_t)srcLen, dst, (int32_t)dstLen);
+        blosc2_free_ctx(dctx);
+        if(n != (int)dstLen){
+            why = "could not be decompressed (blosc error "+std::to_string(n)+")";
+            return 1;
+        }
+        return 0;
+    }
+    if(compressor == "gzip"){
+        // gzip or zlib streams (header detected), possibly several gzip members
+        z_stream stream;
+        memset(&stream, 0, sizeof(stream));
+        uint64_t used = 0, made = 0;
+        while(used < srcLen){
+            if(inflateInit2(&stream, 32) != Z_OK){ why = "could not be decompressed (zlib)"; return 1; }
+            stream.next_in = const_cast<uint8_t*>(in)+used;
+            stream.avail_in = (uInt)(srcLen-used);
+            stream.next_out = static_cast<uint8_t*>(dst)+made;
+            stream.avail_out = (uInt)(dstLen-made);
+            const int r = inflate(&stream, Z_FINISH);
+            used = srcLen-stream.avail_in;
+            made = dstLen-stream.avail_out;
+            inflateEnd(&stream);
+            if(r != Z_STREAM_END){ why = "could not be decompressed (zlib error "+std::to_string(r)+")"; return 1; }
+        }
+        if(made != dstLen){ why = "decompressed to "+std::to_string(made)+" bytes instead of "+std::to_string(dstLen); return 1; }
+        return 0;
+    }
+    why = "uses the \""+compressor+"\" compressor, which is not supported";
+    return 1;
+}
+
 // TODO: FIX MEMORY LEAKS
 // Wrapper used by parallelWriteZarr
 void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,

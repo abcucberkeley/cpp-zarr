@@ -14,6 +14,7 @@
 #include "helperfunctions.h"
 #include "zarr.h"
 #include "zlib.h"
+#include "zstd.h"
 
 // Open a chunk or shard file for writing, making its folder first if it is missing
 // (an array whose metadata another program wrote may not have its folders yet)
@@ -53,18 +54,18 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         Zarr.set_errString("Sharding is not supported for 0-dimensional arrays\n");
         return 1;
     }
-    // Only what the writer produces can be written: not Zarr v3 arrays (yet), and
-    // not v2 arrays read with another compressor (numcodecs zlib or zstd) or byte
-    // order (big-endian on this machine), which would end up with mixed chunks
-    if(Zarr.get_zarr_format() == 3){
-        Zarr.set_errString("Writing Zarr v3 arrays is not supported yet: "+Zarr.get_fileName()+"\n");
-        return 1;
-    }
+    // Chunks are written exactly as the array's metadata (v2 or v3) says: its
+    // compressor (blosc, gzip, numcodecs zlib, zstd or none) and a crc32c checksum
+    // after each chunk if it has one. Arrays in the other byte order are not
+    // written, which would end up with mixed chunks.
     const std::string compressor = Zarr.get_compressor();
-    if(!(compressor == "none" || compressor == "blosc" || (compressor == "gzip" && Zarr.get_cname() == "gzip"))){
+    if(compressor != "none" && compressor != "blosc" && compressor != "gzip" && compressor != "zstd"){
         Zarr.set_errString("Writing arrays with the \""+Zarr.get_cname()+"\" compressor is not supported\n");
         return 1;
     }
+    // (a numcodecs zlib stream has a zlib header instead of gzip's)
+    const bool zlibStream = compressor == "gzip" && Zarr.get_cname() != "gzip";
+    const bool chunkChecksum = Zarr.get_chunkChecksum();
     if(oppositeEndianness(Zarr.get_dtype())){
         Zarr.set_errString("Writing arrays of data type \""+Zarr.get_dtype()+"\" (opposite byte order) is not supported\n");
         return 1;
@@ -117,17 +118,16 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         return 1;
     }
 
-    // Element strides of an uncompressed chunk (F or C order) and of an F-order
-    // chunk-sized region (existing data read back when cropping)
+    // Element strides of an uncompressed chunk (its stored axes, slowest first: C
+    // or F order, or a Zarr v3 transpose) and of an F-order chunk-sized region
+    // (existing data read back when cropping)
     std::vector<uint64_t> chunkStrides(nDims), chunkFStrides(nDims);
     {
         uint64_t acc = 1;
         for(uint64_t d = 0; d < nDims; d++){ chunkFStrides[d] = acc; acc *= chunkDims[d]; }
-        if(Zarr.get_order() == "C"){
-            acc = 1;
-            for(int64_t d = (int64_t)nDims-1; d >= 0; d--){ chunkStrides[d] = acc; acc *= chunkDims[d]; }
-        }
-        else chunkStrides = chunkFStrides;
+        const std::vector<uint64_t> axes = Zarr.get_chunkAxisOrder();
+        acc = 1;
+        for(int64_t i = (int64_t)nDims-1; i >= 0; i--){ chunkStrides[axes[i]] = acc; acc *= chunkDims[axes[i]]; }
     }
 
     // Parse the fill value once (stoi would throw on Infinity-normalized fills,
@@ -155,7 +155,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     // unchecked, wrote empty chunk files -- silently losing data. Reject it up
     // front with an actionable message. (gzip uses zlib's streaming API and is
     // not subject to this limit, so it is allowed through.)
-    if(Zarr.get_cname() != "gzip" && Zarr.get_cname() != "none" && sB > (uint64_t)BLOSC_MAX_BUFFERSIZE){
+    if(compressor == "blosc" && sB > (uint64_t)BLOSC_MAX_BUFFERSIZE){
         std::string dimsStr, productStr;
         for(uint64_t d = 0; d < nDims; d++){
             dimsStr += (d ? "x" : "")+std::to_string(chunkDims[d]);
@@ -181,6 +181,15 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     const bool indexAtStart = Zarr.get_shardIndexAtStart();
     const bool indexChecksum = Zarr.get_shardIndexChecksum();
 
+    // The fill value as one element, for inner chunks a crop write completes that
+    // are missing from their shard
+    uint8_t typedFill[8];
+    fillValueElement(Zarr.get_fill_value(), Zarr.get_dtype(), typedFill);
+    // Blosc's shuffle: as a Zarr v3 array's codec says, and always byte shuffle in
+    // v2 arrays, as cpp-zarr has always written them
+    const uint64_t shuffle = Zarr.get_shuffle();
+    const int bloscShuffle = Zarr.get_zarr_format() != 3 || shuffle > 2 ? BLOSC_SHUFFLE : (int)shuffle;
+
     // Sparse writes leave all-zero chunks unwritten, when that is how a missing
     // chunk reads back (a fill value of zero)
     void* zeroChunkUnc = NULL;
@@ -196,7 +205,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         // gzip/deflate can expand incompressible data beyond blosc's
         // BLOSC_MAX_OVERHEAD guarantee, so size the compressed-chunk buffer to a
         // bound big enough for every codec (compressBound also covers gzip).
-        const uint64_t chunkCCap = (uint64_t)compressBound(sB) + 64;
+        const uint64_t chunkCCap = std::max<uint64_t>(compressBound(sB), ZSTD_compressBound(sB)) + 64;
         void* chunkC = malloc(chunkCCap);
         void* cRegion = nullptr;
         if(!chunkUnC || !chunkC){
@@ -220,9 +229,24 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         uint64_t shardBytes = 0;
         bool shardStarted = false;
         std::string shardPath;
+        // Cropping into a sharded array: the shard's current file and index. Inner
+        // chunks the write does not touch are copied from it as they are stored, and
+        // the ones it partly covers are decoded from it.
+        std::ifstream oldShard;
+        std::vector<uint64_t> oldIndex(shardIndex.size(), emptyEntry);
+        std::vector<char> stored;
+        auto reportError = [&](const std::string &message){
+            #pragma omp critical
+            {
+                err = 1;
+                errString = message;
+            }
+        };
         // Write the shard's index (and its CRC32C) after its inner chunks, or in the
-        // room left for it at the start, then move the file into place
+        // room left for it at the start, then move the file into place (the shard's
+        // old file is closed first: Windows cannot replace an open file)
         auto finishShard = [&]() -> bool {
+            if(oldShard.is_open()) oldShard.close();
             const uint32_t crc = crc32c(reinterpret_cast<const uint8_t*>(shardIndex.data()), shardIndex.size()*sizeof(uint64_t));
             const std::string tmpPath = shardTmpFile ? shardPath+uuid : shardPath;
             std::ofstream file;
@@ -259,6 +283,83 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             }
             return true;
         };
+        // Add an inner chunk's stored bytes (and the checksum after them, if any) to
+        // the shard being written, and record where they are
+        auto appendToShard = [&](const void* data, const uint64_t n, const uint32_t* crc) -> bool {
+            const std::string tmpPath = shardTmpFile ? shardPath+uuid : shardPath;
+            std::ofstream file;
+            if(!openForWrite(file, tmpPath, shardStarted ? std::ios::app : std::ios::trunc)){
+                reportError("Check permissions or filepath. Cannot write to path: "+tmpPath+"\n");
+                return false;
+            }
+            // (room for an index at the start, written when the shard is finished)
+            if(!shardStarted && indexAtStart){
+                const std::vector<char> room(indexBytes, 0);
+                file.write(room.data(), room.size());
+            }
+            file.write(reinterpret_cast<const char*>(data), n);
+            if(crc) file.write(reinterpret_cast<const char*>(crc), sizeof(*crc));
+            file.close();
+            if(!file){
+                reportError("Could not write all of "+tmpPath+" (is the disk full?)\n");
+                return false;
+            }
+            const uint64_t total = n+(crc ? sizeof(*crc) : 0);
+            shardIndex[currChunk*2] = shardBytes;
+            shardIndex[(currChunk*2)+1] = total;
+            shardBytes += total;
+            shardStarted = true;
+            return true;
+        };
+        // Open the shard's current file and read its index, checked as the reader
+        // checks it (a shard that does not exist yet has only empty entries)
+        auto openOldShard = [&]() -> bool {
+            oldShard.close();
+            oldShard.clear();
+            std::fill(oldIndex.begin(), oldIndex.end(), emptyEntry);
+            oldShard.open(shardPath, std::ios::binary);
+            if(!oldShard.is_open()) return true;
+            oldShard.seekg(0, std::ios::end);
+            const uint64_t len = (uint64_t)oldShard.tellg();
+            const uint64_t entryBytes = oldIndex.size()*sizeof(uint64_t);
+            std::string problem;
+            if(len < indexBytes) problem = "is smaller than its index";
+            else{
+                oldShard.seekg(indexAtStart ? 0 : (std::streamoff)(len-indexBytes), std::ios::beg);
+                oldShard.read(reinterpret_cast<char*>(oldIndex.data()), entryBytes);
+                uint32_t crc = 0;
+                if(indexChecksum) oldShard.read(reinterpret_cast<char*>(&crc), sizeof(crc));
+                if(!oldShard) problem = "could not be read";
+                else if(indexChecksum && crc != crc32c(reinterpret_cast<const uint8_t*>(oldIndex.data()), entryBytes)){
+                    problem = "has an index that does not match its checksum";
+                }
+                else{
+                    const uint64_t lo = indexAtStart ? indexBytes : 0, hi = indexAtStart ? len : len-indexBytes;
+                    for(uint64_t i = 0; i < oldIndex.size()/2 && problem.empty(); i++){
+                        const uint64_t off = oldIndex[2*i], nb = oldIndex[(2*i)+1];
+                        if(off == emptyEntry && nb == emptyEntry) continue;
+                        if(off < lo || off > hi || nb > hi-off) problem = "has an index entry outside the file";
+                    }
+                }
+            }
+            if(!problem.empty()){
+                reportError("The shard "+shardPath+" "+problem+" (it may be damaged, or not match the array's metadata)\n");
+                return false;
+            }
+            return true;
+        };
+        // The stored bytes of the shard's inner chunk at position pos
+        auto readOldInner = [&](const uint64_t pos) -> bool {
+            stored.resize(oldIndex[(2*pos)+1]);
+            oldShard.clear();
+            oldShard.seekg((std::streamoff)oldIndex[2*pos], std::ios::beg);
+            oldShard.read(stored.data(), (std::streamsize)stored.size());
+            if(!oldShard){
+                reportError("Could not read the shard "+shardPath+"\n");
+                return false;
+            }
+            return true;
+        };
         std::vector<uint64_t> cAV;
         std::vector<uint64_t> boxLo(nDims), boxHi(nDims), boxExt(nDims), inArray(nDims);
         const std::vector<uint64_t> zeros(nDims, 0);
@@ -278,7 +379,8 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     shardStarted = false;
                     const std::vector<uint64_t> sAV = Zarr.chunkToShard(Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f)));
                     shardPath = Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(sAV)+"/"+
-                                Zarr.chunkNameToShardName(Zarr.get_chunkNames(f));
+                                Zarr.chunkKey(Zarr.chunkNameToShardName(Zarr.get_chunkNames(f)));
+                    if(crop && !openOldShard()) break;
                 }
                 // Inner chunks past the array's edge are not stored
                 const std::vector<uint64_t> pAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
@@ -291,35 +393,54 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             cRegion = nullptr;
 
             // When cropping into an existing array, a chunk the written region only
-            // partly covers (inside the array) needs its current contents
-            bool partial = false;
+            // partly covers (inside the array) needs its current contents, and one
+            // it does not touch at all is only rewritten because its shard is
+            bool partial = false, untouched = false;
             for(uint64_t d = 0; d < nDims; d++){
                 partial = partial || cAV[d]*chunkDims[d] < startCoords[d] ||
                           ((cAV[d]+1)*chunkDims[d] > endCoords[d] && endCoords[d] < Zarr.get_shape(d));
+                untouched = untouched || (cAV[d]+1)*chunkDims[d] <= startCoords[d] || cAV[d]*chunkDims[d] >= endCoords[d];
             }
-            if(crop && partial){
+            // (chunkUnC already holds the chunk's current contents)
+            bool existing = false;
+            if(crop && partial && Zarr.get_shard()){
+                // In a shard: an untouched inner chunk keeps its stored bytes, and one
+                // the write partly covers is decoded from them (a missing one is the
+                // fill value)
+                const bool isStored = !(oldIndex[2*currChunk] == emptyEntry && oldIndex[(2*currChunk)+1] == emptyEntry);
+                if(untouched){
+                    if(!isStored) continue;
+                    if(!readOldInner(currChunk) || !appendToShard(stored.data(), stored.size(), nullptr)) break;
+                    continue;
+                }
+                if(isStored){
+                    std::string why;
+                    if(!readOldInner(currChunk)) break;
+                    if(decodeChunk(compressor, chunkChecksum, stored.data(), stored.size(), chunkUnC, sB, why)){
+                        reportError("An inner chunk of the shard "+shardPath+" "+why+"\n");
+                        break;
+                    }
+                }
+                else fillElements(bytes, chunkUnC, s, typedFill);
+                existing = true;
+            }
+            else if(crop && partial){
                 std::vector<uint64_t> cStart(nDims), cEnd(nDims);
                 for(uint64_t d = 0; d < nDims; d++){
                     cStart[d] = cAV[d]*chunkDims[d];
                     cEnd[d] = (cAV[d]+1)*chunkDims[d];
                 }
-                if(Zarr.get_shard()){
-                    // read through the array's own (shard) chunk shape
-                    zarr shardZarr(Zarr);
-                    shardZarr.set_chunks(shardChunks);
-                    cRegion = parallelReadZarrWriteWrapper(std::move(shardZarr), crop, cStart, cEnd);
-                }
-                else cRegion = parallelReadZarrWriteWrapper(Zarr, crop, cStart, cEnd);
+                cRegion = parallelReadZarrWriteWrapper(Zarr, crop, cStart, cEnd);
                 if(!cRegion){
-                    err = 1;
-                    errString = "Error in Writer Read. Chunk: "+Zarr.get_chunkNames(f)+"\n";
+                    reportError("Error in Writer Read. Chunk: "+Zarr.get_chunkNames(f)+"\n");
                     break;
                 }
             }
-            // Assemble the uncompressed chunk (F or C order) from the F-order input.
-            // Elements inside the written region come from the input; outside it,
-            // from the chunk's existing contents when cropping into an existing
-            // array (cRegion, F order), and otherwise the fill value.
+            // Assemble the uncompressed chunk (in its stored axis order) from the
+            // input. Elements inside the written region come from the input; outside
+            // it, from the chunk's existing contents when cropping into an existing
+            // array (decoded from its shard, or cRegion, F order), and otherwise the
+            // fill value.
             uint64_t srcOff = 0, dstOff = 0;
             bool fullChunk = true;
             for(uint64_t d = 0; d < nDims; d++){
@@ -333,7 +454,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                 srcOff += (lo-startCoords[d])*inStrides[d];
                 dstOff += boxLo[d]*chunkStrides[d];
             }
-            if(!fullChunk){
+            if(!fullChunk && !existing){
                 if(cRegion){
                     // Existing data inside the array; fill beyond the array's edge
                     for(uint64_t d = 0; d < nDims; d++){
@@ -352,47 +473,45 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             // earlier copy of it removed; in a shard its index entry stays empty
             const std::string subfolderName = Zarr.get_subfoldersString(cAV);
             if(zeroChunkUnc && !memcmp(zeroChunkUnc,chunkUnC,sB)){
-                if(!Zarr.get_shard()) remove((Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f)).c_str());
+                if(!Zarr.get_shard()) remove((Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkKey(Zarr.get_chunkNames(f))).c_str());
                 free(cRegion);
                 cRegion = nullptr;
                 continue;
             }
 
-            // Use the same blosc compress as Zarr
+            // Compress as the array's metadata says
             int64_t csize = 0;
             // Uncompressed arrays store the chunk as is
             const void* chunkOut = chunkC;
 
-            if(Zarr.get_cname() == "none"){
+            if(compressor == "none"){
                 chunkOut = chunkUnC;
                 csize = sB;
             }
-            else if(Zarr.get_cname() != "gzip"){
-                /*
-                if(numWorkers<=Zarr.get_numChunks()){
-                    csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,1);
-                }
-                else{
-                    csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,numWorkers);
-                }
-                */
-                csize = blosc_compress_ctx(Zarr.get_clevel(), BLOSC_SHUFFLE, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,nBloscThreads);
+            else if(compressor == "blosc"){
+                csize = blosc_compress_ctx(Zarr.get_clevel(), bloscShuffle, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,nBloscThreads);
                 // A non-positive return means blosc could not compress the chunk
                 // (e.g. it exceeds BLOSC_MAX_BUFFERSIZE). Fail loudly instead of
                 // writing an empty/garbage chunk. (The chunk-size guard above
                 // should already have caught the oversize case.)
                 if(csize <= 0){
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        errString = "Compression error (blosc returned "+std::to_string(csize)+
-                            "). ChunkName: "+Zarr.get_fileName()+"/"+subfolderName+"/"+
-                            Zarr.get_chunkNames(f)+"\n";
-                    }
+                    reportError("Compression error (blosc returned "+std::to_string(csize)+
+                        "). ChunkName: "+Zarr.get_fileName()+"/"+subfolderName+"/"+
+                        Zarr.get_chunkNames(f)+"\n");
                     break;
                 }
             }
+            else if(compressor == "zstd"){
+                const size_t n = ZSTD_compress(chunkC, chunkCCap, chunkUnC, sB, (int)Zarr.get_clevel());
+                if(ZSTD_isError(n)){
+                    reportError("Compression error (zstd: "+std::string(ZSTD_getErrorName(n))+
+                        "). ChunkName: "+Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f)+"\n");
+                    break;
+                }
+                csize = (int64_t)n;
+            }
             else{
+                // gzip, or a zlib stream (numcodecs zlib)
                 csize = chunkCCap;
                 z_stream stream;
                 stream.zalloc = Z_NULL;
@@ -404,7 +523,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
 
                 stream.avail_in = sB;
                 stream.avail_out = csize;
-                int cErr = deflateInit2(&stream, Zarr.get_clevel(), Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+                int cErr = deflateInit2(&stream, Zarr.get_clevel(), Z_DEFLATED, zlibStream ? MAX_WBITS : MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY);
                 if(cErr){
                     #pragma omp critical
                     {
@@ -444,9 +563,13 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                 csize = csize - stream.avail_out;
             }
             
+            // A crc32c codec's checksum follows the compressed chunk
+            uint32_t crc = 0;
+            if(chunkChecksum) crc = crc32c(reinterpret_cast<const uint8_t*>(chunkOut), (size_t)csize);
+
             // Default write
             if(!Zarr.get_shard()){
-                std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.get_chunkNames(f));
+                std::string fileName(Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkKey(Zarr.get_chunkNames(f)));
                 std::string fileNameFinal;
                 if(useUuid){
                     fileNameFinal = std::string(fileName);
@@ -454,69 +577,25 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                 }
                 std::ofstream file;
                 if(!openForWrite(file, fileName, std::ios::trunc)){
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        errString = "Check permissions or filepath. Cannot write to path: "+
-                            fileName+"\n";
-                    }
+                    reportError("Check permissions or filepath. Cannot write to path: "+fileName+"\n");
                     break;
                 }
                 file.write(reinterpret_cast<const char*>(chunkOut),csize);
+                if(chunkChecksum) file.write(reinterpret_cast<const char*>(&crc), sizeof(crc));
                 file.close();
                 if(!file){
                     if(useUuid) remove(fileName.c_str());
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        errString = "Could not write all of "+fileName+" (is the disk full?)\n";
-                    }
+                    reportError("Could not write all of "+fileName+" (is the disk full?)\n");
                     break;
                 }
                 if(useUuid && !renameReplace(fileName, fileNameFinal)){
                     remove(fileName.c_str());
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        errString = "Cannot move the temporary file into place: "+
-                            fileNameFinal+"\n";
-                    }
+                    reportError("Cannot move the temporary file into place: "+fileNameFinal+"\n");
                     break;
                 }
             }
             // Sharding: add the inner chunk to its shard's file and record where it is
-            else{
-                const std::string tmpPath = shardTmpFile ? shardPath+uuid : shardPath;
-                std::ofstream file;
-                if(!openForWrite(file, tmpPath, shardStarted ? std::ios::app : std::ios::trunc)){
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        errString = "Check permissions or filepath. Cannot write to path: "+
-                            tmpPath+"\n";
-                    }
-                    break;
-                }
-                // (room for an index at the start, written when the shard is finished)
-                if(!shardStarted && indexAtStart){
-                    const std::vector<char> room(indexBytes, 0);
-                    file.write(room.data(), room.size());
-                }
-                file.write(reinterpret_cast<const char*>(chunkOut),csize);
-                file.close();
-                if(!file){
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        errString = "Could not write all of "+tmpPath+" (is the disk full?)\n";
-                    }
-                    break;
-                }
-                shardIndex[currChunk*2] = shardBytes;
-                shardIndex[(currChunk*2)+1] = csize;
-                shardBytes += csize;
-                shardStarted = true;
-            }
+            else if(!appendToShard(chunkOut, (uint64_t)csize, chunkChecksum ? &crc : nullptr)) break;
             free(cRegion);
             cRegion = nullptr;
         }

@@ -54,6 +54,24 @@ static bool mexParseRegion(const std::vector<uint64_t> &b, const uint64_t nDims,
     }
     return true;
 }
+// The order option: "F" or "C" (either case)
+static std::string mexOrder(const mxArray* a){
+    if(!mxIsChar(a)) mexErrMsgIdAndTxt("zarr:inputError","order must be a string\n");
+    const std::string order(mxArrayToString(a));
+    if(order == "F" || order == "f") return "F";
+    if(order == "C" || order == "c") return "C";
+    mexErrMsgIdAndTxt("zarr:inputError","order must be \"F\" or \"C\"\n");
+    return order;
+}
+
+// The zarr_format option: 2 or 3
+static uint64_t mexZarrFormat(const mxArray* a){
+    if(!mxIsNumeric(a) || mxGetNumberOfElements(a) != 1) mexErrMsgIdAndTxt("zarr:inputError","zarr_format must be 2 or 3\n");
+    const double v = mxGetScalar(a);
+    if(v != 2 && v != 3) mexErrMsgIdAndTxt("zarr:inputError","zarr_format must be 2 or 3\n");
+    return (uint64_t)v;
+}
+
 // Report an error the zarr class threw (as a string) that the caller does not
 // handle itself
 static void mexZarrError(const std::string &e){
@@ -62,7 +80,10 @@ static void mexZarrError(const std::string &e){
         mexErrMsgIdAndTxt("zarr:zarrayError","This zarr array cannot be read: %s\n",detail.c_str());
     }
     if(e.rfind("zarrV3NotWritable:", 0) == 0){
-        mexErrMsgIdAndTxt("zarr:zarrayError","%s is a Zarr v3 array. Writing Zarr v3 arrays is not supported yet\n",detail.c_str());
+        mexErrMsgIdAndTxt("zarr:zarrayError","%s is a Zarr v3 array. Write it with 'zarr_format', 3, or delete it first\n",detail.c_str());
+    }
+    if(e.rfind("v3Unsupported:", 0) == 0){
+        mexErrMsgIdAndTxt("zarr:zarrayError","This array cannot be written as Zarr v3: %s\n",detail.c_str());
     }
     mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred (%s)\n",e.c_str());
 }

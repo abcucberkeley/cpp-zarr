@@ -44,15 +44,26 @@ static zarr openZarr(const std::string &fileName) {
     }
 }
 
+// Errors the zarr class throws (as strings) when writing metadata or converting
+static std::runtime_error metadataError(const std::string &fileName, const std::string &e) {
+    if (e.rfind("zarrV3NotWritable:", 0) == 0) {
+        return std::runtime_error(fileName + " is a Zarr v3 array. Write it with zarr_format=3, or delete it first");
+    }
+    if (e.rfind("v3Unsupported:", 0) == 0) {
+        return std::runtime_error("Cannot write " + fileName + " as a Zarr v3 array: " + e.substr(e.find(':') + 1));
+    }
+    if (e == "unsupportedCompressor") {
+        return std::runtime_error("Cannot write " + fileName + ": unsupported compressor");
+    }
+    return std::runtime_error("Cannot write the zarr metadata of " + fileName + " (" + e + ")");
+}
+
 static void writeZarray(zarr &Zarr) {
     try {
         Zarr.write_zarray();
     }
     catch (const std::string &e) {
-        if (e.rfind("zarrV3NotWritable:", 0) == 0) {
-            throw std::runtime_error(Zarr.get_fileName() + " is a Zarr v3 array. Writing Zarr v3 arrays is not supported yet");
-        }
-        throw std::runtime_error("Cannot write the zarr metadata of " + Zarr.get_fileName() + " (" + e + ")");
+        throw metadataError(Zarr.get_fileName(), e);
     }
 }
 
@@ -136,17 +147,31 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
 void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
                          const std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &cname = "zstd",
                          const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> &chunks = std::vector<uint64_t>{256, 256, 256},
-                         const std::string &dimension_separator = ".", const bool crop = false){
+                         const std::string &dimension_separator = ".", const bool crop = false, const uint64_t zarr_format = 2,
+                         const std::vector<uint64_t> &shards = std::vector<uint64_t>{}){
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
     zarr Zarr;
     Zarr.set_fileName(fileName);
+    // (first: it sets the Zarr v3 defaults for order and dimension_separator)
+    try {
+        Zarr.set_zarr_format(zarr_format);
+    }
+    catch (const std::string &) {
+        throw std::runtime_error("zarr_format must be 2 or 3, not " + std::to_string(zarr_format));
+    }
     Zarr.set_cname(cname);
     Zarr.set_clevel(clevel);
     Zarr.set_order(order);
-    Zarr.set_chunks(chunks);
     Zarr.set_dimension_separator(dimension_separator);
+    // Zarr v3 shards (shards: the shard shape) of chunks (the inner chunk shape)
+    if (shards.empty()) Zarr.set_chunks(chunks);
+    else {
+        Zarr.set_chunks(shards);
+        Zarr.set_shard(true);
+        Zarr.set_chunk_shape(chunks);
+    }
 
     // Map the numpy dtype via kind ('u' unsigned int, 'i' signed int, 'f' float)
     // and element size. This is robust across platforms, unlike buffer-format
@@ -177,8 +202,9 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
 
     Zarr.set_shape(endCoords);
 
-    // Write out the new .zarray file
-    if(!crop || !fileExists(fileName+"/.zarray")) writeZarray(Zarr);
+    // Write out the new metadata (.zarray or zarr.json), unless writing a region of an
+    // existing array
+    if(!crop || !(fileExists(fileName+"/.zarray") || fileExists(fileName+"/zarr.json"))) writeZarray(Zarr);
     else{
         Zarr = openZarr(fileName);
         if (Zarr.get_ndims() != endCoords.size()) {
@@ -196,6 +222,20 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     if(err) throw std::runtime_error(Zarr.get_errString());
 }
 
+// Turn a Zarr v2 array into a Zarr v3 one in place (only its metadata is rewritten)
+void pybind11_convert_to_v3(const std::string &fileName){
+    zarr Zarr = openZarr(fileName);
+    try {
+        Zarr.convert_to_v3();
+    }
+    catch (const std::string &e) {
+        if (e.rfind("v3Unsupported:", 0) == 0) {
+            throw std::runtime_error("Cannot convert " + fileName + " to Zarr v3: " + e.substr(e.find(':') + 1));
+        }
+        throw metadataError(fileName, e);
+    }
+}
+
 PYBIND11_MODULE(cppzarr, m) {
 	pybind11::module::import("numpy");
 
@@ -206,5 +246,9 @@ PYBIND11_MODULE(cppzarr, m) {
 
 	m.def("pybind11_write_zarr", &pybind11_write_zarr, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("startCoords"),
 	      pybind11::arg("endCoords"), pybind11::arg("cname"), pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"),
-	      pybind11::arg("dimension_separator"), pybind11::arg("crop"), "Write a zarr file");
+	      pybind11::arg("dimension_separator"), pybind11::arg("crop"), pybind11::arg("zarr_format"), pybind11::arg("shards"),
+	      "Write a zarr file");
+
+	m.def("pybind11_convert_to_v3", &pybind11_convert_to_v3, pybind11::arg("fileName"),
+	      "Convert a Zarr v2 array to Zarr v3 in place (metadata only)");
 }
