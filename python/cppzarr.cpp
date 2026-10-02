@@ -184,6 +184,10 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
         throw std::runtime_error(std::string("Unsupported data type: kind '") + kind +
                                  "' with " + std::to_string(itemsize) + " bytes per element");
     }
+    // (write_zarr converts data in the other byte order)
+    if (!data.dtype().attr("isnative").cast<bool>()) {
+        throw std::runtime_error("The data is not in this machine's byte order");
+    }
     const uint64_t dtype = itemsize * 8;
     Zarr.set_dtype(std::string("<") + kind + std::to_string(itemsize));
 
@@ -210,6 +214,13 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
         if (Zarr.get_ndims() != endCoords.size()) {
             throw std::runtime_error("The coordinates have " + std::to_string(endCoords.size()) +
                                      " values but the existing array has " + std::to_string(Zarr.get_ndims()) + " dimensions");
+        }
+        // The chunks are written with the data's element type, so it has to be the
+        // array's (write_zarr converts the data to it)
+        const std::string &arrayType = Zarr.get_dtype();
+        if (arrayType.size() != 3 || arrayType[1] != kind || (uint64_t)(arrayType[2] - '0') != itemsize) {
+            throw std::runtime_error("The data's type (" + std::string(1, kind) + std::to_string(itemsize) +
+                                     ") does not match the existing array's (" + arrayType + ")");
         }
     }
 

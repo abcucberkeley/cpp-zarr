@@ -334,6 +334,36 @@ def main():
     print(f"v3 5D shards  {'OK' if good else 'FAIL'}")
     ok = ok and good
 
+    # Writing a region into an existing array converts the data to the array's type,
+    # as the MATLAB writer does; data in the other byte order is written correctly
+    good = True
+    for zf, atype, dtype in [(2, np.uint16, np.float32), (3, np.float32, np.int64), (3, np.uint8, np.int32),
+                             (3, np.int16, np.dtype('>i2')), (2, np.float64, np.dtype('>f4'))]:
+        path = os.path.join(tmp, f"convert_v{zf}_{np.dtype(atype).name}_{np.dtype(dtype).str}.zarr")
+        base = rng.integers(0, 200, size=(40, 24, 18)).astype(atype)
+        cppzarr.write_zarr(path, base, chunks=[16, 16, 16], zarr_format=zf)
+        patch = (rng.random((10, 9, 8)) * 200).astype(dtype)
+        cppzarr.write_zarr(path, patch, start_coords=[3, 5, 7], end_coords=[13, 14, 15])
+        exp = base.copy()
+        exp[3:13, 5:14, 7:15] = patch.astype(atype)
+        back = cppzarr.read_zarr(path)
+        good = good and back.dtype == np.dtype(atype) and np.array_equal(back, exp) and same(zarr_read(path), exp)
+    for dtype in ('>u2', '>i4', '>f8'):
+        path = os.path.join(tmp, f"big_endian_{dtype[1:]}.zarr")
+        d = np.arange(-50, 950).reshape(10, 100).astype(dtype) if dtype[1] != 'u' else np.arange(1000).reshape(10, 100).astype(dtype)
+        cppzarr.write_zarr(path, d)
+        back = cppzarr.read_zarr(path)
+        good = good and back.dtype == d.dtype.newbyteorder('=') and np.array_equal(back, d)
+    # (the module's own write function refuses data of another type than the array's)
+    try:
+        from cppzarr.cppzarr import pybind11_write_zarr
+        pybind11_write_zarr(path, np.zeros((2, 2), np.float32), [0, 0], [2, 2], 'zstd', 1, 'F', [64, 64], '.', True, 2, [])
+        good = False
+    except Exception as e:
+        good = good and 'does not match' in str(e)
+    print(f"data converted to the array's type  {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
     # The format of an existing array is kept: writes default to it, a crop write
     # cannot change it, and a v2 write over a v3 array is refused. shards needs Zarr
     # v3 and a multiple of the inner chunk shape. A v2 array converted to v3 reads the

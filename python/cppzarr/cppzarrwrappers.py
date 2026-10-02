@@ -37,6 +37,17 @@ def read_zarr(file_name, start_coords=None, end_coords=None, order=None):
     return im
 
 
+def _metadata_dtype(meta):
+    # The element type of an array's metadata (.zarray dtype, or zarr.json
+    # data_type), in native byte order; None if NumPy cannot describe it as a
+    # number type
+    try:
+        dt = np.dtype(meta['dtype'] if 'dtype' in meta else meta['data_type'])
+    except Exception:
+        return None
+    return dt.newbyteorder('=') if dt.kind in 'uif' else None
+
+
 def _existing_format(file_name):
     # The Zarr format of the array at file_name (2 or 3), or None if there is none
     if os.path.isfile(os.path.join(file_name, '.zarray')):
@@ -67,12 +78,20 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
     if dimension_separator is None:
         dimension_separator = '/' if zarr_format == 3 else '.'
 
-    # Writing into an existing array uses its number of dimensions; the data may
-    # omit trailing singleton axes
+    # Writing into an existing array uses its number of dimensions (the data may
+    # omit trailing singleton axes) and its data type: the data is converted to it,
+    # as the MATLAB writer does
     ndim = data.ndim
     if crop and existing is not None:
         with open(os.path.join(file_name, '.zarray' if existing == 2 else 'zarr.json')) as f:
-            ndim = len(json.load(f)['shape'])
+            meta = json.load(f)
+        ndim = len(meta['shape'])
+        dtype = _metadata_dtype(meta)
+        if dtype is not None and data.dtype != dtype:
+            data = np.asarray(data).astype(dtype)
+    # (the writer takes data in this machine's byte order)
+    if not data.dtype.isnative:
+        data = data.astype(data.dtype.newbyteorder('='))
     if data.ndim > ndim:
         raise Exception(f'The data has {data.ndim} dimensions but the array has {ndim}')
     data_shape = list(data.shape) + [1] * (ndim - data.ndim)
