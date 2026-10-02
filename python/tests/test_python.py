@@ -339,7 +339,9 @@ def main():
     good = True
     for zf, atype, dtype in [(2, np.uint16, np.float32), (3, np.float32, np.int64), (3, np.uint8, np.int32),
                              (3, np.int16, np.dtype('>i2')), (2, np.float64, np.dtype('>f4'))]:
-        path = os.path.join(tmp, f"convert_v{zf}_{np.dtype(atype).name}_{np.dtype(dtype).str}.zarr")
+        # (no "<" or ">" in file names: Windows does not allow them)
+        big = '_big_endian' if np.dtype(dtype).byteorder == '>' else ''
+        path = os.path.join(tmp, f"convert_v{zf}_{np.dtype(atype).name}_{np.dtype(dtype).name}{big}.zarr")
         base = rng.integers(0, 200, size=(40, 24, 18)).astype(atype)
         cppzarr.write_zarr(path, base, chunks=[16, 16, 16], zarr_format=zf)
         patch = (rng.random((10, 9, 8)) * 200).astype(dtype)
