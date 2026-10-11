@@ -171,6 +171,8 @@ im = rand(100,100,100);
 parallelWriteZarr('path/to/file.zarr',im);
 % Write with a chunk size (one value per axis)
 parallelWriteZarr('path/to/file.zarr',im,'chunks',[64 64 64]);
+% Write with a compressor and compression level (blosc's lz4 at level 5 by default; levels go from 0 to 9)
+parallelWriteZarr('path/to/file.zarr',im,'cname','zstd','clevel',1);
 % Write into a region of an existing Zarr file ([starts ends] as in parallelReadZarr); the file keeps its Zarr version
 parallelWriteZarr('path/to/file.zarr',im(1:50,:,:),'bbox',[1 1 1 50 100 100]);
 % Write a Zarr v3 file (C order and chunk files named c/0/0/0 by default; 'order','F' still works)

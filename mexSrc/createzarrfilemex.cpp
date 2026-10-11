@@ -81,8 +81,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             Zarr.set_shape(shape);
         }
         else if(currInput == "clevel"){
-            if(!mxIsNumeric(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","clevel must be a numerical value\n");
-            Zarr.set_clevel((uint64_t)*(mxGetPr(prhs[i+1])));
+            Zarr.set_clevel(mexClevel(prhs[i+1]));
         }
         else if(currInput == "subfolders"){
             subfoldersVals = mexVector(prhs[i+1]);

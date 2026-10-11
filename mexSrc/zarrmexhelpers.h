@@ -72,6 +72,15 @@ static uint64_t mexZarrFormat(const mxArray* a){
     return (uint64_t)v;
 }
 
+// The clevel option: a whole number from 0 to 9 (the levels of blosc's compressors
+// and of gzip)
+static uint64_t mexClevel(const mxArray* a){
+    if(!mxIsNumeric(a) || mxGetNumberOfElements(a) != 1) mexErrMsgIdAndTxt("zarr:inputError","clevel must be a whole number from 0 to 9\n");
+    const double v = mxGetScalar(a);
+    if(!(v >= 0 && v <= 9) || v != (double)(uint64_t)v) mexErrMsgIdAndTxt("zarr:inputError","clevel must be a whole number from 0 to 9\n");
+    return (uint64_t)v;
+}
+
 // Report an error the zarr class threw (as a string) that the caller does not
 // handle itself
 static void mexZarrError(const std::string &e){

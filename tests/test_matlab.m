@@ -101,6 +101,50 @@ function test_matlab(mexDir)
     assert(isequal(parallelReadZarr(f21), a2), '2D region into [m n 1] array mismatch');
     fprintf('PASS  2D\n');
 
+    % The compression level: written to the metadata and used (level 0 stores the
+    % data uncompressed); a region written into an existing array keeps its level
+    a3 = cast(repmat((1:40)', [1 30 20]) + randi([0 3], [40 30 20]), 'uint16');
+    sizes = zeros(1, 3);
+    levels = [0 1 9];
+    for k = 1:numel(levels)
+        fl = fullfile(tmp, sprintf('clevel_%d.zarr', levels(k)));
+        parallelWriteZarr(fl, a3, 'cname', 'zstd', 'clevel', levels(k));
+        meta = jsondecode(fileread(fullfile(fl, '.zarray')));
+        assert(meta.compressor.clevel == levels(k), 'clevel %d not in the metadata', levels(k));
+        assert(isequal(parallelReadZarr(fl), a3), 'clevel %d round-trip mismatch', levels(k));
+        files = dir(fullfile(fl, '**', '*'));
+        sizes(k) = sum([files(~[files.isdir]).bytes]);
+    end
+    assert(sizes(1) > sizes(2) && sizes(1) > sizes(3), 'clevel 0 did not store the data uncompressed');
+    fg = fullfile(tmp, 'clevel_gzip.zarr');
+    parallelWriteZarr(fg, a3, 'cname', 'gzip', 'clevel', uint8(3));
+    meta = jsondecode(fileread(fullfile(fg, '.zarray')));
+    assert(meta.compressor.level == 3, 'gzip level not in the metadata');
+    assert(isequal(parallelReadZarr(fg), a3), 'gzip clevel round-trip mismatch');
+    parallelWriteZarr(fl, a3(1:10, :, :) + 1, 'bbox', [1 1 1 10 30 20], 'clevel', 2);
+    meta = jsondecode(fileread(fullfile(fl, '.zarray')));
+    assert(meta.compressor.clevel == 9, 'a region write changed the array''s clevel');
+    e3 = a3; e3(1:10, :, :) = a3(1:10, :, :) + 1;
+    assert(isequal(parallelReadZarr(fl), e3), 'region write with clevel mismatch');
+    bad = {-1, 10, 1.5, 'a', [1 2]};
+    for k = 1:numel(bad)
+        rejected = false;
+        try
+            parallelWriteZarr(fullfile(tmp, 'clevel_bad.zarr'), a3, 'clevel', bad{k});
+        catch e
+            rejected = strcmp(e.identifier, 'zarr:inputError');
+        end
+        assert(rejected, 'clevel %s was not rejected', mat2str(bad{k}));
+        rejected = false;
+        try
+            createZarrFile(fullfile(tmp, 'clevel_bad2.zarr'), 'clevel', bad{k});
+        catch e
+            rejected = strcmp(e.identifier, 'zarr:inputError');
+        end
+        assert(rejected, 'createZarrFile accepted clevel %s', mat2str(bad{k}));
+    end
+    fprintf('PASS  clevel\n');
+
     for nd = [4 5]
         sz = [9 7 6 5 4];  sz = sz(1:nd);
         ch = [4 3 4 2 3];  ch = ch(1:nd);

@@ -143,6 +143,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
             if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","cname must be a string\n");
             Zarr.set_cname(mxArrayToString(prhs[i+1]));
         }
+        // (like cname, used for a new array; a region written into an existing array
+        // keeps the array's)
+        else if(currInput == "clevel"){
+            Zarr.set_clevel(mexClevel(prhs[i+1]));
+        }
         else if(currInput == "subfolders"){
             subfoldersVals = mexVector(prhs[i+1]);
             hasSubfolders = true;
@@ -171,7 +176,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: uuid, bbox, cname, subfolders, chunks, chunk_shape, sparse, dimension_separator, order, zarr_format\n",currInput.c_str());
+            Currently Supported Names: uuid, bbox, cname, clevel, subfolders, chunks, chunk_shape, sparse, dimension_separator, order, zarr_format\n",currInput.c_str());
         }
     }
 
