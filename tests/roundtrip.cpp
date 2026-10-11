@@ -1191,6 +1191,57 @@ int main(int argc, char** argv){
             std::error_code ec; std::filesystem::remove_all(v3.path, ec);
             return ok;
         });
+
+        check("new v2 arrays put chunk files in nested folders ('/') by default, made as chunks are written; '.' arrays keep '.'", [&](){
+            const std::string p = dir + "/rt_v2_default_sep.zarr";
+            std::error_code ec; std::filesystem::remove_all(p, ec);
+            const V shape = {40, 24, 18};
+            auto folders = [](const std::string& path){
+                uint64_t n = 0;
+                for (const auto& f : std::filesystem::recursive_directory_iterator(path)) n += f.is_directory();
+                return n;
+            };
+            zarr D;
+            bool ok = D.get_dimension_separator() == "/";
+            D.set_fileName(p); D.set_cname("lz4"); D.set_chunks({16, 16, 16}); D.set_dtype("<u2"); D.set_shape(shape);
+            D.write_zarray();
+            // '/' in the metadata, and no chunk folders until chunks are written
+            ok = ok && readJson(p + "/.zarray").value("dimension_separator", "") == "/" && folders(p) == 0;
+            // a region of one chunk makes only that chunk's folders
+            std::vector<uint16_t> data(16*16*16, 3);
+            zarr W(p);
+            W.set_chunkInfo({16, 0, 0}, {32, 16, 16});
+            ok = ok && parallelWriteZarr(W, data.data(), {16, 0, 0}, {32, 16, 16}, {16, 16, 16}, 16, true, true, false) == 0;
+            ok = ok && fileExists(p + "/1/0/0") && !fileExists(p + "/1.0.0") && folders(p) == 2;
+            zarr R(p);
+            uint16_t* got = (uint16_t*)parallelReadZarrWriteWrapper(R, false, {0, 0, 0}, shape);
+            ok = ok && got != nullptr;
+            for (uint64_t z = 0; ok && z < shape[2]; z++) for (uint64_t y = 0; ok && y < shape[1]; y++)
+                for (uint64_t x = 0; ok && x < shape[0]; x++)
+                    ok = got[x + y*shape[0] + z*shape[0]*shape[1]] == ((x >= 16 && x < 32 && y < 16 && z < 16) ? 3 : 0);
+            free(got);
+            std::filesystem::remove_all(p, ec);
+            // an existing array whose .zarray has no separator ('.' by the Zarr v2 spec) keeps
+            // '.' when written into
+            Made dot = make("v2_dot_kept", 2, {20, 10, 6}, {8, 8, 6}, {}, "F", "lz4", ".", "<u2");
+            ok = ok && !readJson(dot.path + "/.zarray").contains("dimension_separator") && fileExists(dot.path + "/0.0.0");
+            zarr Z2(dot.path);
+            ok = ok && Z2.get_dimension_separator() == ".";
+            std::vector<uint16_t> patch(8*8*6, 9);
+            Z2.set_chunkInfo({8, 0, 0}, {16, 8, 6});
+            ok = ok && parallelWriteZarr(Z2, patch.data(), {8, 0, 0}, {16, 8, 6}, {8, 8, 6}, 16, true, true, false) == 0;
+            ok = ok && fileExists(dot.path + "/1.0.0") && !fileExists(dot.path + "/1/0/0") && folders(dot.path) == 0;
+            std::filesystem::remove_all(dot.path, ec);
+            // mkdirRecursive makes a folder several missing levels deep, and leaves one that exists
+            const std::string deep = dir + "/rt_mkdir_p/a/b/c";
+            std::filesystem::remove_all(dir + "/rt_mkdir_p", ec);
+            mkdirRecursive(deep.c_str());
+            mkdirRecursive(deep.c_str());
+            mkdirRecursive((deep + "/").c_str());
+            ok = ok && std::filesystem::is_directory(deep);
+            std::filesystem::remove_all(dir + "/rt_mkdir_p", ec);
+            return ok;
+        });
     }
 
     // Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays, made by

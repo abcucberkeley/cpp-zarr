@@ -61,7 +61,9 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
                dimension_separator=None, zarr_format=None, shards=None):
     # zarr_format: 2 or 3. By default the format of the array already at file_name,
     # or 2 for a new one. Zarr v3 arrays default to C order and chunk files named
-    # c/0/0/0 (order='C', dimension_separator='/'), v2 ones to F order and 0.0.0.
+    # c/0/0/0 (order='C', dimension_separator='/'), v2 ones to F order and chunk
+    # files in nested folders, 0/0/0 (dimension_separator='/'; '.' names them 0.0.0,
+    # all in one folder, which writes much slower on network file systems).
     # shards (Zarr v3 only) is the shard shape: chunks then sets the inner chunks.
     crop = start_coords is not None or end_coords is not None
     existing = _existing_format(file_name)
@@ -76,7 +78,7 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
     if order is None:
         order = 'C' if zarr_format == 3 else 'F'
     if dimension_separator is None:
-        dimension_separator = '/' if zarr_format == 3 else '.'
+        dimension_separator = '/'
 
     # Writing into an existing array uses its number of dimensions (the data may
     # omit trailing singleton axes) and its data type: the data is converted to it,

@@ -86,7 +86,10 @@ import cppzarr
 im = cppzarr.read_zarr('filename.zarr')
 
 # Optionally specify specific metadata
-cppzarr.write_zarr('outputFilename.zarr', im, cname='zstd', clevel=1, order='F', chunks=[256, 256, 256], dimension_separator='.')
+cppzarr.write_zarr('outputFilename.zarr', im, cname='zstd', clevel=1, order='F', chunks=[256, 256, 256], dimension_separator='/')
+
+# New Zarr v2 files put their chunk files in nested folders (dimension_separator='/', files named 0/0/0) by default.
+# dimension_separator='.' names them 0.0.0 in one folder, which writes much slower on network file systems.
 
 # Zarr v3 with 1024x1024x1024 shards made of 256x256x256 chunks (shards must be a multiple of chunks).
 # Zarr v3 files default to order='C' and dimension_separator='/' (chunk files named c/0/0/0)
@@ -172,6 +175,9 @@ parallelWriteZarr('path/to/file.zarr',im,'chunks',[64 64 64]);
 parallelWriteZarr('path/to/file.zarr',im(1:50,:,:),'bbox',[1 1 1 50 100 100]);
 % Write a Zarr v3 file (C order and chunk files named c/0/0/0 by default; 'order','F' still works)
 parallelWriteZarr('path/to/file.zarr',im,'zarr_format',3);
+% New Zarr v2 files put their chunk files in nested folders (files named 0/0/0) by default. '.' names them
+% 0.0.0 in one folder, which writes much slower on network file systems.
+parallelWriteZarr('path/to/file.zarr',im,'dimension_separator','.');
 ````
 
 #### convertZarrToV3 - Convert a Zarr v2 file to Zarr v3

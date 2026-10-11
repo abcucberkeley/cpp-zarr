@@ -285,11 +285,15 @@ void zarr::parseZarrJson(){
     }
 }
 
-// Create a blank zarr object with default values
+// Create a blank zarr object with default values. New arrays use '/' chunk keys
+// (nested folders): on network file systems, creating or replacing files in one
+// folder happens one at a time per node, so arrays with many chunks in a single
+// folder wrote up to 37x slower on NFS. Existing arrays keep their own separator,
+// and a .zarray without one means '.'.
 zarr::zarr() :
 fileName(""), chunks({256,256,256}), blocksize(0),
 clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
-dimension_separator("."), fill_value("0"), filters({}), order("F"), 
+dimension_separator("/"), fill_value("0"), filters({}), order("F"),
 shape({0,0,0}), zarr_format(2), subfolders({0,0,0}), shard(false),
 chunk_shape({1,1,1})
 {
@@ -937,14 +941,10 @@ void zarr::createSubfolders(){
     normalizeDims();
     const uint64_t n = shape.size();
 
-    // dimension_separator subfolders
-    if(dimension_separator == "/"){
-        set_chunkInfo(std::vector<uint64_t>(n,0),shape);
-        #pragma omp parallel for
-        for(uint64_t i = 0; i < chunkNames.size(); i++){
-            makeDimensionFolders(fileName+"/"+chunkNames[i]);
-        }
-    }
+    // (The folders of '/' chunk keys are made when chunks are first written in
+    // them, as for Zarr v3, not all when the array is created: making every folder
+    // of a big array ahead took seconds on NFS, even when only a few chunks of it
+    // were written.)
 
     // If all elements are zero then we don't make subfolders
     if(std::all_of(subfolders.begin(),

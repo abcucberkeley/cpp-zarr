@@ -106,40 +106,38 @@ bool folderExists(const std::string &folderName){
         return false;
 }
 
-// Recursively make a directory
-void mkdirRecursive(const char *dir) {
-    if(folderExists(dir)) return;
+// Make one directory (its parent has to exist)
+static int makeOneDir(const std::string &dir){
+    #ifdef _WIN32
+    return mkdir(dir.c_str());
+    #else
+    return mkdir(dir.c_str(), 0777);
+    #endif
+}
 
-    std::string dirPath(dir);
-    if(!dirPath.size()) return;
+// Make a directory and any of its parents that are missing ("mkdir -p"). The
+// directory itself is tried first, so an existing one, or a new one whose parent
+// exists, takes a single call: on network file systems every call on an existing
+// parent locks that parent, which made creating an array's chunk folders up to 7x
+// slower on NFS. The parents are only walked when one of them is missing.
+void mkdirRecursive(const char *dir) {
+    std::string dirPath(dir ? dir : "");
 
     // Convert all \\ to / if on Windows
     #ifdef _WIN32
     std::replace(dirPath.begin(), dirPath.end(), '\\', '/');
     #endif
 
-    // If there is a slash at the end, remove it
-    if(dirPath.back() == '/') dirPath.pop_back();
-    
-    for(size_t i = 0; i < dirPath.size(); i++){
-        if(dirPath[i] == '/'){
-            dirPath[i] = '\0';
+    // Without trailing slashes
+    while(dirPath.size() > 1 && dirPath.back() == '/') dirPath.pop_back();
+    if(dirPath.empty()) return;
 
-            #ifdef _WIN32
-            mkdir(dirPath.c_str());
-            #else
-            mkdir(dirPath.c_str(), 0777);
-            #endif
-
-            dirPath[i] = '/';
-        }
-    }
-
-    #ifdef _WIN32
-    mkdir(dirPath.c_str());
-    #else
-    mkdir(dirPath.c_str(), 0777);
-    #endif
+    if(makeOneDir(dirPath) == 0 || errno == EEXIST) return;
+    if(errno != ENOENT) return;
+    const size_t slash = dirPath.find_last_of('/');
+    if(slash == std::string::npos || slash == 0) return;
+    mkdirRecursive(dirPath.substr(0, slash).c_str());
+    makeOneDir(dirPath);
 }
 
 bool fileExists(const std::string &fileName){
