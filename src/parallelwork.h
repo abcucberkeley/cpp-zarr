@@ -1,5 +1,5 @@
-// How the parallel reader shares out its chunks and keeps its threads' buffers
-// (internal to the library, not installed)
+// How the parallel reader and writer share out their chunks and set up their
+// threads (internal to the library, not installed)
 #ifndef CPPZARR_PARALLELWORK_H
 #define CPPZARR_PARALLELWORK_H
 #include <algorithm>
@@ -10,6 +10,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 // Contiguous blocks of work items with work stealing. Each thread starts with its
 // own contiguous block of the items, so neighboring chunks stay with one thread and
@@ -127,5 +131,32 @@ bool waitFor(const Done &done, const Stop &stop){
     }
     return true;
 }
+
+// For the length of a call, a thread with the default memory policy gets an explicit
+// local one: its memory still comes from its own NUMA node, but Linux's automatic NUMA
+// balancing skips threads with an explicit policy. Otherwise long-running threads (as
+// in MATLAB) have the kernel mark the process's pages, and writes took up to millions
+// of hinting faults and page migrations a call (8-30% of their time). A thread with a
+// policy of its own (numactl, say) keeps it.
+class LocalMemoryPolicy {
+#if defined(__linux__) && defined(SYS_get_mempolicy) && defined(SYS_set_mempolicy)
+    bool set = false;
+public:
+    LocalMemoryPolicy(){
+        int mode = -1;
+        if(syscall(SYS_get_mempolicy, &mode, nullptr, 0UL, nullptr, 0UL) == 0 && mode == 0 /* MPOL_DEFAULT */){
+            set = syscall(SYS_set_mempolicy, 4 /* MPOL_LOCAL */, nullptr, 0UL) == 0;
+        }
+    }
+    ~LocalMemoryPolicy(){
+        if(set) syscall(SYS_set_mempolicy, 0 /* MPOL_DEFAULT */, nullptr, 0UL);
+    }
+#else
+public:
+    LocalMemoryPolicy(){}
+#endif
+    LocalMemoryPolicy(const LocalMemoryPolicy&) = delete;
+    LocalMemoryPolicy& operator=(const LocalMemoryPolicy&) = delete;
+};
 
 #endif
