@@ -12,6 +12,7 @@
 // Progress is written (flushed) to stderr before each operation so that if a
 // build segfaults, the CTest log shows exactly which step/dtype/compressor died.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -24,8 +25,10 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <omp.h>
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "parallelreadzarr.h"
@@ -1242,6 +1245,279 @@ int main(int argc, char** argv){
             std::filesystem::remove_all(dir + "/rt_mkdir_p", ec);
             return ok;
         });
+    }
+
+    // How the reader hands out and decodes chunks, and how the writer adds inner chunks
+    // to shards. Every thin slab of an array is read with one thread (a chunk at a time)
+    // and with eight (fewer chunks than threads take three steps, every thread decoding
+    // pieces of the chunks); a blosc chunk is decoded only for the blocks that hold the
+    // slices the region needs. A crop write into a shard keeps the bytes of the inner
+    // chunks it does not touch. Reads and writes from several threads at once share
+    // buffers and decoders kept between calls.
+    {
+        typedef std::vector<uint64_t> V;
+        auto check = [&](const char* name, std::function<bool()> test){
+            total++;
+            bool ok = false;
+            try { ok = test(); }
+            catch (const std::string& e) { std::fprintf(stderr, "    exception: %s\n", e.c_str()); }
+            catch (const std::exception& e) { std::fprintf(stderr, "    exception: %s\n", e.what()); }
+            std::printf("%s  %s\n", ok ? "PASS" : "FAIL", name);
+            if (!ok) failures++;
+        };
+        struct Arr { std::string path; V shape; std::vector<uint16_t> data; };
+        // A uint16 array with smooth data (so its blosc chunks hold several blocks)
+        auto makeArr = [&](const std::string& name, int fmt, const V& shape, const V& chunks, const V& inner,
+                           const char* order, const char* comp){
+            Arr a{dir + "/rt_dec_" + name + ".zarr", shape, {}};
+            std::error_code ec;
+            std::filesystem::remove_all(a.path, ec);
+            zarr Z;
+            Z.set_fileName(a.path);
+            if (fmt == 3) Z.set_zarr_format(3);
+            Z.set_cname(comp); Z.set_clevel(1); Z.set_order(order); Z.set_chunks(chunks);
+            Z.set_dtype("<u2"); Z.set_shape(shape);
+            if (!inner.empty()){ Z.set_shard(true); Z.set_chunk_shape(inner); }
+            Z.write_zarray();
+            a.data.resize(shape[0]*shape[1]*shape[2]);
+            for (uint64_t z = 0; z < shape[2]; z++) for (uint64_t y = 0; y < shape[1]; y++) for (uint64_t x = 0; x < shape[0]; x++)
+                a.data[x + y*shape[0] + z*shape[0]*shape[1]] = (uint16_t)((x + 3*y + 7*z) % 997 + (x*y*z) % 3);
+            zarr W(a.path);
+            W.set_chunkInfo({0, 0, 0}, shape);
+            if (parallelWriteZarr(W, a.data.data(), {0, 0, 0}, shape, shape, 16, true, false, false))
+                throw std::string("write: ") + W.get_errString();
+            return a;
+        };
+        // Region [s, e) of a read back, in F or C order, against the data
+        auto regionOk = [&](const Arr& a, const V& s, const V& e, bool cOrder){
+            const V rs = {e[0]-s[0], e[1]-s[1], e[2]-s[2]};
+            std::vector<uint16_t> got(rs[0]*rs[1]*rs[2], 0);
+            zarr Z(a.path);
+            Z.set_chunkInfo(s, e);
+            if (parallelReadZarr(Z, got.data(), s, e, rs, 16, true, false, cOrder)) return false;
+            for (uint64_t z = 0; z < rs[2]; z++) for (uint64_t y = 0; y < rs[1]; y++) for (uint64_t x = 0; x < rs[0]; x++){
+                const uint64_t i = cOrder ? z + rs[2]*(y + rs[1]*x) : x + rs[0]*(y + rs[1]*z);
+                if (got[i] != a.data[(s[0]+x) + (s[1]+y)*a.shape[0] + (s[2]+z)*a.shape[0]*a.shape[1]]) return false;
+            }
+            return true;
+        };
+        const std::vector<Arr> arrs = {
+            makeArr("zstd_C", 2, {70, 40, 36}, {32, 32, 32}, {}, "C", "zstd"),
+            makeArr("lz4_F", 2, {70, 40, 36}, {32, 32, 32}, {}, "F", "lz4"),
+            makeArr("shard_C", 3, {70, 40, 36}, {64, 64, 64}, {32, 32, 32}, "C", "zstd"),
+            makeArr("gzip_F", 2, {70, 40, 36}, {32, 32, 32}, {}, "F", "gzip"),
+        };
+        const int maxThreads = omp_get_max_threads();
+
+        check("region reads: every slab 1 to 20 elements thick near a chunk along each axis, F and C order, 1 and 8 threads", [&](){
+            bool ok = true;
+            for (int threads : {1, 8}){
+                omp_set_num_threads(threads);
+                for (const Arr& a : arrs) for (uint64_t d = 0; d < 3; d++){
+                    const uint64_t lim = std::min<uint64_t>(a.shape[d], 36);
+                    for (uint64_t lo = 0; lo < lim && ok; lo++) for (uint64_t hi = lo+1; hi <= std::min(lim, lo+20) && ok; hi++){
+                        V s = {0, 0, 0}, e = a.shape;
+                        s[d] = lo; e[d] = hi;
+                        ok = regionOk(a, s, e, false) && regionOk(a, s, e, true);
+                        if (!ok) std::fprintf(stderr, "    %s: axis %d [%d, %d) with %d threads\n", a.path.c_str(), (int)d, (int)lo, (int)hi, threads);
+                    }
+                }
+                // and whole arrays, and boxes of one to eight chunks
+                for (const Arr& a : arrs){
+                    ok = ok && regionOk(a, {0, 0, 0}, a.shape, false) && regionOk(a, {0, 0, 0}, a.shape, true) &&
+                         regionOk(a, {5, 3, 1}, {37, 35, 33}, false) && regionOk(a, {30, 30, 30}, {34, 34, 34}, true) &&
+                         regionOk(a, {1, 0, 0}, {64, 40, 36}, false);
+                }
+            }
+            omp_set_num_threads(maxThreads);
+            return ok;
+        });
+
+        check("reads of chunks of 1 MB or more that do not spread evenly over the threads (decoded in pieces, copied in slabs), F and C order, 1, 8 and 16 threads", [&](){
+            // 2 MB chunks: with 8 or 16 threads most regions below take the three steps (the
+            // whole array, 18 chunks, in 3 or 2 groups), with one thread a chunk at a time
+            const std::vector<Arr> big = {
+                makeArr("big_zstd_F", 2, {300, 260, 70}, {128, 128, 64}, {}, "F", "zstd"),
+                makeArr("big_shard_C", 3, {300, 260, 70}, {256, 256, 64}, {128, 128, 64}, "C", "lz4"),
+                makeArr("big_gzip_C", 2, {300, 260, 70}, {128, 128, 64}, {}, "C", "gzip"),
+            };
+            const std::vector<std::pair<V, V>> regions = {
+                {{0, 0, 0}, {300, 260, 70}}, {{0, 0, 0}, {128, 128, 64}}, {{5, 3, 1}, {250, 200, 69}},
+                {{0, 0, 30}, {300, 260, 34}}, {{100, 0, 0}, {101, 260, 70}}, {{0, 127, 0}, {300, 129, 70}},
+                {{120, 120, 60}, {136, 136, 70}}, {{299, 259, 69}, {300, 260, 70}}, {{64, 0, 0}, {192, 260, 70}},
+            };
+            bool ok = true;
+            for (int threads : {1, 8, 16}){
+                omp_set_num_threads(threads);
+                for (const Arr& a : big) for (const auto& r : regions){
+                    ok = ok && regionOk(a, r.first, r.second, false) && regionOk(a, r.first, r.second, true);
+                    if (!ok){
+                        std::fprintf(stderr, "    %s: [%d %d %d]-[%d %d %d] with %d threads\n", a.path.c_str(), (int)r.first[0], (int)r.first[1],
+                                     (int)r.first[2], (int)r.second[0], (int)r.second[1], (int)r.second[2], threads);
+                        break;
+                    }
+                }
+            }
+            omp_set_num_threads(maxThreads);
+            return ok;
+        });
+
+        check("a damaged chunk in a read that decodes in pieces is reported, in any group of chunks, 1, 8 and 16 threads", [&](){
+            bool ok = true;
+            // (18 chunks: with 8 threads in 3 groups of 6, with 16 in 2 groups of 9.) An
+            // uncompressed chunk cut short fails as it is read, while threads with nothing
+            // to read wait to decode it.
+            for (const char* name : {"0/0/0", "2/2/1"}){
+                Arr a = makeArr("big_cut", 2, {300, 260, 70}, {128, 128, 64}, {}, "F", "none");
+                std::filesystem::resize_file(a.path + "/" + name, 1000);
+                for (int threads : {1, 8, 16}){
+                    omp_set_num_threads(threads);
+                    std::vector<uint16_t> got(a.data.size());
+                    zarr Z(a.path);
+                    Z.set_chunkInfo({0, 0, 0}, a.shape);
+                    const bool failed = parallelReadZarr(Z, got.data(), {0, 0, 0}, a.shape, a.shape, 16, true, false, false) != 0;
+                    if (!failed) std::fprintf(stderr, "    chunk %s cut short: read did not fail with %d threads\n", name, threads);
+                    ok = ok && failed && Z.get_errString().find("Uncompressed chunk is 1000 bytes") != std::string::npos;
+                }
+            }
+            for (const char* name : {"0/0/0", "1/1/0", "2/2/1"}){
+                Arr a = makeArr("big_damaged", 2, {300, 260, 70}, {128, 128, 64}, {}, "F", "zstd");
+                {
+                    // (its blosc header)
+                    std::fstream f(a.path + "/" + name, std::ios::binary | std::ios::in | std::ios::out);
+                    const std::string junk(16, '\x5a');
+                    f.write(junk.data(), (std::streamsize)junk.size());
+                    ok = ok && f.good();
+                }
+                for (int threads : {1, 8, 16}){
+                    omp_set_num_threads(threads);
+                    std::vector<uint16_t> got(a.data.size());
+                    zarr Z(a.path);
+                    Z.set_chunkInfo({0, 0, 0}, a.shape);
+                    const bool failed = parallelReadZarr(Z, got.data(), {0, 0, 0}, a.shape, a.shape, 16, true, false, false) != 0;
+                    if (!failed) std::fprintf(stderr, "    chunk %s damaged: read did not fail with %d threads\n", name, threads);
+                    ok = ok && failed && Z.get_errString().find("Decompression error") != std::string::npos;
+                }
+            }
+            omp_set_num_threads(maxThreads);
+            return ok;
+        });
+
+        check("sparse reads leave out chunks that are all zeros in the region, also when decoded in pieces, 1, 8 and 16 threads", [&](){
+            // Chunks (x, y, z) with x+y even hold zeros; a sparse read leaves their part of the
+            // output as it was (marked here), and copies the rest
+            Arr a = makeArr("big_sparse", 2, {300, 260, 70}, {128, 128, 64}, {}, "C", "lz4");
+            for (uint64_t z = 0; z < 70; z++) for (uint64_t y = 0; y < 260; y++) for (uint64_t x = 0; x < 300; x++)
+                if ((x/128 + y/128) % 2 == 0) a.data[x + y*300 + z*300*260] = 0;
+            {
+                zarr W(a.path);
+                W.set_chunkInfo({0, 0, 0}, a.shape);
+                if (parallelWriteZarr(W, a.data.data(), {0, 0, 0}, a.shape, a.shape, 16, true, false, false)) return false;
+            }
+            const uint16_t mark = 0xabcd;
+            bool ok = true;
+            for (int threads : {1, 8, 16}){
+                omp_set_num_threads(threads);
+                for (const auto& r : std::vector<std::pair<V, V>>{{{0, 0, 0}, {300, 260, 70}}, {{5, 100, 3}, {250, 200, 69}}}){
+                    const V& s = r.first;
+                    const V& e = r.second;
+                    const V rs = {e[0]-s[0], e[1]-s[1], e[2]-s[2]};
+                    std::vector<uint16_t> got(rs[0]*rs[1]*rs[2], mark);
+                    zarr Z(a.path);
+                    Z.set_chunkInfo(s, e);
+                    ok = ok && parallelReadZarr(Z, got.data(), s, e, rs, 16, true, true, false) == 0;
+                    for (uint64_t z = 0; z < rs[2] && ok; z++) for (uint64_t y = 0; y < rs[1] && ok; y++) for (uint64_t x = 0; x < rs[0] && ok; x++){
+                        const uint64_t X = s[0]+x, Y = s[1]+y, Z3 = s[2]+z;
+                        const uint16_t want = (X/128 + Y/128) % 2 == 0 ? mark : a.data[X + Y*300 + Z3*300*260];
+                        ok = got[x + rs[0]*(y + rs[1]*z)] == want;
+                    }
+                    if (!ok) std::fprintf(stderr, "    sparse read wrong with %d threads\n", threads);
+                }
+            }
+            omp_set_num_threads(maxThreads);
+            return ok;
+        });
+
+        check("a crop write into a shard keeps the bytes of the inner chunks it does not touch", [&](){
+            // one shard of 4x4x4 inner chunks, some never written
+            Arr a = makeArr("shard_keep", 3, {64, 64, 64}, {64, 64, 64}, {16, 16, 16}, "F", "lz4");
+            const std::string shard = a.path + "/c/0/0/0";
+            auto entries = [&](){
+                std::ifstream f(shard, std::ios::binary);
+                f.seekg(0, std::ios::end);
+                const uint64_t len = (uint64_t)f.tellg();
+                std::vector<uint64_t> index(2*64);
+                f.seekg((std::streamoff)(len - index.size()*8 - 4), std::ios::beg);
+                f.read(reinterpret_cast<char*>(index.data()), index.size()*8);
+                std::vector<std::string> inner(64);
+                for (int i = 0; i < 64; i++){
+                    if (index[2*i] == ~0ULL) { inner[i] = "missing"; continue; }
+                    inner[i].resize(index[2*i+1]);
+                    f.seekg((std::streamoff)index[2*i], std::ios::beg);
+                    f.read(&inner[i][0], (std::streamsize)inner[i].size());
+                }
+                return inner;
+            };
+            // a sparse write of zeros over two inner chunks leaves them out of the shard
+            std::vector<uint16_t> zero(16*16*16, 0);
+            zarr Zs(a.path);
+            Zs.set_chunkInfo({0, 16, 48}, {16, 32, 64});
+            bool ok = parallelWriteZarr(Zs, zero.data(), {0, 16, 48}, {16, 32, 64}, {16, 16, 16}, 16, true, true, true) == 0;
+            Zs.set_chunkInfo({48, 48, 0}, {64, 64, 16});
+            ok = ok && parallelWriteZarr(Zs, zero.data(), {48, 48, 0}, {64, 64, 16}, {16, 16, 16}, 16, true, true, true) == 0;
+            for (uint64_t z = 0; z < 16; z++) for (uint64_t y = 0; y < 16; y++) for (uint64_t x = 0; x < 16; x++){
+                a.data[x + (16+y)*64 + (48+z)*4096] = 0;
+                a.data[(48+x) + (48+y)*64 + z*4096] = 0;
+            }
+            const std::vector<std::string> before = entries();
+            int missing = 0;
+            for (const auto& s : before) missing += s == "missing";
+            ok = ok && missing == 2;
+            // a region that covers some inner chunks whole and some in part
+            const V s = {10, 16, 20}, e = {40, 48, 33};
+            std::vector<uint16_t> patch((e[0]-s[0])*(e[1]-s[1])*(e[2]-s[2]));
+            for (uint64_t i = 0; i < patch.size(); i++) patch[i] = (uint16_t)(5000 + i % 101);
+            zarr Zc(a.path);
+            Zc.set_chunkInfo(s, e);
+            ok = ok && parallelWriteZarr(Zc, patch.data(), s, e, {e[0]-s[0], e[1]-s[1], e[2]-s[2]}, 16, true, true, false) == 0;
+            uint64_t k = 0;
+            for (uint64_t z = s[2]; z < e[2]; z++) for (uint64_t y = s[1]; y < e[1]; y++) for (uint64_t x = s[0]; x < e[0]; x++)
+                a.data[x + y*64 + z*4096] = patch[k++];
+            const std::vector<std::string> after = entries();
+            for (int i = 0; i < 64 && ok; i++){
+                // (the index runs over the inner chunks last axis fastest)
+                const uint64_t cx = i/16, cy = (i/4)%4, cz = i%4;
+                const bool touched = cx*16 < e[0] && cx*16+16 > s[0] && cy*16 < e[1] && cy*16+16 > s[1] && cz*16 < e[2] && cz*16+16 > s[2];
+                if (!touched) ok = after[i] == before[i];
+            }
+            return ok && regionOk(a, {0, 0, 0}, a.shape, false);
+        });
+
+        check("reads and writes from 3 threads at once", [&](){
+            std::atomic<int> bad{0};
+            std::vector<std::thread> threads;
+            omp_set_num_threads(3);
+            for (int t = 0; t < 3; t++){
+                threads.emplace_back([&, t](){
+                    try {
+                        Arr mine = makeArr("concurrent" + std::to_string(t), t == 1 ? 3 : 2, {50, 40, 30}, t == 1 ? V{32, 32, 32} : V{16, 16, 16},
+                                           t == 1 ? V{16, 16, 16} : V{}, t == 2 ? "C" : "F", t == 0 ? "zstd" : "lz4");
+                        for (int k = 0; k < 6; k++){
+                            const Arr& a = arrs[(t + k) % arrs.size()];
+                            if (!regionOk(a, {0, 0, 0}, a.shape, k % 2 == 1) || !regionOk(a, {3, 5, 7}, {40, 33, 30}, false) ||
+                                !regionOk(mine, {0, 0, 0}, mine.shape, false)) bad++;
+                        }
+                    } catch (...) { bad++; }
+                });
+            }
+            for (auto& th : threads) th.join();
+            omp_set_num_threads(maxThreads);
+            return bad == 0;
+        });
+
+        std::error_code ec;
+        for (const auto& p : std::filesystem::directory_iterator(dir))
+            if (p.path().filename().string().rfind("rt_dec_", 0) == 0) std::filesystem::remove_all(p.path(), ec);
     }
 
     // Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays, made by
