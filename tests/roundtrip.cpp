@@ -1275,10 +1275,19 @@ int main(int argc, char** argv){
             zarr Z;
             Z.set_fileName(a.path);
             if (fmt == 3) Z.set_zarr_format(3);
-            Z.set_cname(comp); Z.set_clevel(1); Z.set_order(order); Z.set_chunks(chunks);
+            const bool zstdCodec = std::string(comp) == "zstd-codec";
+            Z.set_cname(zstdCodec ? "zstd" : comp); Z.set_clevel(1); Z.set_order(order); Z.set_chunks(chunks);
             Z.set_dtype("<u2"); Z.set_shape(shape);
             if (!inner.empty()){ Z.set_shard(true); Z.set_chunk_shape(inner); }
             Z.write_zarray();
+            // "zstd-codec": a v2 array of the zstd codec itself (numcodecs' Zstd, as zarr-python
+            // writes it) instead of blosc
+            if (zstdCodec){
+                json m;
+                { std::ifstream f(a.path + "/.zarray"); m = json::parse(f); }
+                m["compressor"] = {{"id", "zstd"}, {"level", 1}};
+                std::ofstream(a.path + "/.zarray") << m.dump();
+            }
             a.data.resize(shape[0]*shape[1]*shape[2]);
             for (uint64_t z = 0; z < shape[2]; z++) for (uint64_t y = 0; y < shape[1]; y++) for (uint64_t x = 0; x < shape[0]; x++)
                 a.data[x + y*shape[0] + z*shape[0]*shape[1]] = (uint16_t)((x + 3*y + 7*z) % 997 + (x*y*z) % 3);
@@ -1356,6 +1365,111 @@ int main(int argc, char** argv){
                                      (int)r.first[2], (int)r.second[0], (int)r.second[1], (int)r.second[2], threads);
                         break;
                     }
+                }
+            }
+            omp_set_num_threads(maxThreads);
+            return ok;
+        });
+
+        check("reads of big chunks of the zstd codec itself (decoded a part at a time), regions in F and C order, 1, 8 and 16 threads", [&](){
+            // A chunk's zstd frame rewritten: without its content size in its header (with a
+            // window as big as its data instead, which a single-segment frame does not state),
+            // or saying it has a checksum, with a wrong one after it
+            auto rewriteFrame = [](const std::string& path, bool dropSize, bool badChecksum){
+                std::string f;
+                { std::ifstream in(path, std::ios::binary); f.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()); }
+                static const size_t didBytes[4] = {0, 1, 2, 4};
+                const uint8_t d = (uint8_t)f[4];
+                const bool single = d & 0x20;
+                const size_t fcsBytes = (d >> 6) == 0 ? (single ? 1 : 0) : (size_t)1 << (d >> 6);
+                const size_t didAt = single ? 5 : 6, fcsAt = didAt + didBytes[d & 3];
+                uint64_t size = 0;
+                for (size_t i = 0; i < fcsBytes; i++) size |= (uint64_t)(uint8_t)f[fcsAt + i] << (8 * i);
+                if (fcsBytes == 2) size += 256;
+                std::string out = f.substr(0, 4);
+                if (dropSize){
+                    int log = 10;
+                    while ((1ull << log) < size) log++;
+                    out += (char)((d & 0x0f) | (badChecksum ? 0x04 : 0));
+                    out += single ? std::string(1, (char)((log - 10) << 3)) : f.substr(5, 1);
+                    out += f.substr(didAt, didBytes[d & 3]) + f.substr(fcsAt + fcsBytes);
+                }
+                else out += (char)(d | (badChecksum ? 0x04 : 0)) + f.substr(5);
+                if (badChecksum) out += std::string(4, '\0');
+                std::ofstream(path, std::ios::binary | std::ios::trunc) << out;
+            };
+            auto chunkFiles = [](const std::string& path){
+                std::vector<std::string> files;
+                for (const auto& f : std::filesystem::recursive_directory_iterator(path))
+                    if (f.is_regular_file() && f.path().filename().string()[0] != '.') files.push_back(f.path().string());
+                return files;
+            };
+            // 2 MB chunks; an F-order array read in F order and a C-order one in C order take
+            // the streaming decoder (up to the region's last slice, or to the end of chunks
+            // without their size in their headers), the other orders not
+            std::vector<Arr> big = {
+                makeArr("big_zstdcodec_F", 2, {300, 260, 70}, {128, 128, 64}, {}, "F", "zstd-codec"),
+                makeArr("big_zstdcodec_C", 2, {300, 260, 70}, {128, 128, 64}, {}, "C", "zstd-codec"),
+                makeArr("big_zstdcodec_nosize_F", 2, {300, 260, 70}, {128, 128, 64}, {}, "F", "zstd-codec"),
+                makeArr("big_zstdcodec_nosize_C", 2, {300, 260, 70}, {128, 128, 64}, {}, "C", "zstd-codec"),
+            };
+            for (size_t i = 2; i < big.size(); i++) for (const std::string& f : chunkFiles(big[i].path)) rewriteFrame(f, true, false);
+            const std::vector<std::pair<V, V>> regions = {
+                {{0, 0, 0}, {300, 260, 70}}, {{0, 0, 0}, {128, 128, 64}}, {{5, 3, 1}, {250, 200, 69}},
+                {{0, 0, 30}, {300, 260, 34}}, {{100, 0, 0}, {101, 260, 70}}, {{0, 127, 0}, {300, 129, 70}},
+                {{120, 120, 60}, {136, 136, 70}}, {{299, 259, 69}, {300, 260, 70}}, {{64, 0, 0}, {192, 260, 70}},
+                {{0, 0, 0}, {300, 260, 1}}, {{0, 0, 63}, {300, 260, 65}},
+            };
+            bool ok = true;
+            for (int threads : {1, 8, 16}){
+                omp_set_num_threads(threads);
+                for (const Arr& a : big) for (const auto& r : regions){
+                    ok = ok && regionOk(a, r.first, r.second, false) && regionOk(a, r.first, r.second, true);
+                    if (!ok){
+                        std::fprintf(stderr, "    %s: [%d %d %d]-[%d %d %d] with %d threads\n", a.path.c_str(), (int)r.first[0], (int)r.first[1],
+                                     (int)r.first[2], (int)r.second[0], (int)r.second[1], (int)r.second[2], threads);
+                        break;
+                    }
+                }
+            }
+            // A chunk is reported that is cut short, has junk for its frame header, or decodes
+            // to more or fewer bytes than a chunk (from arrays of other chunk sizes, with its
+            // size in its header or not), in reads of all of it or of a region that ends inside
+            // it; and one whose checksum does not match, in a read to its end
+            const Arr more = makeArr("big_zstdcodec_65", 2, {300, 260, 70}, {128, 128, 65}, {}, "F", "zstd-codec");
+            const Arr fewer = makeArr("big_zstdcodec_63", 2, {300, 260, 70}, {128, 128, 63}, {}, "F", "zstd-codec");
+            for (const std::string how : {"cut", "junk", "more", "fewer", "more_nosize", "fewer_nosize", "checksum"}){
+                Arr a = makeArr("big_zstdcodec_" + how, 2, {300, 260, 70}, {128, 128, 64}, {}, "F", "zstd-codec");
+                const std::string chunk = a.path + "/1/1/0";
+                if (how == "cut") std::filesystem::resize_file(chunk, std::filesystem::file_size(chunk)/2);
+                else if (how == "junk"){
+                    // (its frame header)
+                    std::fstream f(chunk, std::ios::binary | std::ios::in | std::ios::out);
+                    const std::string junk(16, '\x5a');
+                    f.write(junk.data(), (std::streamsize)junk.size());
+                    ok = ok && f.good();
+                }
+                else if (how == "checksum") rewriteFrame(chunk, false, true);
+                else{
+                    // (with streams: std::filesystem::copy aborts in this program on macOS)
+                    {
+                        std::ifstream in((how[0] == 'm' ? more : fewer).path + "/1/1/0", std::ios::binary);
+                        std::ofstream out(chunk, std::ios::binary | std::ios::trunc);
+                        out << in.rdbuf();
+                    }
+                    if (how.find("nosize") != std::string::npos) rewriteFrame(chunk, true, false);
+                }
+                for (int threads : {1, 8, 16}) for (bool whole : {true, false}){
+                    if (!whole && how == "checksum") continue;
+                    omp_set_num_threads(threads);
+                    const V e = whole ? a.shape : V{300, 260, 30};
+                    std::vector<uint16_t> got(e[0]*e[1]*e[2]);
+                    zarr Z(a.path);
+                    Z.set_chunkInfo({0, 0, 0}, e);
+                    const bool failed = parallelReadZarr(Z, got.data(), {0, 0, 0}, e, e, 16, true, false, false) != 0;
+                    if (!failed) std::fprintf(stderr, "    zstd chunk %s: %s read did not fail with %d threads\n", how.c_str(),
+                                              whole ? "whole" : "region", threads);
+                    ok = ok && failed && Z.get_errString().find("Decompression error") != std::string::npos;
                 }
             }
             omp_set_num_threads(maxThreads);

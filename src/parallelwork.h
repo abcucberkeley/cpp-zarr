@@ -36,6 +36,12 @@ public:
             ranges[i].end.store(items*(i+1)/t, std::memory_order_relaxed);
         }
     }
+    // The item thread t takes next from its own block, or -1 (another thread may still
+    // take it first)
+    int64_t peek(const int t) const {
+        const int64_t b = ranges[t].begin.load(std::memory_order_relaxed);
+        return b < ranges[t].end.load(std::memory_order_relaxed) ? b : -1;
+    }
     // The next item for thread t, or -1 once none is left anywhere
     int64_t next(const int t){
         {

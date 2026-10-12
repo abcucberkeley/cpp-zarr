@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <limits>
 #include <atomic>
@@ -14,8 +15,160 @@
 #include "parallelwork.h"
 #include "zlib.h"
 #include "zstd.h"
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#ifdef __linux__
+#include <dirent.h>
+#include <mutex>
+#include <sys/sysmacros.h>
+#endif
+
+#if defined(__GNUC__)
+#define CPPZARR_NOINLINE __attribute__((noinline))
+#else
+#define CPPZARR_NOINLINE
+#endif
 
 namespace {
+// A shard file a thread keeps open while it reads from it: read at offsets with pread, one
+// system call a read (a seek and a read with a stream), and its descriptor can be given
+// read-ahead advice; a stream on Windows, which has no pread
+class ShardFile {
+#ifdef _WIN32
+    std::ifstream f;
+#else
+    int fd = -1;
+#endif
+public:
+    ShardFile(){}
+    ShardFile(const ShardFile&) = delete;
+    ShardFile& operator=(const ShardFile&) = delete;
+    ~ShardFile(){ close(); }
+    bool open(const std::string &path){
+        close();
+    #ifdef _WIN32
+        f.open(path, std::ios::binary);
+        return f.is_open();
+    #else
+        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        return fd >= 0;
+    #endif
+    }
+    void close(){
+    #ifdef _WIN32
+        if(f.is_open()) f.close();
+        f.clear();
+    #else
+        if(fd >= 0) ::close(fd);
+        fd = -1;
+    #endif
+    }
+    // Its size in bytes, or -1
+    int64_t size(){
+    #ifdef _WIN32
+        f.clear();
+        f.seekg(0, std::ios::end);
+        return f ? (int64_t)f.tellg() : -1;
+    #else
+        struct stat st;
+        return fstat(fd, &st) == 0 ? (int64_t)st.st_size : -1;
+    #endif
+    }
+    // Read n bytes at offset off into buf; false if they could not all be read
+    bool readAt(uint64_t off, void* buf, uint64_t n){
+    #ifdef _WIN32
+        f.clear();
+        f.seekg((std::streamoff)off, std::ios::beg);
+        f.read(static_cast<char*>(buf), (std::streamsize)n);
+        return (bool)f;
+    #else
+        uint8_t* p = static_cast<uint8_t*>(buf);
+        while(n > 0){
+            const ssize_t r = pread(fd, p, n, (off_t)off);
+            if(r < 0 && errno == EINTR) continue;
+            if(r <= 0) return false;
+            p += r;
+            off += (uint64_t)r;
+            n -= (uint64_t)r;
+        }
+        return true;
+    #endif
+    }
+    // Its descriptor (-1 on Windows)
+    int handle() const {
+    #ifdef _WIN32
+        return -1;
+    #else
+        return fd;
+    #endif
+    }
+};
+
+#ifdef __linux__
+// What reading ahead needs to know of a file system's block device, found once per device:
+// whether it is an NVMe drive, or a device-mapper or md device (LVM, RAID) on NVMe drives
+// only (its sysfs path, or those of the devices under it, name an NVMe controller); and the
+// most one read-ahead call reads, the larger of its largest request and its read-ahead
+// (max_sectors_kb and read_ahead_kb, a partition's those of its disk), 0 if not known.
+// (128 KB on many NVMe drives: asked in 512 KB steps, such a drive read a quarter.)
+struct BlockDevice {
+    bool nvme = false;
+    uint64_t readAheadMax = 0;
+};
+BlockDevice blockDevice(const dev_t dev){
+    static std::mutex m;
+    static std::vector<std::pair<dev_t, BlockDevice>> known;
+    {
+        std::lock_guard<std::mutex> g(m);
+        for(const auto &k : known) if(k.first == dev) return k.second;
+    }
+    std::function<bool(const std::string&, int)> nvme = [&](const std::string &path, const int depth) -> bool {
+        char* real = realpath(path.c_str(), nullptr);
+        if(!real) return false;
+        const std::string r(real);
+        free(real);
+        if(r.find("/nvme") != std::string::npos) return true;
+        DIR* d = depth < 4 ? opendir((r+"/slaves").c_str()) : nullptr;
+        if(!d) return false;
+        bool any = false, all = true;
+        while(const struct dirent* e = readdir(d)){
+            if(e->d_name[0] == '.') continue;
+            any = true;
+            all = all && nvme("/sys/class/block/"+std::string(e->d_name), depth+1);
+        }
+        closedir(d);
+        return any && all;
+    };
+    const std::string sys = "/sys/dev/block/"+std::to_string(major(dev))+":"+std::to_string(minor(dev));
+    BlockDevice v;
+    v.nvme = nvme(sys, 0);
+    auto kb = [](const std::string &path) -> uint64_t {
+        std::ifstream f(path);
+        uint64_t n = 0;
+        return (f >> n) ? n : 0;
+    };
+    char* real = realpath(sys.c_str(), nullptr);
+    if(real){
+        const std::string r(real);
+        free(real);
+        for(const std::string &q : {r+"/queue/", r+"/../queue/"}){
+            const uint64_t most = std::max(kb(q+"max_sectors_kb"), kb(q+"read_ahead_kb"));
+            if(most){
+                v.readAheadMax = most << 10;
+                break;
+            }
+        }
+    }
+    std::lock_guard<std::mutex> g(m);
+    known.push_back({dev, v});
+    return v;
+}
+#endif
+
 // A reader thread's buffers and decoders, kept in a pool between calls (see
 // ScratchPool). Buffers over 1 MB (and the decoder used with them) are not kept.
 struct ReadScratch {
@@ -301,12 +454,136 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         to = (std::min(b+c, endCoords[sliceAxis])-b)*sliceBytes;
     };
 
+    // Reading ahead (Linux): the kernel is asked to read parts of the files into the page
+    // cache in the background, so that more reads are in flight and they are bigger. On a
+    // local disk (a file system on a block device, whose device number has a major number;
+    // NFS, tmpfs and FUSE have 0) a shard's parts are; and on NVMe drives also each thread's
+    // next chunk file (on a SATA SSD that made cold reads up to 2.5% slower). NFS clients
+    // read ahead well themselves: reading ahead whole chunk files or big parts of shards
+    // there made cold reads up to 1.5 times as long. (Found out when a read first needs to
+    // know: stat can ask an NFS server, and statfs always does, which made small reads up
+    // to 65% slower.) 0: not a local disk, 1: a local disk, 2: an NVMe drive
+    // (Reading ahead is asked for in steps of the most a call reads, the larger of the
+    // device's largest request and its read-ahead, up to 2 MB: 1.25 MB on the cluster's
+    // disks, where 512 KB steps made cold reads of a whole sharded array on a SATA SSD 3%
+    // slower, and 128 KB on many NVMe drives. On NFS, where a call reads 1 MB or more, 512 KB
+    // steps were faster than 1 MB ones.)
+    std::atomic<int> diskKind{-1};
+    std::atomic<uint64_t> readAheadStep{512 << 10};
+    auto disk = [&]() -> int {
+        int v = diskKind.load(std::memory_order_acquire);
+        if(v < 0){
+            v = 0;
+            #ifdef __linux__
+            struct stat st;
+            if(stat(Zarr.get_fileName().c_str(), &st) == 0 && major(st.st_dev) != 0){
+                const BlockDevice b = blockDevice(st.st_dev);
+                v = b.nvme ? 2 : 1;
+                if(b.readAheadMax) readAheadStep.store(std::max<uint64_t>(4096, std::min<uint64_t>(2 << 20, b.readAheadMax)), std::memory_order_relaxed);
+            }
+            #endif
+            diskKind.store(v, std::memory_order_release);
+        }
+        return v;
+    };
+    // Ask for the byte ranges [first, second) of an open file
+    auto readAhead = [&](const int fd, const std::vector<std::pair<uint64_t, uint64_t>> &ranges){
+    #ifdef __linux__
+        const uint64_t step = readAheadStep.load(std::memory_order_relaxed);
+        for(const auto &r : ranges){
+            for(uint64_t at = r.first; at < r.second; at += step){
+                posix_fadvise(fd, (off_t)at, (off_t)std::min(step, r.second-at), POSIX_FADV_WILLNEED);
+            }
+        }
+    #else
+        (void)fd;
+        (void)ranges;
+    #endif
+    };
+    // Ask for a whole file
+    auto readAheadFile = [&](const std::string &fileName){
+    #ifdef __linux__
+        const int fd = open(fileName.c_str(), O_RDONLY | O_CLOEXEC);
+        if(fd < 0) return;
+        struct stat st;
+        if(fstat(fd, &st) == 0 && st.st_size > 0) readAhead(fd, {{0, (uint64_t)st.st_size}});
+        close(fd);
+    #else
+        (void)fileName;
+    #endif
+    };
+    // Shards (by their place in the region's grid of shards) a thread has read ahead in this call
+    std::unique_ptr<std::atomic<uint8_t>[]> shardOpened;
+    if(Zarr.get_shard() && regular && nOuter > 0){
+        shardOpened.reset(new std::atomic<uint8_t>[nOuter]);
+        for(uint64_t o = 0; o < nOuter; o++) shardOpened[o].store(0, std::memory_order_relaxed);
+    }
+
     // A thread's shard being read: kept open, with its index loaded
     struct ShardState {
-        std::ifstream file;
+        ShardFile file;
         std::string path;
         bool open = false, indexRead = false;
         uint64_t* index = nullptr;
+    };
+    // A thread that opens the shard asks to read ahead the inner chunks of it the
+    // region needs (once for each shard), neighbors (less than 256 KB apart)
+    // together: each read their own as threads came to them, the inner chunks of a
+    // shard read whole from a cold SATA SSD 2.1 times as long as with this, and a
+    // timepoint of a few inner chunks of each of four shards up to 1.4 times as
+    // long from NFS. Shards that need at most 8 MB only when the thread's index
+    // read took long, so came from the disk or the server (from the page cache it
+    // takes under 25 us, from VAST over 700 us and from an NVMe drive about 100):
+    // asked for data already in the page cache, NFS made such reads up to 19%
+    // slower. (A thread whose index came from the page cache, which another thread
+    // may just have read it into, leaves them to one whose index did not.) Bigger
+    // ones only on local disks (see above).
+    // (Not inlined: inlined in readChunk, it made one-chunk reads at 8 threads 6% slower, though
+    // they never came here.)
+    auto readAheadShard = [&](const ShardFile &file, const uint64_t* index, const std::vector<uint64_t> &cAV,
+                              const double indexTook, const uint64_t indexBytes) CPPZARR_NOINLINE {
+        uint64_t o = 0;
+        for(uint64_t d = 0; d < nDims; d++) o += (cAV[d]/innerCount[d]-outerFirst[d])*outerStride[d];
+        const int kind = o < nOuter && shardOpened[o].load(std::memory_order_relaxed) == 0 ? disk() : -1;
+        const bool slow = indexTook > (kind > 0 ? 40e-6 : 300e-6)+indexBytes/2e9;
+        if(kind >= 0 && (slow || kind > 0)){
+            // (the shard's inner chunks inside the region, last axis fastest)
+            std::vector<uint64_t> lo(nDims), hi(nDims), at(nDims);
+            bool any = true;
+            for(uint64_t d = 0; d < nDims; d++){
+                const uint64_t cs = Zarr.get_chunk_shape(d), first = (cAV[d]/innerCount[d])*innerCount[d];
+                lo[d] = std::max(first, startCoords[d]/cs);
+                hi[d] = std::min(first+innerCount[d], (endCoords[d]+cs-1)/cs);
+                any = any && hi[d] > lo[d];
+                at[d] = lo[d];
+            }
+            std::vector<std::pair<uint64_t, uint64_t>> ranges;
+            uint64_t total = 0;
+            while(any){
+                const uint64_t p = Zarr.get_chunkShardPosition(at);
+                const uint64_t off = index[2*p], n = index[(2*p)+1];
+                if(!(off == emptyEntry && n == emptyEntry) && n > 0){
+                    ranges.push_back({off, off+n});
+                    total += n;
+                }
+                int64_t d = (int64_t)nDims-1;
+                for(; d >= 0; d--){
+                    if(++at[d] < hi[d]) break;
+                    at[d] = lo[d];
+                }
+                any = d >= 0;
+            }
+            uint8_t opened = 0;
+            if(ranges.size() > 1 && (total <= (8 << 20) ? slow : kind > 0) && shardOpened[o].compare_exchange_strong(opened, 1)){
+                std::sort(ranges.begin(), ranges.end());
+                std::vector<std::pair<uint64_t, uint64_t>> runs;
+                for(const auto &r : ranges){
+                    if(!runs.empty() && r.first <= runs.back().second+(256 << 10)) runs.back().second = std::max(runs.back().second, r.second);
+                    else runs.push_back(r);
+                }
+                readAhead(file.handle(), runs);
+            }
+        }
     };
     // Read a chunk's stored bytes (the chunk named name, at indices cAV) into the buffer
     // alloc(n) gives, and check the checksum after them if it has one. Returns their
@@ -330,30 +607,27 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         else{
             fileName = Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkKey(Zarr.chunkNameToShardName(name));
             if(fileName != ss.path){
-                ss.file.close();
-                ss.file.clear();
-                ss.file.open(fileName, std::ios::binary);
+                ss.open = ss.file.open(fileName);
                 ss.path = fileName;
-                ss.open = ss.file.is_open();
                 ss.indexRead = false;
             }
             // A shard that was never written reads as the fill value
             if(!ss.open) return -1;
             // Its index, checked: its checksum, and every entry inside the file
             if(!ss.indexRead){
-                ss.file.clear();
-                ss.file.seekg(0, std::ios::end);
-                const uint64_t shardLen = (uint64_t)ss.file.tellg();
+                const auto indexStart = std::chrono::steady_clock::now();
+                const int64_t size = ss.file.size();
+                const uint64_t shardLen = size > 0 ? (uint64_t)size : 0;
                 const uint64_t entryBytes = 2*nInner*sizeof(uint64_t);
                 const uint64_t indexBytes = entryBytes+(indexChecksum ? 4 : 0);
                 std::string problem;
                 if(shardLen < indexBytes) problem = "is smaller than its index";
                 else{
-                    ss.file.seekg(indexAtStart ? 0 : (std::streamoff)(shardLen-indexBytes), std::ios::beg);
-                    ss.file.read(reinterpret_cast<char*>(ss.index), entryBytes);
+                    // (the entries and their checksum in one read: the buffer has room for both)
                     uint32_t crc = 0;
-                    if(indexChecksum) ss.file.read(reinterpret_cast<char*>(&crc), sizeof(crc));
-                    if(!ss.file) problem = "could not be read";
+                    const bool got = ss.file.readAt(indexAtStart ? 0 : shardLen-indexBytes, ss.index, indexBytes);
+                    if(got && indexChecksum) memcpy(&crc, reinterpret_cast<const uint8_t*>(ss.index)+entryBytes, sizeof(crc));
+                    if(!got) problem = "could not be read";
                     else if(indexChecksum && crc != crc32c(reinterpret_cast<const uint8_t*>(ss.index), entryBytes)){
                         problem = "has an index that does not match its checksum";
                     }
@@ -374,6 +648,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     return -2;
                 }
                 ss.indexRead = true;
+                const double indexTook = std::chrono::duration<double>(std::chrono::steady_clock::now()-indexStart).count();
+                if(shardOpened) readAheadShard(ss.file, ss.index, cAV, indexTook, indexBytes);
             }
             const uint64_t pos = Zarr.get_chunkShardPosition(cAV);
             const uint64_t offset = ss.index[2*pos], nbytes = ss.index[(2*pos)+1];
@@ -381,9 +657,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             if(offset == emptyEntry && nbytes == emptyEntry) return -1;
             fileLen = (int64_t)nbytes;
             data = alloc(nbytes);
-            ss.file.clear();
-            ss.file.seekg((std::streamoff)offset, std::ios::beg);
-            ss.file.read(reinterpret_cast<char*>(data), fileLen);
+            if(!ss.file.readAt(offset, data, nbytes)){
+                ss.path.clear();
+                fail("The shard "+fileName+" could not be read (it may be damaged, or not match the array's metadata)\n");
+                return -2;
+            }
         }
         // A crc32c codec's checksum follows the chunk's bytes
         if(chunkChecksum){
@@ -505,7 +783,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // contexts) and a zstd decoder as the array needs
     auto takeScratch = [&]() -> std::unique_ptr<ReadScratch> {
         std::unique_ptr<ReadScratch> sc = readScratchPool.take(omp_get_thread_num());
-        sc->shardIndex.resize(2*nInner);
+        sc->shardIndex.resize(2*nInner+1);
         if(compressor == "blosc" && useCtx && !sc->dctx) sc->dctx = blosc2_create_dctx(BLOSC2_DPARAMS_DEFAULTS);
         if(compressor == "zstd" && !sc->zctx) sc->zctx = ZSTD_createDCtx();
         return sc;
@@ -581,6 +859,68 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             const uint64_t za = std::max(ga, ra), zb = std::min(ge, rb);
             if(zeroChunkUnc && !memcmp(zeroChunkUnc, buf+(za-ga), zb-za)) continue;
             copyChunkAt(buf, ga, cAV, boxExt, sliceAxis, b+za/sliceBytes-startCoords[sliceAxis], b+zb/sliceBytes-startCoords[sliceAxis]);
+        }
+        return true;
+    };
+
+    // Big zstd chunks (the zstd codec itself) whose slices run along the output's slowest
+    // axis are decoded a part (whole slices, about 256 KB) at a time with zstd's streaming
+    // decoder, up to the last slice the region needs, and each part copied out while it is
+    // in the cache. Decoded whole, they went through memory twice more, into buffers of
+    // their size that every call faulted in again, which made region reads up to 1.2 times
+    // as long, and the buffers held them to fewer threads. Only a chunk of one frame (all of
+    // its bytes) that says it decodes to a chunk's bytes, as cpp-zarr, numcodecs and
+    // TensorStore write them; one that does not say is decoded to its end, and others whole
+    // (which reports any that do not decode to a chunk's bytes, as before). A chunk decoded
+    // to its end is checked as one decoded whole is: its size, and its checksum if it has
+    // one; past a region's last slice it is not decoded.
+    const bool zstdFusable = compressor == "zstd" && sB >= bigChunk && nDims > 0 && sliceBytes < sB && (int64_t)sliceAxis == outSlow;
+    // How a chunk (len stored bytes at src) is decoded: 0 whole, 1 a part at a time up to the
+    // region's last slice, 2 a part at a time to its end
+    auto zstdStreamed = [&](const uint8_t* src, const int64_t len) -> int {
+        if(ZSTD_findFrameCompressedSize(src, (size_t)len) != (size_t)len) return 0;
+        const unsigned long long n = ZSTD_getFrameContentSize(src, (size_t)len);
+        return n == sB ? 1 : n == ZSTD_CONTENTSIZE_UNKNOWN ? 2 : 0;
+    };
+    auto copyZstdStream = [&](ReadScratch &sc, const uint8_t* src, const int64_t len, const bool toEnd,
+                              const std::vector<uint64_t> &cAV, std::vector<uint64_t> &boxExt, const uint64_t s0, const uint64_t s1,
+                              const std::string &subfolderName, const std::string &name) -> bool {
+        auto bad = [&](const std::string &why){
+            fail("Decompression error ("+why+"). ChunkName: "+Zarr.get_fileName()+"/"+subfolderName+"/"+name+"\n");
+            return false;
+        };
+        const uint64_t partBytes = std::max<uint64_t>(1, (256 << 10)/sliceBytes)*sliceBytes;
+        uint8_t* buf = sc.partBuffer(partBytes);
+        ZSTD_DCtx_reset(sc.zctx, ZSTD_reset_session_only);
+        ZSTD_inBuffer in = {src, (size_t)len, 0};
+        const uint64_t ra = s0*sliceBytes, rb = s1*sliceBytes, until = toEnd ? sB : rb;
+        const uint64_t b = cAV[sliceAxis]*Zarr.get_chunks(sliceAxis);
+        size_t r = 1;
+        for(uint64_t ga = 0; ga < until; ga += partBytes){
+            const uint64_t ge = std::min(sB, ga+partBytes);
+            ZSTD_outBuffer out = {buf, (size_t)(ge-ga), 0};
+            while(out.pos < out.size){
+                const size_t inBefore = in.pos, outBefore = out.pos;
+                r = ZSTD_decompressStream(sc.zctx, &out, &in);
+                if(ZSTD_isError(r)) return bad(ZSTD_getErrorName(r));
+                if(in.pos == inBefore && out.pos == outBefore) return bad("the chunk ends early");
+            }
+            const uint64_t za = std::max(ga, ra), zb = std::min(ge, rb);
+            if(zb <= za) continue;
+            if(zeroChunkUnc && !memcmp(zeroChunkUnc, buf+(za-ga), zb-za)) continue;
+            copyChunkAt(buf, ga, cAV, boxExt, sliceAxis, b+za/sliceBytes-startCoords[sliceAxis], b+zb/sliceBytes-startCoords[sliceAxis]);
+        }
+        // Decoded to its end, the frame must end there (and its checksum match)
+        if(until == sB){
+            uint8_t more = 0;
+            while(r != 0){
+                ZSTD_outBuffer out = {&more, 1, 0};
+                const size_t inBefore = in.pos;
+                r = ZSTD_decompressStream(sc.zctx, &out, &in);
+                if(ZSTD_isError(r)) return bad(ZSTD_getErrorName(r));
+                if(out.pos > 0) return bad("the chunk decodes to more than a chunk's bytes");
+                if(r != 0 && in.pos == inBefore) return bad("the chunk ends early");
+            }
         }
         return true;
     };
@@ -911,7 +1251,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // more fresh buffers of their size (which the pool does not keep), which made reads
     // without huge pages up to 11% slower.
     else{
-        const int32_t team = (int32_t)std::max<int64_t>(1, sB >= bigChunk && !fusable && perThread > 0 ?
+        const int32_t team = (int32_t)std::max<int64_t>(1, sB >= bigChunk && !fusable && !zstdFusable && perThread > 0 ?
                                                            (nItems+perThread-1)/perThread : std::min<int64_t>(numWorkers, nItems));
         WorkRanges work(team, nItems);
         // (in a region of all of the threads, those past the team doing nothing: OpenMP ends
@@ -947,6 +1287,16 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                         return scratch->storedBuffer(n, storedRoom);
                     }, stored);
                     if(fileLen == -2) break;
+                    // On an NVMe drive, the thread's next chunk file is read ahead while this one
+                    // is decoded, which keeps more reads in flight: cold whole-array reads took
+                    // up to 6% longer without it
+                    if(!Zarr.get_shard()){
+                        const int64_t nx = work.peek(w);
+                        if(nx >= 0 && disk() == 2){
+                            const std::string &nextName = Zarr.get_chunkNames(listIndex(nx));
+                            readAheadFile(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(nextName))+"/"+Zarr.chunkKey(nextName));
+                        }
+                    }
                     if(fileLen == -1) continue;
 
                     // A fusable chunk a part at a time, from a part that depends on its place
@@ -957,6 +1307,12 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     if(unit){
                         if(!copyFused(*scratch, stored, fileLen, unit, typesize, cAV, boxExt, from/sliceBytes, to/sliceBytes, (uint64_t)it,
                                       subfolderName, name)) break;
+                        continue;
+                    }
+                    const int streamed = zstdFusable ? zstdStreamed(stored, fileLen) : 0;
+                    if(streamed){
+                        if(!copyZstdStream(*scratch, stored, fileLen, streamed == 2, cAV, boxExt, from/sliceBytes, to/sliceBytes,
+                                           subfolderName, name)) break;
                         continue;
                     }
                     // Otherwise decompressed (a blosc chunk only for its slices inside the
