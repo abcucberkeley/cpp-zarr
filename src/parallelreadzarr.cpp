@@ -27,6 +27,16 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
+// preadv2 (Linux 4.6), which the page-cache probe below uses, where the system headers
+// predate it (as the 3.10 headers of manylinux2014, which Python wheels can be built on);
+// a kernel without it fails the call, and the probe then has no answer
+#ifndef SYS_preadv2
+#if defined(__x86_64__)
+#define SYS_preadv2 327
+#elif defined(__aarch64__)
+#define SYS_preadv2 286
+#endif
+#endif
 #endif
 
 #if defined(__GNUC__)
