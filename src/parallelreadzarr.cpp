@@ -24,7 +24,9 @@
 #ifdef __linux__
 #include <dirent.h>
 #include <mutex>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/uio.h>
 #endif
 
 #if defined(__GNUC__)
@@ -269,6 +271,13 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool sparse,
                          const bool cOrder)
 {
+    // Linux's automatic NUMA balancing is kept off the threads that read, for the call (see
+    // LocalMemoryPolicy): the calling thread for all of it, and every thread of each
+    // parallel region, also those with nothing to do (any thread can mark the process's
+    // pages for it). Without huge pages, its hinting faults made reads of big arrays up to
+    // 5% slower; kept off only the threads with work, reads of one chunk took up to 1.5
+    // times as long.
+    const LocalMemoryPolicy memoryPolicy;
     // A 0-dimensional array is a single element: sharding does not apply
     if(Zarr.get_ndims() == 0 && Zarr.get_shard()){
         Zarr.set_errString("Sharding is not supported for 0-dimensional arrays\n");
@@ -376,7 +385,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         innerStride[d] = d+1 < (int64_t)nDims ? innerStride[d+1]*innerCount[d+1] : 1;
     }
     const bool regular = nOuter*nPer == (uint64_t)listed;
-    const bool reorder = !cOrder && nDims > 1 && regular;
+    bool reorder = !cOrder && nDims > 1 && regular;
     // The list position of the chunk at position q of the output's order
     auto listIndex = [&](uint64_t q) -> int64_t {
         if(!reorder) return (int64_t)q;
@@ -512,6 +521,38 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         (void)fileName;
     #endif
     };
+    // Whether the page cache holds the start of chunk files across the list (four of them),
+    // asked with one-byte reads that may not wait for the disk; true where that cannot be
+    // asked
+    auto filesCached = [&]() -> bool {
+    #if defined(__linux__) && defined(SYS_preadv2)
+        try{
+            for(int64_t k = 0; k < 4; k++){
+                const std::string &name = Zarr.get_chunkNames((listed-1)*k/3);
+                const std::string fileName = Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(name))+"/"+
+                                             Zarr.chunkKey(name);
+                const int fd = open(fileName.c_str(), O_RDONLY | O_CLOEXEC);
+                if(fd < 0) continue;
+                uint8_t b = 0;
+                struct iovec v = {&b, 1};
+                const long n = syscall(SYS_preadv2, fd, &v, 1, 0L, 0L, 8 /* RWF_NOWAIT */);
+                const int e = errno;
+                close(fd);
+                if(n < 0 && e == EAGAIN) return false;
+            }
+        }
+        catch(const std::exception&){}
+    #endif
+        return true;
+    };
+    // On a local disk other than an NVMe drive, chunk files the page cache does not hold are
+    // handed out in the list's order instead (the order they were written in, so mostly the
+    // disk's), so that each thread reads files that lie together: in the output's order the
+    // threads jumped across the disk, and cold F-order reads of the 16,384 files of an array
+    // of 64^3 chunks from a SATA SSD took 1.2-1.4 times as long (as long as in v1.6.0).
+    // Only reads of at least 8 chunk files a thread, which count as cold if any of four
+    // files across the list is not in the page cache.
+    if(reorder && !Zarr.get_shard() && listed >= 8*(int64_t)numWorkers && disk() == 1 && !filesCached()) reorder = false;
     // Shards (by their place in the region's grid of shards) a thread has read ahead in this call
     std::unique_ptr<std::atomic<uint8_t>[]> shardOpened;
     if(Zarr.get_shard() && regular && nOuter > 0){
@@ -1047,6 +1088,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             for(int64_t i = 0; i < nItems; i++) wholeState[i].store(0);
             #pragma omp parallel num_threads(numWorkers)
             {
+                const LocalMemoryPolicy memoryPolicy;
                 const int w = omp_get_thread_num();
                 std::unique_ptr<ReadScratch> scratch;
                 ShardState ss;
@@ -1129,6 +1171,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         else{
             #pragma omp parallel num_threads(numWorkers)
             {
+                const LocalMemoryPolicy memoryPolicy;
                 const int w = omp_get_thread_num();
                 std::unique_ptr<ReadScratch> scratch;
                 ShardState ss;
@@ -1258,86 +1301,89 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         // the threads a smaller region leaves out, and starts them again for the next bigger
         // one, which made reads of small regions of changing sizes up to 8 times slower)
         #pragma omp parallel num_threads(numWorkers)
-        if(omp_get_thread_num() < team)
         {
-            const int w = omp_get_thread_num();
-            // This thread's buffers (a chunk's stored bytes and the chunk decoded) and
-            // decoders, from the pool, and the shard it is reading
-            std::unique_ptr<ReadScratch> scratch;
-            ShardState ss;
-            uint8_t* decoded = nullptr;
-            std::vector<uint64_t> boxExt(nDims);
-            try{
-                scratch = takeScratch();
-                ss.index = scratch->shardIndex.data();
-            }
-            catch(const std::exception &e){
-                fail(std::string("Read error: ")+e.what()+"\n");
-            }
-            // An exception cannot leave the parallel region: report it as an error
-            for(int64_t it = (err || !scratch) ? -1 : work.next(w); it >= 0; it = err ? -1 : work.next(w)){
-                const int64_t f = Zarr.get_shard() ? items[it] : listIndex(it);
+            const LocalMemoryPolicy memoryPolicy;
+            if(omp_get_thread_num() < team)
+            {
+                const int w = omp_get_thread_num();
+                // This thread's buffers (a chunk's stored bytes and the chunk decoded) and
+                // decoders, from the pool, and the shard it is reading
+                std::unique_ptr<ReadScratch> scratch;
+                ShardState ss;
+                uint8_t* decoded = nullptr;
+                std::vector<uint64_t> boxExt(nDims);
                 try{
-                    const std::string &name = Zarr.get_chunkNames(f);
-                    const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(name);
-                    // (a shard's subfolder comes from the shard's own indices)
-                    const std::string subfolderName = Zarr.get_subfoldersString(Zarr.get_shard() ? Zarr.chunkToShard(cAV) : cAV);
-                    uint8_t* stored = nullptr;
-                    const int64_t fileLen = readChunk(ss, name, cAV, subfolderName, [&](const uint64_t n){
-                        return scratch->storedBuffer(n, storedRoom);
-                    }, stored);
-                    if(fileLen == -2) break;
-                    // On an NVMe drive, the thread's next chunk file is read ahead while this one
-                    // is decoded, which keeps more reads in flight: cold whole-array reads took
-                    // up to 6% longer without it
-                    if(!Zarr.get_shard()){
-                        const int64_t nx = work.peek(w);
-                        if(nx >= 0 && disk() == 2){
-                            const std::string &nextName = Zarr.get_chunkNames(listIndex(nx));
-                            readAheadFile(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(nextName))+"/"+Zarr.chunkKey(nextName));
-                        }
-                    }
-                    if(fileLen == -1) continue;
-
-                    // A fusable chunk a part at a time, from a part that depends on its place
-                    // in the list
-                    uint64_t from = 0, to = sB, typesize = 0;
-                    bytesInRegion(cAV, from, to);
-                    const uint64_t unit = fusable ? fusedUnit(stored, fileLen, typesize) : 0;
-                    if(unit){
-                        if(!copyFused(*scratch, stored, fileLen, unit, typesize, cAV, boxExt, from/sliceBytes, to/sliceBytes, (uint64_t)it,
-                                      subfolderName, name)) break;
-                        continue;
-                    }
-                    const int streamed = zstdFusable ? zstdStreamed(stored, fileLen) : 0;
-                    if(streamed){
-                        if(!copyZstdStream(*scratch, stored, fileLen, streamed == 2, cAV, boxExt, from/sliceBytes, to/sliceBytes,
-                                           subfolderName, name)) break;
-                        continue;
-                    }
-                    // Otherwise decompressed (a blosc chunk only for its slices inside the
-                    // region); uncompressed chunks are used straight from the file buffer
-                    const uint8_t* chunkData = stored;
-                    if(compressor != "none"){
-                        if(!decoded) decoded = scratch->decodedBuffer(sB);
-                        if(!decodeChunkRange(*scratch, scratch->dctx, stored, fileLen, decoded, from, to, subfolderName, name)) break;
-                        chunkData = decoded;
-                    }
-
-                    // If the chunk is all zeros (in the region's slices), skip it
-                    if(zeroChunkUnc && !memcmp(zeroChunkUnc, chunkData+from, to-from)) continue;
-
-                    copyChunk(chunkData, cAV, boxExt, -1, 0, 0);
+                    scratch = takeScratch();
+                    ss.index = scratch->shardIndex.data();
                 }
                 catch(const std::exception &e){
                     fail(std::string("Read error: ")+e.what()+"\n");
-                    break;
                 }
+                // An exception cannot leave the parallel region: report it as an error
+                for(int64_t it = (err || !scratch) ? -1 : work.next(w); it >= 0; it = err ? -1 : work.next(w)){
+                    const int64_t f = Zarr.get_shard() ? items[it] : listIndex(it);
+                    try{
+                        const std::string &name = Zarr.get_chunkNames(f);
+                        const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(name);
+                        // (a shard's subfolder comes from the shard's own indices)
+                        const std::string subfolderName = Zarr.get_subfoldersString(Zarr.get_shard() ? Zarr.chunkToShard(cAV) : cAV);
+                        uint8_t* stored = nullptr;
+                        const int64_t fileLen = readChunk(ss, name, cAV, subfolderName, [&](const uint64_t n){
+                            return scratch->storedBuffer(n, storedRoom);
+                        }, stored);
+                        if(fileLen == -2) break;
+                        // On an NVMe drive, the thread's next chunk file is read ahead while this one
+                        // is decoded, which keeps more reads in flight: cold whole-array reads took
+                        // up to 6% longer without it
+                        if(!Zarr.get_shard()){
+                            const int64_t nx = work.peek(w);
+                            if(nx >= 0 && disk() == 2){
+                                const std::string &nextName = Zarr.get_chunkNames(listIndex(nx));
+                                readAheadFile(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(nextName))+"/"+Zarr.chunkKey(nextName));
+                            }
+                        }
+                        if(fileLen == -1) continue;
+
+                        // A fusable chunk a part at a time, from a part that depends on its place
+                        // in the list
+                        uint64_t from = 0, to = sB, typesize = 0;
+                        bytesInRegion(cAV, from, to);
+                        const uint64_t unit = fusable ? fusedUnit(stored, fileLen, typesize) : 0;
+                        if(unit){
+                            if(!copyFused(*scratch, stored, fileLen, unit, typesize, cAV, boxExt, from/sliceBytes, to/sliceBytes, (uint64_t)it,
+                                          subfolderName, name)) break;
+                            continue;
+                        }
+                        const int streamed = zstdFusable ? zstdStreamed(stored, fileLen) : 0;
+                        if(streamed){
+                            if(!copyZstdStream(*scratch, stored, fileLen, streamed == 2, cAV, boxExt, from/sliceBytes, to/sliceBytes,
+                                               subfolderName, name)) break;
+                            continue;
+                        }
+                        // Otherwise decompressed (a blosc chunk only for its slices inside the
+                        // region); uncompressed chunks are used straight from the file buffer
+                        const uint8_t* chunkData = stored;
+                        if(compressor != "none"){
+                            if(!decoded) decoded = scratch->decodedBuffer(sB);
+                            if(!decodeChunkRange(*scratch, scratch->dctx, stored, fileLen, decoded, from, to, subfolderName, name)) break;
+                            chunkData = decoded;
+                        }
+
+                        // If the chunk is all zeros (in the region's slices), skip it
+                        if(zeroChunkUnc && !memcmp(zeroChunkUnc, chunkData+from, to-from)) continue;
+
+                        copyChunk(chunkData, cAV, boxExt, -1, 0, 0);
+                    }
+                    catch(const std::exception &e){
+                        fail(std::string("Read error: ")+e.what()+"\n");
+                        break;
+                    }
+                }
+                try{
+                    readScratchPool.give(omp_get_thread_num(), std::move(scratch));
+                }
+                catch(const std::exception&){}
             }
-            try{
-                readScratchPool.give(omp_get_thread_num(), std::move(scratch));
-            }
-            catch(const std::exception&){}
         }
     }
     if(!useCtx){
