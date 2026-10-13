@@ -7,15 +7,26 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS "-Wall -Wextra")
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
+# cpp-zarr's optimization flags for each build type, unless given on the command
+# line (-DCMAKE_CXX_FLAGS_RELEASE=...). (Cache entries made before project(), which
+# keeps them instead of setting its own defaults.)
+if(NOT DEFINED CMAKE_CXX_FLAGS_DEBUG)
+  set(CMAKE_CXX_FLAGS_DEBUG "-g" CACHE STRING "Flags used by the C++ compiler for Debug builds")
+endif()
+if(NOT DEFINED CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG" CACHE STRING "Flags used by the C++ compiler for RelWithDebInfo builds")
+endif()
+if(NOT DEFINED CMAKE_CXX_FLAGS_RELEASE)
+  set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "Flags used by the C++ compiler for Release builds")
+endif()
 
 project(
   cpp-zarr
   VERSION 1.7.0
   LANGUAGES CXX)
+
+# Warnings, added to the flags given on the command line or in CXXFLAGS
+string(APPEND CMAKE_CXX_FLAGS " -Wall -Wextra")
 
 include(GNUInstallDirs)
 include(FetchContent)
@@ -62,6 +73,12 @@ if (UNIX)
     # Specify the include directories and link the UUID library
     ExternalProject_Get_Property(uuid_external source_dir)
     ExternalProject_Get_Property(uuid_external binary_dir)
+    # The sources include <uuid/uuid.h>: the bundled library's header, which its
+    # tarball keeps at its top level, goes in a uuid/ folder of the build, so
+    # systems without libuuid's headers (uuid-dev) build too, and the header always
+    # matches the library linked in
+    set(UUID_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/uuid_include")
+    configure_file(${UUID_SOURCE_DIR}/uuid.h ${UUID_INCLUDE_DIR}/uuid/uuid.h COPYONLY)
 endif()
 
 # ---- Fetched dependencies -------------------------------------------------
@@ -134,7 +151,7 @@ set_target_properties(cppZarr_shared PROPERTIES PUBLIC_HEADER "${SRC_DIR}/zarr.h
 
 if(UNIX)
     add_dependencies(cppZarr_shared uuid_external)
-    target_include_directories(cppZarr_shared PRIVATE ${source_dir}/include)
+    target_include_directories(cppZarr_shared BEFORE PRIVATE ${UUID_INCLUDE_DIR})
     target_link_libraries(cppZarr_shared PRIVATE ${binary_dir}/.libs/libuuid.a)
 endif()
 

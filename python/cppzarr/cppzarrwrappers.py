@@ -1,7 +1,10 @@
+import itertools
 import json
 import numpy as np
 import os
-from .cppzarr import pybind11_convert_to_v3, pybind11_read_zarr, pybind11_write_zarr
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
+from .cppzarr import pybind11_convert_to_v3, pybind11_default_threads, pybind11_read_zarr, pybind11_write_zarr
 
 
 def _default_chunks(ndim):
@@ -20,10 +23,25 @@ def _fit_coords(coords, ndim, is_end, name):
     return coords
 
 
-def read_zarr(file_name, start_coords=None, end_coords=None, order=None):
+def _threads(num_threads):
+    # A call's number of threads: None (0 to the module) for the default, OpenMP's
+    # (OMP_NUM_THREADS, or every CPU the process may run on)
+    if num_threads is None:
+        return 0
+    if isinstance(num_threads, bool) or int(num_threads) != num_threads or num_threads < 1:
+        raise Exception(f'num_threads must be a whole number of at least 1, not {num_threads!r}')
+    return int(num_threads)
+
+
+def read_zarr(file_name, start_coords=None, end_coords=None, order=None, num_threads=None, out=None):
     # order is the memory layout of the returned array: 'F' (first axis
     # contiguous), 'C' (last axis contiguous), or None (the default) for the
-    # file's own storage order, like zarr-python
+    # file's own storage order, like zarr-python (or out's).
+    # num_threads: the threads this call uses (by default OMP_NUM_THREADS, or every
+    # CPU the process may run on). The GIL is released while reading, so reads from
+    # several Python threads run at once: give each a share of the CPUs.
+    # out: a NumPy array to read into instead of a new one (of the region's shape and
+    # the array's data type, writeable and C- or F-contiguous); it is returned.
     if not (os.path.isfile(os.path.join(file_name, '.zarray')) or os.path.isfile(os.path.join(file_name, 'zarr.json'))):
         raise Exception(f'{file_name} does not exist. No .zarray or zarr.json metadata file was found')
     if order not in (None, 'F', 'C'):
@@ -33,19 +51,127 @@ def read_zarr(file_name, start_coords=None, end_coords=None, order=None):
         start_coords = [0, 0, 0]
     if end_coords is None:
         end_coords = [0, 0, 0]
-    im = pybind11_read_zarr(file_name, list(start_coords), list(end_coords), order or '')
+    im = pybind11_read_zarr(file_name, list(start_coords), list(end_coords), order or '', _threads(num_threads), out)
     return im
+
+
+def _cpus():
+    # The CPUs this process may run on
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+# The threads that run batches of reads, one pool per number of threads each read uses:
+# a thread keeps its OpenMP team at one size (OpenMP runtimes end and recreate threads
+# when a thread's team changes size, which made small reads several times slower)
+_pools = {}
+_pools_lock = threading.Lock()
+_pools_pid = os.getpid()
+
+
+def _pool(threads_per_read):
+    global _pools_pid
+    with _pools_lock:
+        # (a forked child has the pools but none of their threads: it makes its own)
+        if os.getpid() != _pools_pid:
+            _pools.clear()
+            _pools_pid = os.getpid()
+        pool = _pools.get(threads_per_read)
+        if pool is None:
+            pool = _pools[threads_per_read] = ThreadPoolExecutor(max_workers=max(_cpus(), 1),
+                                                                 thread_name_prefix=f'cppzarr{threads_per_read}')
+        return pool
+
+
+# Elements a read's thread works on: reads of up to this many use one thread each, and
+# larger ones a thread per this many (an 8 MiB uint16 region with 64 chunks spent a third
+# of its time on a call's fixed costs at 12 threads; a 128 MiB one scaled to 16 threads)
+_ELEMENTS_PER_THREAD = 8 << 20
+
+
+def _region_elements(file_name, start_coords, end_coords):
+    # The number of elements a request reads (for the whole array, from its metadata)
+    if start_coords is not None and end_coords is not None and any(end_coords):
+        return int(np.prod([int(e) - int(s) for s, e in zip(start_coords, end_coords)], dtype=np.float64))
+    for f in ('.zarray', 'zarr.json'):
+        path = os.path.join(file_name, f)
+        if os.path.isfile(path):
+            with open(path) as h:
+                shape = json.load(h)['shape']
+            stop = [int(e) for e in end_coords] if end_coords is not None and any(end_coords) else shape
+            begin = [int(s) for s in start_coords] if start_coords is not None else [0] * len(shape)
+            return int(np.prod([e - s for s, e in zip(begin, stop)], dtype=np.float64))
+    return 0
+
+
+def read_zarr_batch(requests, order=None, num_threads=None):
+    # Read many regions at once, as reading them one after another with read_zarr does,
+    # but with the reads overlapping (the GIL is released while reading): the way to
+    # read a batch of regions, from one array or many, when each is small or the
+    # storage is slow. requests: a list of (file_name, start_coords, end_coords) or
+    # (file_name, start_coords, end_coords, out); start_coords and end_coords may be
+    # None (the whole array) and out None (a new array). Returns the arrays, in the
+    # order of the requests.
+    # num_threads: the threads the batch uses (by default, as for read_zarr,
+    # OMP_NUM_THREADS, or every CPU this process may run on). Each read gets a thread per
+    # 8M elements it reads (at least one, at most all of them), and as many reads as the
+    # threads allow run at once.
+    requests = [tuple(r) + (None,) * (4 - len(r)) for r in requests]
+    if any(len(r) != 4 for r in requests):
+        raise Exception('Each request is (file_name, start_coords, end_coords) or (file_name, start_coords, end_coords, out)')
+    if not requests:
+        return []
+    total = _threads(num_threads) or pybind11_default_threads()
+    sizes = sorted(_region_elements(r[0], r[1], r[2]) for r in requests)
+    per_read = min(total, max(1, round(sizes[len(sizes) // 2] / _ELEMENTS_PER_THREAD)))
+    at_once = max(1, min(len(requests), round(total / per_read)))
+    # (the threads split as evenly as they go: some reads may get one more)
+    threads = [total // at_once + (i < total % at_once) for i in range(at_once)]
+    results = [None] * len(requests)
+    following = itertools.count()
+    lock = threading.Lock()
+    failed = []
+
+    def reader(each):
+        # (each task takes the next request until none are left, or a read has failed)
+        while not failed:
+            with lock:
+                i = next(following)
+            if i >= len(requests):
+                return
+            file_name, start, end, out = requests[i]
+            try:
+                results[i] = read_zarr(file_name, start, end, order=order, num_threads=each, out=out)
+            except BaseException:
+                failed.append(True)
+                raise
+
+    futures = [_pool(each).submit(reader, each) for each in threads]
+    # (a failed read's error is raised once the reads under way have ended)
+    wait(futures)
+    for f in futures:
+        f.result()
+    return results
 
 
 def _metadata_dtype(meta):
     # The element type of an array's metadata (.zarray dtype, or zarr.json
     # data_type), in native byte order; None if NumPy cannot describe it as a
-    # number type
+    # number type. bfloat16 is ml_dtypes' type.
+    name = meta['dtype'] if 'dtype' in meta else meta['data_type']
+    if isinstance(name, str) and name.lstrip('<>|') == 'bfloat16':
+        try:
+            import ml_dtypes
+        except ImportError:
+            raise Exception('Writing into a bfloat16 array needs the ml_dtypes package (pip install ml_dtypes)')
+        return np.dtype(ml_dtypes.bfloat16)
     try:
-        dt = np.dtype(meta['dtype'] if 'dtype' in meta else meta['data_type'])
+        dt = np.dtype(name)
     except Exception:
         return None
-    return dt.newbyteorder('=') if dt.kind in 'uif' else None
+    return dt.newbyteorder('=') if dt.kind in 'buifc' else None
 
 
 def _existing_format(file_name):
@@ -58,13 +184,15 @@ def _existing_format(file_name):
 
 
 def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd', clevel=1, order=None, chunks=None,
-               dimension_separator=None, zarr_format=None, shards=None):
+               dimension_separator=None, zarr_format=None, shards=None, num_threads=None):
     # zarr_format: 2 or 3. By default the format of the array already at file_name,
     # or 2 for a new one. Zarr v3 arrays default to C order and chunk files named
     # c/0/0/0 (order='C', dimension_separator='/'), v2 ones to F order and chunk
     # files in nested folders, 0/0/0 (dimension_separator='/'; '.' names them 0.0.0,
     # all in one folder, which writes much slower on network file systems).
     # shards (Zarr v3 only) is the shard shape: chunks then sets the inner chunks.
+    # num_threads: the threads this call uses, as for read_zarr (the GIL is released
+    # while writing).
     crop = start_coords is not None or end_coords is not None
     existing = _existing_format(file_name)
     if zarr_format not in (None, 2, 3):
@@ -128,7 +256,7 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
                                         for s, n in zip(data.strides, data.shape)):
         data = np.array(data, order='K')
     pybind11_write_zarr(file_name, data, start_coords, end_coords, cname, clevel, order, chunks, dimension_separator, crop,
-                        zarr_format, shards or [])
+                        zarr_format, shards or [], _threads(num_threads))
     return
 
 

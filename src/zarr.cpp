@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <omp.h>
@@ -6,8 +7,6 @@
 #ifdef _WIN32
 #include <stdarg.h>
 #include <sys/time.h>
-#else
-#include <uuid/uuid.h>
 #endif
 #include <fstream>
 #include "zarr.h"
@@ -15,7 +14,8 @@
 
 // A metadata fill_value as the zarr class keeps it: integers in decimal, other
 // numbers in full precision, "NaN", "Infinity", "-Infinity" and Zarr v3's "0x..."
-// bit patterns as they are, and "0" for no fill value (null)
+// bit patterns as they are, a complex number's [real, imaginary] pair as its JSON
+// text, and "0" for no fill value (null)
 static std::string fillValueString(const json &v){
     if(v.is_null()) return "0";
     if(v.is_boolean()) return v.get<bool>() ? "1" : "0";
@@ -32,7 +32,48 @@ static std::string fillValueString(const json &v){
         const std::string s = v.get<std::string>();
         return s.empty() || s == "null" ? "0" : s;
     }
+    if(v.is_array() && v.size() == 2) return v.dump();
     throw std::string("metadataIncomplete");
+}
+
+// One float of a fill value as JSON writes it: a number, or "NaN", "Infinity",
+// "-Infinity" as strings. A Zarr v2 .zarray has no "0x..." bit patterns: those
+// become the value they stand for (bytes: 2, 4 or 8; bfloat16 for 2-byte bfloat16).
+static json floatFillJson(const std::string &f, const uint64_t bytes, const bool bfloat16, const bool bitsAllowed){
+    if(f == "NaN" || f == "Infinity" || f == "-Infinity") return f;
+    const bool bits = f.size() > 2 && f[0] == '0' && (f[1] == 'x' || f[1] == 'X');
+    if(bits && bitsAllowed) return f;
+    double v = 0;
+    if(bits){
+        uint8_t elem[16];
+        const std::string dtype = bytes == 2 ? (bfloat16 ? "bfloat16" : "<f2") : bytes == 4 ? "<f4" : "<f8";
+        fillValueElement(f, isLittleEndian() ? dtype : (bfloat16 ? ">bfloat16" : ">"+dtype.substr(1)), elem);
+        if(bytes == 8) memcpy(&v, elem, 8);
+        else if(bytes == 4){ float x; memcpy(&x, elem, 4); v = x; }
+        else{ uint16_t h; memcpy(&h, elem, 2); v = bfloat16 ? bfloat16ToFloat(h) : halfToFloat(h); }
+        if(std::isnan(v)) return "NaN";
+        if(std::isinf(v)) return v > 0 ? "Infinity" : "-Infinity";
+    }
+    else v = strtod(f.c_str(), NULL);
+    // (whole numbers as integers, as cpp-zarr has always written them)
+    if(std::isfinite(v) && v == std::floor(v) && std::fabs(v) < 9e15 && !(v == 0 && std::signbit(v))) return (int64_t)v;
+    return v;
+}
+
+// A complex number's fill value as JSON writes it: [real, imaginary]
+static json complexFillJson(const std::string &f, const uint64_t bytes, const bool bitsAllowed){
+    json parts = json::array();
+    try{
+        const json v = json::parse(f);
+        if(v.is_array() && v.size() == 2){
+            for(const json &p : v) parts.push_back(p.is_string() ? p.get<std::string>() : fillValueString(p));
+        }
+    }
+    catch(...){}
+    if(parts.empty()) parts = json::array({f, "0"});
+    json out = json::array();
+    for(const json &p : parts) out.push_back(floatFillJson(p.get<std::string>(), bytes/2, false, bitsAllowed));
+    return out;
 }
 
 // ---- Zarr v3 metadata (zarr.json) ---------------------------------------------
@@ -189,6 +230,18 @@ void zarr::parseZarrJson(){
         dimension_separator = extConfig(keys).value("separator", encoding == "default" ? "/" : ".");
         if(dimension_separator != "/" && dimension_separator != ".") unsupportedV3("its chunk key separator is not \"/\" or \".\"");
 
+        // The data type (before the codecs: a type cpp-zarr does not read, such as
+        // strings, often comes with codecs it does not know either)
+        {
+            const json &dataType = m.at("data_type");
+            const char* const known[] = {"bool", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+                                         "float16", "float32", "float64", "complex64", "complex128", "bfloat16"};
+            bool ok = false;
+            if(dataType.is_string()) for(const char* k : known) ok = ok || dataType.get<std::string>() == k;
+            if(!ok) unsupportedV3("its data type "+(dataType.is_string() ? "\""+dataType.get<std::string>()+"\" " : std::string())+
+                                  "is not supported");
+        }
+
         // Codecs, and for a sharded array its inner chunks and shard index
         const V3Codecs outer = parseV3Codecs(m.at("codecs"), n, true);
         V3Codecs inner = outer;
@@ -220,9 +273,13 @@ void zarr::parseZarrJson(){
         if(t == "bool"){ kind = 'b'; size = 1; }
         else if(t == "int8" || t == "int16" || t == "int32" || t == "int64"){ kind = 'i'; size = std::stoi(t.substr(3))/8; }
         else if(t == "uint8" || t == "uint16" || t == "uint32" || t == "uint64"){ kind = 'u'; size = std::stoi(t.substr(4))/8; }
-        else if(t == "float32" || t == "float64"){ kind = 'f'; size = std::stoi(t.substr(5))/8; }
+        else if(t == "float16" || t == "float32" || t == "float64"){ kind = 'f'; size = std::stoi(t.substr(5))/8; }
+        else if(t == "complex64" || t == "complex128"){ kind = 'c'; size = std::stoi(t.substr(7))/8; }
+        // (bfloat16: a Zarr extension data type)
+        else if(t == "bfloat16"){ kind = 'f'; size = 2; }
         else unsupportedV3("its data type \""+t+"\" is not supported");
-        dtype = std::string(size == 1 ? "|" : inner.bigEndian ? ">" : "<")+kind+std::to_string(size);
+        if(t == "bfloat16") dtype = std::string(inner.bigEndian ? ">" : "")+"bfloat16";
+        else dtype = std::string(size == 1 ? "|" : inner.bigEndian ? ">" : "<")+kind+std::to_string(size);
 
         // Each chunk's storage order: C, F, or another transpose
         order = "C";
@@ -257,18 +314,31 @@ void zarr::parseZarrJson(){
             clevel = (uint64_t)cc.value("level", (int64_t)0);
         }
 
-        // Fill value: a number, true/false, or for floats "NaN", "Infinity",
-        // "-Infinity" or a "0x..." bit pattern
+        // Fill value: a number, true/false, for floats "NaN", "Infinity",
+        // "-Infinity" or a "0x..." bit pattern, and for complex numbers a pair of
+        // those, [real, imaginary]
         const json &fv = m.at("fill_value");
+        // (one float of the fill value, of partBytes bytes)
+        auto floatFill = [](const json &v, const int partBytes){
+            if(v.is_number()) return true;
+            if(!v.is_string()) return false;
+            const std::string f = v.get<std::string>();
+            const bool bits = f.size() == 2+2*(size_t)partBytes && f[0] == '0' && (f[1] == 'x' || f[1] == 'X');
+            return f == "NaN" || f == "Infinity" || f == "-Infinity" || bits;
+        };
         if(kind == 'b'){
             if(!fv.is_boolean()) throw std::string("metadataIncomplete");
             fill_value = fv.get<bool>() ? "1" : "0";
         }
+        else if(kind == 'c'){
+            if(!fv.is_array() || fv.size() != 2 || !floatFill(fv[0], size/2) || !floatFill(fv[1], size/2)){
+                throw std::string("metadataIncomplete");
+            }
+            fill_value = fv.dump();
+        }
         else if(fv.is_string()){
-            const std::string f = fv.get<std::string>();
-            const bool bits = f.size() == 2+2*(size_t)size && f[0] == '0' && (f[1] == 'x' || f[1] == 'X');
-            if(kind != 'f' || !(f == "NaN" || f == "Infinity" || f == "-Infinity" || bits)) throw std::string("metadataIncomplete");
-            fill_value = f;
+            if(kind != 'f' || !floatFill(fv, size)) throw std::string("metadataIncomplete");
+            fill_value = fv.get<std::string>();
         }
         else if(fv.is_number()) fill_value = fillValueString(fv);
         else throw std::string("metadataIncomplete");
@@ -382,6 +452,7 @@ zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
         }
 
         dtype = zarray.at("dtype");
+        if(!dtypeInfo(dtype).kind) throw std::string("metadataUnsupported:its data type \""+dtype+"\" is not supported");
         fill_value = fillValueString(zarray.at("fill_value"));
         // Filters (numcodecs Delta, Shuffle, ...) change the stored values, and
         // are not applied: such arrays cannot be read
@@ -527,12 +598,14 @@ void zarr::convert_to_v3(){
 json zarr::v3Metadata(const bool existingChunks) const{
     auto unsupported = [](const std::string &why){ return std::string("v3Unsupported:")+why; };
     const uint64_t n = shape.size();
-    const uint64_t bytes = dtypeBytes();
-    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
+    const DtypeInfo info = dtypeInfo(dtype);
+    const uint64_t bytes = info.bytes;
+    const char kind = info.kind;
     std::string dataType;
-    if(kind == 'b' && bytes == 1) dataType = "bool";
-    else if((kind == 'u' || kind == 'i') && bytes) dataType = std::string(kind == 'u' ? "uint" : "int")+std::to_string(8*bytes);
-    else if(kind == 'f' && (bytes == 4 || bytes == 8)) dataType = "float"+std::to_string(8*bytes);
+    if(kind == 'b') dataType = "bool";
+    else if(kind == 'u' || kind == 'i') dataType = std::string(kind == 'u' ? "uint" : "int")+std::to_string(8*bytes);
+    else if(kind == 'f') dataType = info.bfloat16 ? "bfloat16" : "float"+std::to_string(8*bytes);
+    else if(kind == 'c') dataType = "complex"+std::to_string(8*bytes);
     else throw unsupported("its data type \""+dtype+"\" is not supported");
     if(std::any_of(subfolders.begin(), subfolders.end(), [](uint64_t v){ return v != 0; })){
         throw unsupported("subfolders cannot be described in Zarr v3");
@@ -561,7 +634,7 @@ json zarr::v3Metadata(const bool existingChunks) const{
         if(!cOrder && !fOrder) axes = old;
     }
     if(!axes.empty()) chunkCodecs.push_back({{"name", "transpose"}, {"configuration", {{"order", axes}}}});
-    if(bytes > 1) chunkCodecs.push_back({{"name", "bytes"}, {"configuration", {{"endian", dtype[0] == '>' ? "big" : "little"}}}});
+    if(bytes > 1) chunkCodecs.push_back({{"name", "bytes"}, {"configuration", {{"endian", info.bigEndian ? "big" : "little"}}}});
     else chunkCodecs.push_back({{"name", "bytes"}});
     const std::string compressor = get_compressor();
     if(compressor == "blosc"){
@@ -605,6 +678,7 @@ json zarr::v3Metadata(const bool existingChunks) const{
         if(fill_value == "NaN" || fill_value == "Infinity" || fill_value == "-Infinity" || bits) fill = fill_value;
         else fill = strtod(fill_value.c_str(), NULL);
     }
+    else if(kind == 'c') fill = complexFillJson(fill_value, bytes, true);
     else if(kind == 'u') fill = (uint64_t)strtoull(fill_value.c_str(), NULL, 10);
     else fill = (int64_t)strtoll(fill_value.c_str(), NULL, 10);
 
@@ -700,7 +774,11 @@ const std::string &zarr::get_dtype() const{
 }
 
 void zarr::set_dtype(const std::string &dtype){
-    this->dtype = dtype;
+    // 1-byte types have no byte order: "|u1", "|i1" and "|b1", as NumPy names them
+    // (zarr-python 3 does not open v2 arrays whose dtype is "<u1")
+    const DtypeInfo t = dtypeInfo(dtype);
+    if(t.kind && t.bytes == 1 && dtype[0] != '|') this->dtype = std::string("|")+dtype.substr(1);
+    else this->dtype = dtype;
 }
 
 const std::string &zarr::get_fill_value() const{
@@ -732,12 +810,7 @@ void zarr::set_shape(const std::vector<uint64_t> &shape){
 }
 
 const uint64_t zarr::dtypeBytes() const{
-    if(dtype.size() != 3) return 0;
-    else if(dtype[2] == '1') return 1;
-    else if(dtype[2] == '2') return 2;
-    else if(dtype[2] == '4') return 4;
-    else if(dtype[2] == '8') return 8;
-    else return 0;
+    return dtypeInfo(dtype).bytes;
 }
 
 // Set the values of the JSON file to the current member values
@@ -764,10 +837,18 @@ void zarr::set_jsonValues(){
     if(dimension_separator == "/") zarray["dimension_separator"] = dimension_separator;
 
     zarray["dtype"] = dtype;
-    if(fill_value == "NaN") zarray["fill_value"] = fill_value;
-    else if(fill_value == "null") zarray["fill_value"] = nullptr;
+    // The fill value: floats as numbers or "NaN", "Infinity" and "-Infinity",
+    // complex numbers as [real, imaginary], booleans as true or false, integers as
+    // integers (and the Infinity of older metadata as the int64 limits)
+    const DtypeInfo info = dtypeInfo(dtype);
+    if(fill_value == "null") zarray["fill_value"] = nullptr;
+    else if(info.kind == 'f') zarray["fill_value"] = floatFillJson(fill_value, info.bytes, info.bfloat16, false);
+    else if(info.kind == 'c') zarray["fill_value"] = complexFillJson(fill_value, info.bytes, false);
+    else if(info.kind == 'b') zarray["fill_value"] = fill_value == "1" || fill_value == "true";
+    else if(fill_value == "NaN") zarray["fill_value"] = fill_value;
     else if(fill_value == "Infinity") zarray["fill_value"] = std::numeric_limits<int64_t>::max();
     else if(fill_value == "-Infinity") zarray["fill_value"] = std::numeric_limits<int64_t>::min();
+    else if(info.kind == 'u' && !fill_value.empty() && fill_value[0] != '-') zarray["fill_value"] = (uint64_t)std::stoull(fill_value);
     else zarray["fill_value"] = std::stoll(fill_value);
     zarray["filters"] = nullptr;
     zarray["order"] = order;    

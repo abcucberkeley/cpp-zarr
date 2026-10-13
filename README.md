@@ -42,7 +42,7 @@ The writer takes an output filename and a numpy array with optional arguments fo
 
 The following compressors are supported: blosclz, lz4, lz4hc, gzip, zlib, zstd, and none (uncompressed)
 
-The following data types are supported: uint8, int8, uint16, int16, uint32, int32, uint64, int64, float32/single, and float64/double
+The following data types are supported: bool, uint8, int8, uint16, int16, uint32, int32, uint64, int64, float16, float32/single, float64/double, complex64, complex128, and bfloat16 (the Zarr extension data type; reading and writing it in Python needs the ml_dtypes package: `pip install ml_dtypes`)
 
 zstd is recommended for when you want smaller file sizes or disk limited processing such as when using a cluster
 
@@ -94,6 +94,47 @@ cppzarr.write_zarr('outputFilename.zarr', im, cname='zstd', clevel=1, order='F',
 # Zarr v3 with 1024x1024x1024 shards made of 256x256x256 chunks (shards must be a multiple of chunks).
 # Zarr v3 files default to order='C' and dimension_separator='/' (chunk files named c/0/0/0)
 cppzarr.write_zarr('outputFilename.zarr', im, zarr_format=3, cname='zstd', clevel=1, chunks=[256, 256, 256], shards=[1024, 1024, 1024])
+````
+
+#### Data types
+````
+import numpy as np
+import cppzarr
+
+# The array's data type is the numpy array's: float16, complex64 and bool arrays included
+cppzarr.write_zarr('half.zarr', np.random.rand(256, 256, 64).astype(np.float16))
+
+# bfloat16 arrays are ml_dtypes' bfloat16 type
+import ml_dtypes
+cppzarr.write_zarr('bf16.zarr', np.random.rand(256, 256, 64).astype(ml_dtypes.bfloat16), zarr_format=3)
+````
+
+#### Threads, reading into an array, and reading from several threads or processes
+````
+import numpy as np
+import cppzarr
+
+# A call uses every CPU by default (or OMP_NUM_THREADS); num_threads sets it for one call
+im = cppzarr.read_zarr('filename.zarr', num_threads=4)
+
+# Read a region into an existing array instead of a new one (of the region's shape and the
+# array's data type, C- or F-contiguous), such as one slot of a batch buffer
+batch = np.empty((8, 128, 128, 128), dtype=np.uint16)
+cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
+
+# Reads and writes release the GIL, so several Python threads can read at once: give each
+# a share of the CPUs with num_threads. The same goes for several processes reading at once
+# (a multiprocessing pool, a data loader's workers): give each process a share with
+# num_threads (a bigger one to those with more to read), or OMP_NUM_THREADS set before
+# cppzarr is imported. Processes that each use every CPU make one another's reads several
+# times slower.
+
+# Or read a batch of regions at once (from one array or several), new arrays or into given ones:
+# the reads overlap and share num_threads threads (by default, as for a call, OMP_NUM_THREADS
+# or every CPU), each read getting more of them the larger it is
+regions = [('filename.zarr', [0, 0, 128*i], [128, 128, 128*(i+1)]) for i in range(8)]
+arrays = cppzarr.read_zarr_batch(regions, num_threads=8)
+cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_threads=8)
 ````
 
 #### Write a region to an existing Zarr file
@@ -173,6 +214,11 @@ parallelWriteZarr('path/to/file.zarr',im);
 parallelWriteZarr('path/to/file.zarr',im,'chunks',[64 64 64]);
 % Write with a compressor and compression level (blosc's lz4 at level 5 by default; levels go from 0 to 9)
 parallelWriteZarr('path/to/file.zarr',im,'cname','zstd','clevel',1);
+% Write a new array of another data type than the data's (here float16; also 'bfloat16', 'uint16', 'single', '<u2', ...).
+% MATLAB has no 16-bit float class: float16 and bfloat16 arrays read as single. Logical arrays are written as bool,
+% complex single and double as complex64 and complex128, and data written into an existing array is converted to its
+% data type as MATLAB converts between classes.
+parallelWriteZarr('path/to/file.zarr',single(im),'dtype','float16');
 % Write into a region of an existing Zarr file ([starts ends] as in parallelReadZarr); the file keeps its Zarr version
 parallelWriteZarr('path/to/file.zarr',im(1:50,:,:),'bbox',[1 1 1 50 100 100]);
 % Write a Zarr v3 file (C order and chunk files named c/0/0/0 by default; 'order','F' still works)

@@ -1,3 +1,4 @@
+#include <cstring>
 #include "mex.h"
 #include "../src/helperfunctions.h"
 #include "../src/parallelreadzarr.h"
@@ -100,44 +101,79 @@ void mexFunction(int nlhs, mxArray *plhs[],
     for(uint64_t d = 0; d < nDims; d++) readSize *= readShape[d];
 
     // Map the zarr dtype to the matching MATLAB class. The read machinery is
-    // element-width based, so one generic path covers every supported dtype:
-    // signed/unsigned 8/16/32/64-bit integers, 32/64-bit floats and booleans.
+    // element-width based, so one generic path covers every supported dtype. MATLAB
+    // has no 16-bit float class: float16 and bfloat16 arrays read as single. Complex
+    // arrays read as complex single and double.
     const std::string dtype = Zarr.get_dtype();
-    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
-    const char dsize = dtype.size() == 3 ? dtype[2] : '\0';
+    const DtypeInfo t = dtypeInfo(dtype);
     mxClassID mxClass = mxUNKNOWN_CLASS;
-    if(kind == 'u'){
-        if(dsize == '1') mxClass = mxUINT8_CLASS;
-        else if(dsize == '2') mxClass = mxUINT16_CLASS;
-        else if(dsize == '4') mxClass = mxUINT32_CLASS;
-        else if(dsize == '8') mxClass = mxUINT64_CLASS;
+    if(t.kind == 'u'){
+        if(t.bytes == 1) mxClass = mxUINT8_CLASS;
+        else if(t.bytes == 2) mxClass = mxUINT16_CLASS;
+        else if(t.bytes == 4) mxClass = mxUINT32_CLASS;
+        else if(t.bytes == 8) mxClass = mxUINT64_CLASS;
     }
-    else if(kind == 'i'){
-        if(dsize == '1') mxClass = mxINT8_CLASS;
-        else if(dsize == '2') mxClass = mxINT16_CLASS;
-        else if(dsize == '4') mxClass = mxINT32_CLASS;
-        else if(dsize == '8') mxClass = mxINT64_CLASS;
+    else if(t.kind == 'i'){
+        if(t.bytes == 1) mxClass = mxINT8_CLASS;
+        else if(t.bytes == 2) mxClass = mxINT16_CLASS;
+        else if(t.bytes == 4) mxClass = mxINT32_CLASS;
+        else if(t.bytes == 8) mxClass = mxINT64_CLASS;
     }
-    else if(kind == 'f'){
-        if(dsize == '4') mxClass = mxSINGLE_CLASS;
-        else if(dsize == '8') mxClass = mxDOUBLE_CLASS;
-    }
-    else if(kind == 'b' && dsize == '1') mxClass = mxLOGICAL_CLASS;
+    else if(t.kind == 'f') mxClass = t.bytes == 8 ? mxDOUBLE_CLASS : mxSINGLE_CLASS;
+    else if(t.kind == 'c') mxClass = t.bytes == 16 ? mxDOUBLE_CLASS : mxSINGLE_CLASS;
+    else if(t.kind == 'b') mxClass = mxLOGICAL_CLASS;
     if(mxClass == mxUNKNOWN_CLASS) mexErrMsgIdAndTxt("zarr:dataTypeError","Data type \"%s\" is not supported",dtype.c_str());
 
     // The output starts as the fill value, which is what missing chunks read as
     const uint64_t bytes = Zarr.dtypeBytes();
-    uint8_t fillElem[8];
+    uint8_t fillElem[16];
     fillValueElement(Zarr.get_fill_value(), dtype, fillElem);
     bool fill = false;
     for(uint64_t b = 0; b < bytes; b++) fill = fill || fillElem[b];
+    const bool cplx = t.kind == 'c';
+    // 16-bit floats are read into a buffer and widened; so are complex numbers when
+    // MATLAB keeps their real and imaginary parts apart
+    bool viaBuffer = t.kind == 'f' && t.bytes == 2;
+#if !(MX_HAS_INTERLEAVED_COMPLEX)
+    viaBuffer = viaBuffer || cplx;
+#endif
     if(mxClass == mxLOGICAL_CLASS) plhs[0] = mxCreateLogicalArray(dim.size(),dim.data());
-    else if(fill) plhs[0] = mxCreateUninitNumericArray(dim.size(),dim.data(),mxClass, mxREAL);
-    else plhs[0] = mxCreateNumericArray(dim.size(),dim.data(),mxClass, mxREAL);
-    void* zarrArr = mxGetData(plhs[0]);
+    else if(fill || viaBuffer) plhs[0] = mxCreateUninitNumericArray(dim.size(),dim.data(),mxClass, cplx ? mxCOMPLEX : mxREAL);
+    else plhs[0] = mxCreateNumericArray(dim.size(),dim.data(),mxClass, cplx ? mxCOMPLEX : mxREAL);
+    void* zarrArr = viaBuffer ? malloc(readSize*bytes ? readSize*bytes : 1) : mxGetData(plhs[0]);
+    if(!zarrArr) mexErrMsgIdAndTxt("zarr:readError","Out of memory");
     if(fill) fillElements(bytes, zarrArr, readSize, fillElem);
+    else if(viaBuffer) memset(zarrArr, 0, readSize*bytes);
     err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,useCtx,sparse);
-
-    if(err) mexErrMsgIdAndTxt("zarr:readError",Zarr.get_errString().c_str());
-
+    if(err){
+        if(viaBuffer) free(zarrArr);
+        mexErrMsgIdAndTxt("zarr:readError",Zarr.get_errString().c_str());
+    }
+    if(viaBuffer){
+        const int64_t n = (int64_t)readSize;
+        if(t.kind == 'f'){
+            const uint16_t* src = (const uint16_t*)zarrArr;
+            float* out = (float*)mxGetData(plhs[0]);
+            const bool bf = t.bfloat16;
+            #pragma omp parallel for
+            for(int64_t i = 0; i < n; i++) out[i] = bf ? bfloat16ToFloat(src[i]) : halfToFloat(src[i]);
+        }
+#if !(MX_HAS_INTERLEAVED_COMPLEX)
+        else if(t.bytes == 8){
+            const float* src = (const float*)zarrArr;
+            float* re = (float*)mxGetData(plhs[0]);
+            float* im = (float*)mxGetImagData(plhs[0]);
+            #pragma omp parallel for
+            for(int64_t i = 0; i < n; i++){ re[i] = src[2*i]; im[i] = src[2*i+1]; }
+        }
+        else{
+            const double* src = (const double*)zarrArr;
+            double* re = (double*)mxGetData(plhs[0]);
+            double* im = (double*)mxGetImagData(plhs[0]);
+            #pragma omp parallel for
+            for(int64_t i = 0; i < n; i++){ re[i] = src[2*i]; im[i] = src[2*i+1]; }
+        }
+#endif
+        free(zarrArr);
+    }
 }

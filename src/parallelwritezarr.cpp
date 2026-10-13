@@ -10,8 +10,6 @@
 #include <omp.h>
 #ifdef _WIN32
 #include <sys/time.h>
-#else
-#include <uuid/uuid.h>
 #endif
 #include <fstream>
 #include "blosc.h"
@@ -209,24 +207,13 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         for(int64_t i = (int64_t)nDims-1; i >= 0; i--){ chunkStrides[axes[i]] = acc; acc *= chunkDims[axes[i]]; }
     }
 
-    // Parse the fill value once (stoi would throw on Infinity-normalized fills,
-    // and the C-order path below fills per element).
-    const int fillValue = fillValueToInt(Zarr.get_fill_value());
-
-    // The fill value for elements outside the written region: F-order chunks
-    // have always been filled byte-wise (memset), C-order chunks per element.
-    uint8_t fillElem[8] = {0};
-    {
-        const std::string &dtype = Zarr.get_dtype();
-        const char kind = dtype.size() == 3 ? dtype[1] : '\0';
-        if(kind == 'f' && bytes == 4){ const float v = (float)fillValue; memcpy(fillElem, &v, 4); }
-        else if(kind == 'f' && bytes == 8){ const double v = (double)fillValue; memcpy(fillElem, &v, 8); }
-        else if(bytes == 1){ const uint8_t v = (uint8_t)fillValue; memcpy(fillElem, &v, 1); }
-        else if(bytes == 2){ const uint16_t v = (uint16_t)fillValue; memcpy(fillElem, &v, 2); }
-        else if(bytes == 4){ const uint32_t v = (uint32_t)fillValue; memcpy(fillElem, &v, 4); }
-        else if(bytes == 8){ const uint64_t v = (uint64_t)(int64_t)fillValue; memcpy(fillElem, &v, 8); }
-        if(Zarr.get_order() != "C") memset(fillElem, fillValue, sizeof(fillElem));
-    }
+    // The fill value as one element, in every order and data type: what the
+    // elements of a new chunk outside the written region get (they read back as
+    // the fill value, as missing chunks do), what inner chunks a crop write
+    // completes get when they are missing from their shard, and what v2 chunks a
+    // crop write completes get when they do not exist yet
+    uint8_t fillElem[16];
+    fillValueElement(Zarr.get_fill_value(), Zarr.get_dtype(), fillElem);
 
     // blosc (both blosc1 and blosc2) stores each chunk as a single frame with
     // 32-bit size fields, so one chunk cannot exceed BLOSC_MAX_BUFFERSIZE
@@ -264,20 +251,16 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     const uint64_t emptyEntry = std::numeric_limits<uint64_t>::max();
     const uint64_t indexBytes = 2*perShard*sizeof(uint64_t)+(indexChecksum ? sizeof(uint32_t) : 0);
 
-    // The fill value as one element, for inner chunks a crop write completes that
-    // are missing from their shard, and v2 chunks a crop write completes that do
-    // not exist yet
-    uint8_t typedFill[8];
-    fillValueElement(Zarr.get_fill_value(), Zarr.get_dtype(), typedFill);
+    const uint8_t* const typedFill = fillElem;
     // Blosc's shuffle: as a Zarr v3 array's codec says, and always byte shuffle in
     // v2 arrays, as cpp-zarr has always written them
     const uint64_t shuffle = Zarr.get_shuffle();
     const int bloscShuffle = Zarr.get_zarr_format() != 3 || shuffle > 2 ? BLOSC_SHUFFLE : (int)shuffle;
 
     // Sparse writes leave all-zero chunks unwritten, when that is how a missing
-    // chunk reads back (a fill value of zero)
+    // chunk reads back (a fill value whose bytes are all zero)
     void* zeroChunkUnc = NULL;
-    if(sparse && fillValueIsZero(Zarr.get_fill_value())){
+    if(sparse && fillValueIsZero(Zarr.get_fill_value(), Zarr.get_dtype())){
         zeroChunkUnc = calloc(s,bytes);
     }
 

@@ -78,6 +78,85 @@ function test_matlab(mexDir)
         fprintf('PASS  %s\n', t);
     end
 
+    % Data types beyond MATLAB's numeric classes: logical arrays are bool, complex
+    % single and double are complex64 and complex128, and float16 and bfloat16 arrays
+    % (the dtype option) read as single. Data is converted to an array's data type as
+    % MATLAB converts between classes.
+    m = rand(sz) > 0.5;
+    fb = fullfile(tmp, 'rt_logical.zarr');
+    parallelWriteZarr(fb, m);
+    meta = jsondecode(fileread(fullfile(fb, '.zarray')));
+    b = parallelReadZarr(fb);
+    assert(strcmp(meta.dtype, '|b1') && isa(b, 'logical') && isequal(b, m), 'logical round trip mismatch');
+    parallelWriteZarr(fb, ~m(5:20, 3:9, 2:7), 'bbox', [5 3 2 20 9 7]);
+    m(5:20, 3:9, 2:7) = ~m(5:20, 3:9, 2:7);
+    assert(isequal(parallelReadZarr(fb), m), 'logical bbox write mismatch');
+    for cls = {'single', 'double'}
+        c = complex(cast((rand(sz) - 0.5) * 1000, cls{1}), cast((rand(sz) - 0.5) * 1000, cls{1}));
+        for fmt = [2 3]
+            fc = fullfile(tmp, sprintf('rt_complex_%s_v%d.zarr', cls{1}, fmt));
+            parallelWriteZarr(fc, c, 'zarr_format', fmt, 'chunks', [16 16 16]);
+            b = parallelReadZarr(fc);
+            assert(isa(b, cls{1}) && ~isreal(b) && isequal(b, c), 'complex %s v%d round trip mismatch', cls{1}, fmt);
+            assert(isequal(parallelReadZarr(fc, 'bbox', [3 2 1 30 20 9]), c(3:30, 2:20, 1:9)), 'complex %s bbox read mismatch', cls{1});
+            % real data into a complex array (imaginary part 0), and a C-order array
+            parallelWriteZarr(fc, real(c(1:10, 1:5, 1:3)), 'bbox', [1 1 1 10 5 3]);
+            e = c;  e(1:10, 1:5, 1:3) = complex(real(c(1:10, 1:5, 1:3)), 0);
+            assert(isequal(parallelReadZarr(fc), e), 'real data into complex %s array mismatch', cls{1});
+        end
+        fcc = fullfile(tmp, ['rt_complex_' cls{1} '_C.zarr']);
+        createZarrFile(fcc, 'shape', sz, 'dtype', ['complex' num2str(64 * (1 + strcmp(cls{1}, 'double')))], 'chunks', [16 16 16], 'order', 'C');
+        parallelWriteZarr(fcc, c, 'bbox', [1 1 1 sz]);
+        assert(isequal(parallelReadZarr(fcc), c), 'C-order complex %s mismatch', cls{1});
+    end
+    % float16 and bfloat16: values they hold exactly, written from single or double
+    for spec = {{'float16', '<f2', single(randi([-1000 1000], sz)) / 4}, {'bfloat16', 'bfloat16', single(randi([-100 100], sz))}}
+        [name, dt, v] = spec{1}{:};
+        fh = fullfile(tmp, ['rt_' name '.zarr']);
+        parallelWriteZarr(fh, v, 'dtype', name, 'chunks', [16 16 16]);
+        meta = jsondecode(fileread(fullfile(fh, '.zarray')));
+        b = parallelReadZarr(fh);
+        assert(strcmp(meta.dtype, dt) && isa(b, 'single') && isequal(b, v), '%s round trip mismatch', name);
+        parallelWriteZarr(fh, double(v(1:10, 1:5, 1:3)) * 2, 'bbox', [1 1 1 10 5 3]);
+        v(1:10, 1:5, 1:3) = v(1:10, 1:5, 1:3) * 2;
+        assert(isequal(parallelReadZarr(fh), v), '%s bbox write mismatch', name);
+        fh3 = fullfile(tmp, ['rt_' name '_v3.zarr']);
+        parallelWriteZarr(fh3, v, 'dtype', name, 'zarr_format', 3, 'chunk_shape', [8 8 8], 'chunks', [16 16 16]);
+        meta = jsondecode(fileread(fullfile(fh3, 'zarr.json')));
+        assert(strcmp(meta.data_type, name) && isequal(parallelReadZarr(fh3), v), '%s v3 sharded mismatch', name);
+    end
+    % rounding to float16 (ties to even; too big for float16 is Inf) and to bfloat16
+    fr = fullfile(tmp, 'rt_float16_rounding.zarr');
+    parallelWriteZarr(fr, [1 + 2^-11, 1 + 3 * 2^-11, 65519, 65520, -1e10, 2^-25, 1.5 * 2^-25, NaN], 'dtype', 'f2');
+    assert(isequaln(parallelReadZarr(fr), single([1, 1 + 2^-9, 65504, Inf, -Inf, 0, 2^-24, NaN])), 'float16 rounding mismatch');
+    parallelWriteZarr(fr, [1 + 2^-8, 1 + 3 * 2^-8, 3e38], 'dtype', 'bfloat16');
+    % (3e38 rounds to bfloat16 0x7f62)
+    assert(isequal(parallelReadZarr(fr), [single(1), single(1 + 2^-6), typecast(uint32(hex2dec('7f62')) * 65536, 'single')]), ...
+           'bfloat16 rounding mismatch');
+    % into an existing integer array, as MATLAB converts: halves away from zero,
+    % saturated, NaN to 0
+    fu = fullfile(tmp, 'convert_uint8.zarr');
+    createZarrFile(fu, 'shape', [1 7], 'dtype', 'uint8', 'chunks', [1 7]);
+    x = [-3.5 0.5 1.5 2.49 300 NaN Inf];
+    parallelWriteZarr(fu, x, 'bbox', [1 1 1 7]);
+    assert(isequal(parallelReadZarr(fu), uint8(x)), 'double into uint8 array mismatch');
+    fi = fullfile(tmp, 'convert_int16.zarr');
+    createZarrFile(fi, 'shape', [1 4], 'dtype', 'i2', 'chunks', [1 4]);
+    y = int32([40000 -40000 7 -7]);
+    parallelWriteZarr(fi, y, 'bbox', [1 1 1 4]);
+    assert(isequal(parallelReadZarr(fi), int16(y)), 'int32 into int16 array mismatch');
+    % refused: complex data into a real array, and a dtype other than an existing array's
+    for bad = {{fu, complex(1:7, 1), {}}, {fu, 1:7, {'dtype', 'single'}}}
+        try
+            parallelWriteZarr(bad{1}{1}, bad{1}{2}, 'bbox', [1 1 1 7], bad{1}{3}{:});
+            refused = false;
+        catch
+            refused = true;
+        end
+        assert(refused, 'a write that should be refused was not');
+    end
+    fprintf('PASS  logical, complex, float16 and bfloat16\n');
+
     % N-dimensional arrays. 2D data is a true 2D array; the old 3D-style
     % arguments (3-value chunks, 6-value bbox) still work on it.
     a2 = cast(randi([0 200], [70 45]), 'uint16');
@@ -363,8 +442,6 @@ function checkTestArrays(v3dir, tmp)
 % Read every test array (arrays.json) and compare with the values zarr-python reads;
 % check the rejected ones are rejected; write into copies of them and convert those
     fixtures = jsondecode(fileread(fullfile(v3dir, 'arrays.json'))).arrays;
-    classes = struct('u1', 'uint8', 'i1', 'int8', 'u2', 'uint16', 'i2', 'int16', 'u4', 'uint32', ...
-                     'i4', 'int32', 'u8', 'uint64', 'i8', 'int64', 'f4', 'single', 'f8', 'double', 'b1', 'logical');
     nRead = 0;  nRejected = 0;
     for k = 1 : numel(fixtures)
         if iscell(fixtures), fx = fixtures{k}; else, fx = fixtures(k); end
@@ -380,10 +457,7 @@ function checkTestArrays(v3dir, tmp)
             nRejected = nRejected + 1;
             continue;
         end
-        cls = classes.(fx.dtype(2:3));
-        fid = fopen(fullfile(v3dir, [fx.name '.bin']), 'r', 'ieee-le');
-        if strcmp(cls, 'logical'), v = fread(fid, Inf, 'uint8=>uint8') ~= 0; else, v = fread(fid, Inf, [cls '=>' cls]); end
-        fclose(fid);
+        [cls, v] = fixtureValues(fullfile(v3dir, [fx.name '.bin']), fx.dtype);
         shp = fx.shape(:)';
         % the expected values are in C order: reverse the axes for MATLAB's F order
         if numel(shp) >= 2
@@ -407,28 +481,30 @@ function checkTestArrays(v3dir, tmp)
     nWritten = 0;
     for k = 1 : numel(fixtures)
         if iscell(fixtures), fx = fixtures{k}; else, fx = fixtures(k); end
-        if isfield(fx, 'error') || strcmp(fx.dtype(2:3), 'b1'), continue; end
-        cls = classes.(fx.dtype(2:3));
+        if isfield(fx, 'error'), continue; end
+        cls = fixtureValues('', fx.dtype);
         fw = fullfile(tmp, ['ta_' fx.name '.zarr']);
         copyfile(fullfile(v3dir, [fx.name '.zarr']), fw);
         e = parallelReadZarr(fw);
         shp = size(e);
         if isempty(fx.shape), shp = []; elseif isscalar(fx.shape), shp = fx.shape; end
-        bigEndian = isfile(fullfile(fw, 'zarr.json')) && contains(fileread(fullfile(fw, 'zarr.json')), '"big"');
+        % (Zarr v3: a bytes codec in big-endian order; v2: a ">" dtype)
+        bigEndian = (isfile(fullfile(fw, 'zarr.json')) && contains(fileread(fullfile(fw, 'zarr.json')), '"big"')) || ...
+                    (isfile(fullfile(fw, '.zarray')) && startsWith(jsondecode(fileread(fullfile(fw, '.zarray'))).dtype, '>'));
         before = dir(fullfile(fw, '**', '*'));
         try
             if ~isempty(shp)
                 s = ones(1, numel(shp));  t = shp;
                 s(shp > 2) = 2;  t(shp > 2) = shp(shp > 2) - 1;
                 idx = arrayfun(@(p, q) p:q, s, t, 'UniformOutput', false);
-                p = cast(randi([0 100], size(e(idx{:}))), cls);
+                p = newValues(size(e(idx{:})), cls, ~isreal(e));
                 parallelWriteZarr(fw, p, 'bbox', [s t]);
                 e(idx{:}) = p;
                 assert(isequaln(parallelReadZarr(fw), e), 'region write into test array %s mismatch', fx.name);
-                w = cast(randi([0 100], size(e)), cls);
+                w = newValues(size(e), cls, ~isreal(e));
                 parallelWriteZarr(fw, w, 'bbox', [ones(1, numel(shp)) shp]);
             else
-                w = cast(randi([0 100]), cls);
+                w = newValues([1 1], cls, ~isreal(e));
                 parallelWriteZarr(fw, w, 'bbox', [1 1]);
             end
             assert(~bigEndian && isequaln(parallelReadZarr(fw), w), 'write into test array %s mismatch', fx.name);
@@ -451,4 +527,58 @@ function checkTestArrays(v3dir, tmp)
         nWritten = nWritten + 1;
     end
     fprintf('PASS  zarr-python and TensorStore test arrays (%d read, %d rejected, %d written into)\n', nRead, nRejected, nWritten);
+end
+
+function [cls, v] = fixtureValues(binFile, dtype)
+% The MATLAB class a test array of the data type reads as, and the values in its .bin
+% file (C order, little-endian): float16 and bfloat16 as single, complex numbers as
+% complex single and double
+    d = dtype;
+    if any(d(1) == '<>|'), d = d(2:end); end
+    classes = struct('u1', 'uint8', 'i1', 'int8', 'u2', 'uint16', 'i2', 'int16', 'u4', 'uint32', 'i4', 'int32', ...
+                     'u8', 'uint64', 'i8', 'int64', 'f2', 'single', 'f4', 'single', 'f8', 'double', 'b1', 'logical', ...
+                     'bfloat16', 'single', 'c8', 'single', 'c16', 'double');
+    cls = classes.(d);
+    v = [];
+    if isempty(binFile), return; end
+    fid = fopen(binFile, 'r', 'ieee-le');
+    switch d
+        case 'b1'
+            v = fread(fid, Inf, 'uint8=>uint8') ~= 0;
+        case 'f2'
+            v = halfToSingle(fread(fid, Inf, 'uint16=>uint16'));
+        case 'bfloat16'
+            v = typecast(bitshift(uint32(fread(fid, Inf, 'uint16=>uint16')), 16), 'single');
+        case {'c8', 'c16'}
+            p = fread(fid, Inf, [cls '=>' cls]);
+            v = complex(p(1:2:end), p(2:2:end));
+        otherwise
+            v = fread(fid, Inf, [cls '=>' cls]);
+    end
+    fclose(fid);
+end
+
+function v = halfToSingle(h)
+% float16 bits as single values
+    h = double(h);
+    s = 1 - 2 * floor(h / 32768);
+    e = mod(floor(h / 1024), 32);
+    m = mod(h, 1024);
+    v = s .* 2 .^ (e - 15) .* (1 + m / 1024);
+    v(e == 0) = s(e == 0) .* 2^-14 .* m(e == 0) / 1024;
+    v(e == 31 & m == 0) = s(e == 31 & m == 0) * Inf;
+    v(e == 31 & m ~= 0) = NaN;
+    v = single(v);
+end
+
+function w = newValues(sz, cls, cplx)
+% Values to write into a test array: whole numbers from 0 to 100, which every type
+% holds exactly (true or false for logical arrays)
+    if strcmp(cls, 'logical')
+        w = randi([0 1], sz) > 0;
+    elseif cplx
+        w = complex(cast(randi([0 100], sz), cls), cast(randi([0 100], sz), cls));
+    else
+        w = cast(randi([0 100], sz), cls);
+    end
 end

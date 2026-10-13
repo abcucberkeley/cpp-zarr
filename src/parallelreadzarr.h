@@ -21,6 +21,21 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool sparse,
                          const bool cOrder);
 
+// Same as above, for an output that does not already hold the fill value (memory
+// the caller reads into, as it is): the chunks that are missing (and the inner chunks
+// missing from their shards) get the element at fillMissing (as fillValueElement
+// makes it), and the others their data. With fillMissing NULL, the output is taken
+// to hold the fill value already, as above.
+uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
+                         const std::vector<uint64_t> &startCoords,
+                         const std::vector<uint64_t> &endCoords,
+                         const std::vector<uint64_t> &readShape,
+                         const uint64_t bits,
+                         const bool useCtx,
+                         const bool sparse,
+                         const bool cOrder,
+                         const void* fillMissing);
+
 void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
                               std::vector<uint64_t> startCoords,
                               std::vector<uint64_t> endCoords);

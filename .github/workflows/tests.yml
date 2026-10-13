@@ -34,11 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The library includes the system's <uuid/uuid.h> (macOS has it in its SDK)
-      - name: Install libuuid headers (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y uuid-dev
-
       # The library's build flags and OpenMP setup are GCC-only, so Windows uses
       # MinGW. The Python tests use MSYS2's Python, so they share one toolchain.
       # MSYS2 packages GCC's OpenMP runtime (libgomp) separately from gcc.
@@ -70,7 +65,7 @@ jobs:
       - name: Make the test arrays
         shell: bash
         run: |
-          python -m pip install "zarr==3.1.6" "numcodecs==0.16.5" "tensorstore==0.1.85" numpy
+          python -m pip install "zarr==3.1.6" "numcodecs==0.16.5" "tensorstore==0.1.85" "ml_dtypes==0.6.0" numpy
           python tests/make_test_arrays.py
 
       - name: Build library and C++ tests
@@ -91,10 +86,10 @@ jobs:
           EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
           case "$RUNNER_OS" in
             Linux)
-              python -m pip install numpy pybind11
+              python -m pip install numpy pybind11 ml_dtypes
               FLAGS="-fPIC $(python -m pybind11 --includes) -Wl,-rpath,$PWD/install/lib -static-libstdc++" ;;
             macOS)
-              python -m pip install numpy pybind11
+              python -m pip install numpy pybind11 ml_dtypes
               FLAGS="-fPIC $(python -m pybind11 --includes) -isysroot $(xcrun --show-sdk-path) -undefined dynamic_lookup -Wl,-rpath,$PWD/install/lib -static-libstdc++" ;;
             Windows)
               PYINC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
@@ -126,10 +121,6 @@ jobs:
       CPPZARR_REQUIRE_TEST_ARRAYS: '1'
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install libuuid headers (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y uuid-dev
 
       - name: Set up MinGW (Windows)
         if: runner.os == 'Windows'
@@ -165,7 +156,7 @@ jobs:
       - name: Make the test arrays
         shell: bash
         run: |
-          python -m pip install "zarr==3.1.6" "numcodecs==0.16.5" "tensorstore==0.1.85" numpy
+          python -m pip install "zarr==3.1.6" "numcodecs==0.16.5" "tensorstore==0.1.85" "ml_dtypes==0.6.0" numpy
           python tests/make_test_arrays.py
 
       - name: Build library

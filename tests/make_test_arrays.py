@@ -5,12 +5,13 @@ and fill values cpp-zarr does not write itself, the values zarr-python reads bac
 (C-order little-endian bytes in <name>.bin), and arrays cpp-zarr must reject. arrays.json
 lists them; the C++, Python and MATLAB tests read every array and compare.
 
-    python make_test_arrays.py        (needs zarr>=3, numcodecs, tensorstore and numpy)
+    python make_test_arrays.py        (needs zarr>=3, numcodecs, tensorstore, numpy and ml_dtypes)
 """
 import json
 import os
 import shutil
 
+import ml_dtypes
 import numcodecs
 import numpy as np
 import tensorstore as ts
@@ -28,9 +29,14 @@ def values(dtype, shape=SHAPE):
     dtype = np.dtype(dtype)
     if dtype.kind == 'b':
         return rng.random(shape) < 0.5
-    if dtype.kind == 'f':
+    if dtype.kind == 'f' or dtype == np.dtype(ml_dtypes.bfloat16):
         v = rng.standard_normal(shape) * 1000
         v.flat[::17] = np.nan
+        return v.astype(dtype)
+    if dtype.kind == 'c':
+        v = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) * 1000
+        v.flat[::17] = complex(np.nan, 1)     # (NaN in either part)
+        v.flat[5::23] = complex(2, np.nan)
         return v.astype(dtype)
     info = np.iinfo(dtype)
     return rng.integers(max(info.min, -10**9), min(info.max, 10**12), size=shape, endpoint=True).astype(dtype)
@@ -126,6 +132,16 @@ os.remove(os.path.join(OUT, 'v3_hex_fill_float32.bin'))
 fixtures.pop()
 record('v3_hex_fill_float32')
 
+# float16 and complex numbers: fill values that are NaN, infinite, or pairs of parts,
+# big-endian, F order and sharded
+array('v3_float16_nan_fill', 'float16', 'partial', fill_value=float('nan'),
+      compressors=[BloscCodec(cname='zstd', clevel=1, shuffle='shuffle')])
+array('v3_sharded_big_endian_float16', 'float16', 'scattered', chunks=(8, 4, 5), fill_value=-1.5, compressors=None,
+      serializer=ShardingCodec(chunk_shape=(4, 2, 5), codecs=[BytesCodec(endian='big'), ZstdCodec(level=1)]))
+array('v3_complex64_fill', 'complex64', 'partial', fill_value=complex(1.5, float('nan')), compressors=[ZstdCodec(level=1)])
+array('v3_complex128_big_endian_f', 'complex128', 'partial', fill_value=complex(0, -2),
+      filters=[TransposeCodec(order=(2, 1, 0))], serializer=BytesCodec(endian='big'), compressors=[GzipCodec(level=1)])
+
 # TensorStore: its default codecs, and F-order blosc shards with the index at the start
 for name, codecs in [('v3_tensorstore_default_int32', None),
                      ('v3_tensorstore_sharded_f_uint16', [{'name': 'sharding_indexed', 'configuration': {
@@ -157,11 +173,43 @@ v2array('v2_blosc_fill7_uint16', 'uint16', 'partial', fill_value=7,
         compressors=numcodecs.Blosc(cname='zstd', clevel=1, shuffle=numcodecs.Blosc.SHUFFLE))
 v2array('v2_blosc_fill1p5_float32', 'float32', 'partial', fill_value=1.5, compressors=numcodecs.Blosc(cname='lz4', clevel=1))
 v2array('v2_bool_fill_true', 'bool', 'partial', fill_value=True, compressors=numcodecs.Blosc(cname='lz4', clevel=1))
+v2array('v2_float16_big_endian_inf', '>f2', 'partial', fill_value=float('-inf'), compressors=numcodecs.Blosc(cname='lz4', clevel=1))
+v2array('v2_complex64_f', 'complex64', 'partial', order='F', fill_value=complex(-1, 2), compressors=numcodecs.Zstd(level=1))
+v2array('v2_complex128', '<c16', compressors=numcodecs.Blosc(cname='zstd', clevel=1, shuffle=numcodecs.Blosc.SHUFFLE))
+
+
+# bfloat16 (a Zarr extension type, which zarr-python does not write), and its values
+# (the bits, C order, little-endian)
+def ts_bfloat16(name, driver, meta, write='partial'):
+    t = ts.open({'driver': driver, 'kvstore': {'driver': 'file', 'path': path(name)}, 'metadata': meta},
+                create=True, delete_existing=True).result()
+    v = values(ml_dtypes.bfloat16)
+    if write == 'partial':
+        t[0:8].write(v[0:8]).result()
+    else:
+        t.write(v).result()
+    a = np.ascontiguousarray(t.read().result()).view(np.uint16).astype('<u2')
+    a.tofile(os.path.join(OUT, name + '.bin'))
+    fixtures.append({'name': name, 'dtype': 'bfloat16', 'shape': list(a.shape)})
+
+
+ts_bfloat16('v3_tensorstore_bfloat16', 'zarr3', {'shape': list(SHAPE), 'data_type': 'bfloat16', 'fill_value': 'NaN',
+            'chunk_grid': {'name': 'regular', 'configuration': {'chunk_shape': list(CHUNKS)}}})
+ts_bfloat16('v3_tensorstore_bfloat16_sharded', 'zarr3', {
+    'shape': list(SHAPE), 'data_type': 'bfloat16', 'fill_value': -2,
+    'chunk_grid': {'name': 'regular', 'configuration': {'chunk_shape': [8, 4, 5]}},
+    'codecs': [{'name': 'sharding_indexed', 'configuration': {
+        'chunk_shape': [4, 2, 5], 'codecs': [{'name': 'bytes', 'configuration': {'endian': 'little'}},
+                                             {'name': 'blosc', 'configuration': {'cname': 'zstd', 'clevel': 1, 'shuffle': 'shuffle',
+                                                                                 'typesize': 2, 'blocksize': 0}}]}}]})
+ts_bfloat16('v2_tensorstore_bfloat16', 'zarr', {'shape': list(SHAPE), 'chunks': list(CHUNKS), 'dtype': 'bfloat16',
+            'fill_value': 1.5, 'compressor': {'id': 'blosc', 'cname': 'lz4', 'clevel': 1, 'shuffle': 1}})
 
 # Arrays cpp-zarr must reject (with an error that names the reason, not a crash)
 rejected('v3_group', 'group', lambda: zarr.create_group(store=path('v3_group')))
-rejected('v3_float16', 'float16', lambda: zarr.create_array(store=path('v3_float16'), shape=SHAPE, chunks=CHUNKS, dtype='float16'))
-rejected('v3_complex64', 'complex64', lambda: zarr.create_array(store=path('v3_complex64'), shape=SHAPE, chunks=CHUNKS, dtype='complex64'))
+rejected('v3_string', 'data type', lambda: zarr.create_array(store=path('v3_string'), shape=SHAPE, chunks=CHUNKS, dtype=str))
+rejected('v2_unicode', 'data type', lambda: zarr.create_array(store=path('v2_unicode'), shape=SHAPE, chunks=CHUNKS, dtype='<U4',
+                                                               zarr_format=2))
 rejected('v3_sharded_then_compressed', 'after sharding_indexed', lambda: zarr.create_array(
     store=path('v3_sharded_then_compressed'), shape=SHAPE, chunks=(8, 4, 5), dtype='uint16',
     serializer=ShardingCodec(chunk_shape=(4, 2, 5))))

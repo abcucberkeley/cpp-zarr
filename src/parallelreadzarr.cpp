@@ -281,6 +281,19 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool sparse,
                          const bool cOrder)
 {
+    return parallelReadZarr(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, cOrder, nullptr);
+}
+
+uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
+                         const std::vector<uint64_t> &startCoords,
+                         const std::vector<uint64_t> &endCoords,
+                         const std::vector<uint64_t> &readShape,
+                         const uint64_t bits,
+                         const bool useCtx,
+                         const bool sparse,
+                         const bool cOrder,
+                         const void* fillMissing)
+{
     // Linux's automatic NUMA balancing is kept off the threads that read, for the call (see
     // LocalMemoryPolicy): the calling thread for all of it, and every thread of each
     // parallel region, also those with nothing to do (any thread can mark the process's
@@ -356,7 +369,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // Sparse reads skip all-zero chunks, which the output already holds when the
     // fill value is zero
     void* zeroChunkUnc = NULL;
-    if(sparse && fillValueIsZero(Zarr.get_fill_value())){
+    if(sparse && !fillMissing && fillValueIsZero(Zarr.get_fill_value(), Zarr.get_dtype())){
         zeroChunkUnc = calloc(s,bytes);
     }
 
@@ -827,6 +840,27 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const int64_t sAxis, const uint64_t sLo, const uint64_t sHi){
         copyChunkAt(chunkData, 0, cAV, boxExt, sAxis, sLo, sHi);
     };
+    // When the output does not hold the fill value already (fillMissing), the chunks
+    // found missing are noted, and their part of the output set to it after the read
+    std::mutex missingMutex;
+    std::vector<std::vector<uint64_t>> missing;
+    auto noteMissing = [&](const std::vector<uint64_t> &cAV){
+        if(!fillMissing) return;
+        std::lock_guard<std::mutex> g(missingMutex);
+        missing.push_back(cAV);
+    };
+    auto fillChunk = [&](const std::vector<uint64_t> &cAV, std::vector<uint64_t> &boxExt){
+        uint64_t dstOff = 0;
+        for(uint64_t d = 0; d < nDims; d++){
+            const uint64_t b = cAV[d]*Zarr.get_chunks(d);
+            const uint64_t lo = std::max(b, startCoords[d]);
+            const uint64_t hi = std::min(b+Zarr.get_chunks(d), endCoords[d]);
+            if(hi <= lo) return;
+            boxExt[d] = hi-lo;
+            dstOff += (lo-startCoords[d])*outStrides[d];
+        }
+        fillBoxND(bytes, (uint8_t*)zarrArr+dstOff*bytes, boxExt, outStrides, fillMissing);
+    };
     // A chunk's stored bytes: at most its decoded size and a codec's overhead (when that
     // is small enough for the pool to keep)
     const uint64_t storedRoom = sB+sB/128+4096 <= (1 << 20) ? sB+sB/128+4096 : 0;
@@ -920,8 +954,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // in the cache. Decoded whole, they went through memory twice more, into buffers of
     // their size that every call faulted in again, which made region reads up to 1.2 times
     // as long, and the buffers held them to fewer threads. Only a chunk of one frame (all of
-    // its bytes) that says it decodes to a chunk's bytes, as cpp-zarr, numcodecs and
-    // TensorStore write them; one that does not say is decoded to its end, and others whole
+    // its bytes) that says it decodes to a chunk's bytes, as cpp-zarr and other Zarr writers
+    // write them; one that does not say is decoded to its end, and others whole
     // (which reports any that do not decode to a chunk's bytes, as before). A chunk decoded
     // to its end is checked as one decoded whole is: its size, and its checksum if it has
     // one; past a region's last slice it is not decoded.
@@ -1125,6 +1159,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                                 return slots[k]->storedBuffer(m ? m : 1, storedRoom);
                             }, data);
                             if(len == -2) break;
+                            if(len == -1) noteMissing(chunkAV[i]);
                             storedOf[i] = data;
                             storedLen[i] = len;
                             fUnit[i] = len >= 0 ? fusedUnit(data, len, fType[i]) : 0;
@@ -1209,6 +1244,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                                 return slots[k]->storedBuffer(m ? m : 1, storedRoom);
                             }, data);
                             if(len == -2) break;
+                            if(len == -1) noteMissing(chunkAV[i]);
                             storedOf[i] = data;
                             storedLen[i] = len;
                             if(len >= 0){
@@ -1352,7 +1388,10 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                                 readAheadFile(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(nextName))+"/"+Zarr.chunkKey(nextName));
                             }
                         }
-                        if(fileLen == -1) continue;
+                        if(fileLen == -1){
+                            noteMissing(cAV);
+                            continue;
+                        }
 
                         // A fusable chunk a part at a time, from a part that depends on its place
                         // in the list
@@ -1396,6 +1435,17 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             }
         }
     }
+    // The missing chunks' part of an output that did not hold the fill value
+    if(fillMissing && !err && !missing.empty()){
+        const int64_t nMissing = (int64_t)missing.size();
+        #pragma omp parallel num_threads(numWorkers)
+        {
+            const LocalMemoryPolicy memoryPolicy;
+            std::vector<uint64_t> boxExt(nDims);
+            #pragma omp for schedule(dynamic)
+            for(int64_t i = 0; i < nMissing; i++) fillChunk(missing[i], boxExt);
+        }
+    }
     if(!useCtx){
         blosc2_destroy();
     }
@@ -1407,7 +1457,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     }
     uint64_t readSize = 1;
     for(uint64_t d = 0; d < nDims; d++) readSize *= readShape[d];
-    if(oppositeEndianness(Zarr.get_dtype())) swapArrayEndianness(zarrArr,bytes,readSize);
+    // (each part of a complex number on its own)
+    if(oppositeEndianness(Zarr.get_dtype())) swapDtypeEndianness(zarrArr, dtypeInfo(Zarr.get_dtype()), readSize);
     return 0;
 }
 
@@ -1504,18 +1555,14 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     Zarr.set_chunkInfo(startCoords, endCoords);
 
     // The chunk read/copy machinery is element-width based, so one generic path
-    // covers every supported dtype: signed/unsigned 8/16/32/64-bit integers,
-    // 32/64-bit floats and booleans.
+    // covers every supported dtype: booleans, signed/unsigned 8/16/32/64-bit
+    // integers, 16/32/64-bit floats and bfloat16, and complex numbers
     const std::string &dtype = Zarr.get_dtype();
     const uint64_t bytes = Zarr.dtypeBytes();
-    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
-    if(!bytes || (kind != 'u' && kind != 'i' && kind != 'f' && kind != 'b') ||
-       (kind == 'f' && bytes < 4) || (kind == 'b' && bytes != 1)){
-        return NULL;
-    }
+    if(!dtypeInfo(dtype).kind) return NULL;
 
     // The output starts as the fill value, which is what missing chunks read as
-    uint8_t fillElem[8];
+    uint8_t fillElem[16];
     fillValueElement(Zarr.get_fill_value(), dtype, fillElem);
     void* zarrArr = nullptr;
     if(std::any_of(fillElem, fillElem+bytes, [](uint8_t b){ return b != 0; })){
@@ -1533,7 +1580,14 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
 }
 
 void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t startY, uint64_t startZ, uint64_t endX, uint64_t endY, uint64_t endZ, uint8_t imageJIm){
-    zarr Zarr(folderName);
+    // Arrays that cannot be read (missing or unsupported metadata) give NULL too
+    zarr Zarr;
+    try{
+        Zarr = zarr(folderName);
+    }
+    catch(const std::string &){
+        return NULL;
+    }
     // This helper's interface is 3D
     if(Zarr.get_ndims() != 3) return NULL;
     void* zarrArr = parallelReadZarrWriteWrapper(Zarr, true,
@@ -1568,6 +1622,8 @@ void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t s
                         case 8:
                             ((double*)zarrArrC)[j+(i*ry)+(k*ry*rx)] = ((double*)zarrArr)[i+(j*rx)+(k*rx*ry)];
                             break;
+                        default:
+                            memcpy((uint8_t*)zarrArrC+(j+(i*ry)+(k*ry*rx))*es, (uint8_t*)zarrArr+(i+(j*rx)+(k*rx*ry))*es, es);
                     }
                 }
             }

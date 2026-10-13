@@ -7,28 +7,61 @@
 #include "parallelwritezarr.h"
 #include "helperfunctions.h"
 
-template <typename T>
-pybind11::array_t<T> create_pybind11_array(void* data, const std::vector<uint64_t> &dims, const bool cOrder) {
-    auto deleter = [](void* ptr) { free(ptr); };
+// The NumPy dtype for an array's data type: bfloat16 is ml_dtypes' type, the others
+// NumPy's own
+static pybind11::dtype numpyDtype(const DtypeInfo &t, const std::string &dtype) {
+    if (t.bfloat16) {
+        try {
+            return pybind11::dtype::from_args(pybind11::module_::import("ml_dtypes").attr("bfloat16"));
+        }
+        catch (pybind11::error_already_set &) {
+            throw std::runtime_error("Reading bfloat16 arrays needs the ml_dtypes package (pip install ml_dtypes)");
+        }
+    }
+    const std::string bits = std::to_string(8*t.bytes);
+    switch (t.kind) {
+        case 'b': return pybind11::dtype("bool");
+        case 'i': return pybind11::dtype("int" + bits);
+        case 'u': return pybind11::dtype("uint" + bits);
+        case 'f': return pybind11::dtype("float" + bits);
+        case 'c': return pybind11::dtype("complex" + bits);
+    }
+    throw std::runtime_error("Unsupported data type: " + dtype);
+}
 
-    // The data is in F order (the first axis is contiguous) or C order (the last)
+// A NumPy array over data (malloc'd: freed with the array), in F order (the first
+// axis contiguous) or C order (the last)
+static pybind11::array createArray(void* data, const std::vector<uint64_t> &dims, const bool cOrder,
+                                   const pybind11::dtype &dt) {
     const size_t n = dims.size();
     std::vector<ssize_t> shape(n), strides(n);
-    ssize_t stride = sizeof(T);
+    ssize_t stride = dt.itemsize();
     for (size_t i = 0; i < n; i++) {
         const size_t d = cOrder ? n-1-i : i;
         shape[d] = static_cast<ssize_t>(dims[d]);
         strides[d] = stride;
         stride *= static_cast<ssize_t>(dims[d]);
     }
-
-    return pybind11::array_t<T>(
-        shape,
-        strides,
-        static_cast<T*>(data),
-        pybind11::capsule(data, deleter)
-    );
+    return pybind11::array(dt, shape, strides, data, pybind11::capsule(data, [](void* ptr) { free(ptr); }));
 }
+
+// A call's threads (numThreads; 0 for the thread's default: OMP_NUM_THREADS, or every
+// CPU it may run on), set for the calling thread for the whole call and then restored:
+// every OpenMP region of the call (finding the region's chunks too) then has a team of
+// that size. (A region with the default team in between had OpenMP end and start
+// threads in every call: pooled reads of small regions went 4 times as slow.)
+struct CallThreads {
+    int prev = 0;
+    explicit CallThreads(const int64_t numThreads) {
+        if (numThreads > 0) {
+            prev = callThreads();
+            setCallThreads((int)numThreads);
+        }
+    }
+    ~CallThreads() {
+        if (prev > 0) setCallThreads(prev);
+    }
+};
 
 // The zarr class reports metadata problems by throwing std::string; turn them
 // into Python exceptions with a readable message
@@ -87,12 +120,23 @@ static std::vector<uint64_t> fitCoords(const std::vector<uint64_t> &coords, cons
 }
 
 pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
-                                   std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &order = ""){
+                                   std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &order = "",
+                                   const int64_t numThreads = 0, const pybind11::object &out = pybind11::none()){
     // order is the memory layout of the returned array: "F" (first axis
     // contiguous), "C" (last axis contiguous), or "" for the file's storage order
+    // (or out's). The GIL is released while the array is opened and read, so other
+    // Python threads run, and read other arrays, meanwhile.
     if (!order.empty() && order != "F" && order != "C") throw std::runtime_error("order must be 'F' or 'C', not '" + order + "'");
-    zarr Zarr = openZarr(fileName);
-    const bool cOrder = order.empty() ? Zarr.get_order() == "C" : order == "C";
+    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
+    const CallThreads threads(numThreads);
+    zarr Zarr;
+    {
+        pybind11::gil_scoped_release release;
+        Zarr = openZarr(fileName);
+    }
+    bool cOrder = order.empty() ? Zarr.get_order() == "C" : order == "C";
+    // (before reading: bfloat16 needs ml_dtypes)
+    const pybind11::dtype dt = numpyDtype(dtypeInfo(Zarr.get_dtype()), Zarr.get_dtype());
     const uint64_t nDims = Zarr.get_ndims();
     std::vector<uint64_t> dims(nDims);
     for (uint64_t d = 0; d < nDims; d++) dims[d] = Zarr.get_shape(d);
@@ -113,44 +157,62 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
             }
             dims[d] = end[d]-start[d];
         }
+        pybind11::gil_scoped_release release;
         Zarr.set_chunkInfo(start, end);
     }
-    void* data = parallelReadZarrWriteWrapper(Zarr, crop, start, end, cOrder);
-    if (!data) throw std::runtime_error("Failed to read the zarr file (unsupported dtype or read error)");
 
-    // Dispatch on the full dtype: byte width alone is ambiguous now that signed,
-    // unsigned, and float types of the same size are all supported.
-    const std::string &dtype = Zarr.get_dtype();
-    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
-    const char dsize = dtype.size() == 3 ? dtype[2] : '\0';
-    if (kind == 'u') {
-        if (dsize == '1') return create_pybind11_array<uint8_t>(data, dims, cOrder);
-        if (dsize == '2') return create_pybind11_array<uint16_t>(data, dims, cOrder);
-        if (dsize == '4') return create_pybind11_array<uint32_t>(data, dims, cOrder);
-        if (dsize == '8') return create_pybind11_array<uint64_t>(data, dims, cOrder);
+    // Into the caller's array (out): of the region's shape and the array's data type,
+    // writeable, and contiguous (in order, when given)
+    if (!out.is_none()) {
+        if (!pybind11::isinstance<pybind11::array>(out)) throw std::runtime_error("out must be a NumPy array");
+        pybind11::array a = out.cast<pybind11::array>();
+        std::string shapeText;
+        for (uint64_t d = 0; d < nDims; d++) shapeText += (d ? ", " : "") + std::to_string(dims[d]);
+        if (!a.dtype().equal(dt)) {
+            throw std::runtime_error("out has data type " + pybind11::str(a.dtype()).cast<std::string>() +
+                                     ", not the array's " + pybind11::str(dt).cast<std::string>());
+        }
+        bool sameShape = (uint64_t)a.ndim() == nDims;
+        for (uint64_t d = 0; sameShape && d < nDims; d++) sameShape = (uint64_t)a.shape(d) == dims[d];
+        if (!sameShape) throw std::runtime_error("out must have the shape of the region read, (" + shapeText + ")");
+        const pybind11::object flags = a.attr("flags");
+        const bool cContig = flags.attr("c_contiguous").cast<bool>(), fContig = flags.attr("f_contiguous").cast<bool>();
+        if (!flags.attr("writeable").cast<bool>()) throw std::runtime_error("out must be writeable");
+        if (!order.empty() ? !(cOrder ? cContig : fContig) : !(cContig || fContig)) {
+            throw std::runtime_error(order.empty() ? std::string("out must be C- or F-contiguous")
+                                                   : "out must be " + order + "-contiguous for order '" + order + "'");
+        }
+        // (its own layout, unless order says; one that is both, the file's order)
+        if (order.empty() && cContig != fContig) cOrder = cContig;
+        uint8_t fillElem[16];
+        fillValueElement(Zarr.get_fill_value(), Zarr.get_dtype(), fillElem);
+        void* ptr = a.mutable_data();
+        uint8_t err = 0;
+        {
+            pybind11::gil_scoped_release release;
+            if (!crop) Zarr.set_chunkInfo(start, end);
+            err = parallelReadZarr(Zarr, ptr, start, end, dims, Zarr.dtypeBytes()*8, true, false, cOrder, fillElem);
+        }
+        if (err) throw std::runtime_error(Zarr.get_errString());
+        return a;
     }
-    else if (kind == 'i') {
-        if (dsize == '1') return create_pybind11_array<int8_t>(data, dims, cOrder);
-        if (dsize == '2') return create_pybind11_array<int16_t>(data, dims, cOrder);
-        if (dsize == '4') return create_pybind11_array<int32_t>(data, dims, cOrder);
-        if (dsize == '8') return create_pybind11_array<int64_t>(data, dims, cOrder);
+
+    void* data = nullptr;
+    {
+        pybind11::gil_scoped_release release;
+        data = parallelReadZarrWriteWrapper(Zarr, crop, start, end, cOrder);
     }
-    else if (kind == 'f') {
-        if (dsize == '4') return create_pybind11_array<float>(data, dims, cOrder);
-        if (dsize == '8') return create_pybind11_array<double>(data, dims, cOrder);
-    }
-    else if (kind == 'b' && dsize == '1') return create_pybind11_array<bool>(data, dims, cOrder);
-    free(data);
-    throw std::runtime_error("Unsupported data type: " + dtype);
+    if (!data) throw std::runtime_error("Failed to read the zarr file (unsupported dtype or read error)");
+    return createArray(data, dims, cOrder, dt);
 }
 
 void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
                          const std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &cname = "zstd",
                          const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> &chunks = std::vector<uint64_t>{256, 256, 256},
                          const std::string &dimension_separator = ".", const bool crop = false, const uint64_t zarr_format = 2,
-                         const std::vector<uint64_t> &shards = std::vector<uint64_t>{}){
-    // Determine the dtype based on the NumPy array type
-    pybind11::buffer_info info = data.request();
+                         const std::vector<uint64_t> &shards = std::vector<uint64_t>{}, const int64_t numThreads = 0){
+    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
+    const CallThreads threads(numThreads);
 
     zarr Zarr;
     Zarr.set_fileName(fileName);
@@ -173,14 +235,22 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
         Zarr.set_chunk_shape(chunks);
     }
 
-    // Map the numpy dtype via kind ('u' unsigned int, 'i' signed int, 'f' float)
-    // and element size. This is robust across platforms, unlike buffer-format
-    // strings (e.g. numpy int64 reports 'l' on Linux while int64_t formats as 'q').
+    // Map the numpy dtype via kind ('b' bool, 'u' unsigned int, 'i' signed int,
+    // 'f' float, 'c' complex) and element size, and ml_dtypes' bfloat16 by name.
+    // This is robust across platforms, unlike buffer-format strings (e.g. numpy
+    // int64 reports 'l' on Linux while int64_t formats as 'q').
     const char kind = data.dtype().kind();
     const uint64_t itemsize = (uint64_t)data.dtype().itemsize();
-    const bool intKind = (kind == 'u' || kind == 'i');
-    if (!((intKind && (itemsize == 1 || itemsize == 2 || itemsize == 4 || itemsize == 8)) ||
-          (kind == 'f' && (itemsize == 4 || itemsize == 8)))) {
+    const bool bfloat16 = itemsize == 2 && kind == 'V' && data.dtype().attr("name").cast<std::string>() == "bfloat16";
+    std::string arrayDtype;
+    if (bfloat16) arrayDtype = "bfloat16";
+    else if (kind == 'b' && itemsize == 1) arrayDtype = "|b1";
+    else if (((kind == 'u' || kind == 'i') && (itemsize == 1 || itemsize == 2 || itemsize == 4 || itemsize == 8)) ||
+             (kind == 'f' && (itemsize == 2 || itemsize == 4 || itemsize == 8)) ||
+             (kind == 'c' && (itemsize == 8 || itemsize == 16))) {
+        arrayDtype = std::string("<") + kind + std::to_string(itemsize);
+    }
+    else {
         throw std::runtime_error(std::string("Unsupported data type: kind '") + kind +
                                  "' with " + std::to_string(itemsize) + " bytes per element");
     }
@@ -188,8 +258,12 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     if (!data.dtype().attr("isnative").cast<bool>()) {
         throw std::runtime_error("The data is not in this machine's byte order");
     }
+    // The data's memory (bfloat16 through a uint16 view: NumPy cannot hand out
+    // ml_dtypes' types as buffers)
+    const pybind11::array buffer = bfloat16 ? data.attr("view")(pybind11::dtype("uint16")).cast<pybind11::array>() : data;
+    pybind11::buffer_info info = buffer.request();
     const uint64_t dtype = itemsize * 8;
-    Zarr.set_dtype(std::string("<") + kind + std::to_string(itemsize));
+    Zarr.set_dtype(arrayDtype);
 
     // The writer reads the array in place through its strides (in elements), so
     // any memory layout works without a copy. The Python wrapper copies arrays
@@ -207,29 +281,42 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     Zarr.set_shape(endCoords);
 
     // Write out the new metadata (.zarray or zarr.json), unless writing a region of an
-    // existing array
-    if(!crop || !(fileExists(fileName+"/.zarray") || fileExists(fileName+"/zarr.json"))) writeZarray(Zarr);
+    // existing array. (The GIL is released for the file system work and the write.)
+    if(!crop || !(fileExists(fileName+"/.zarray") || fileExists(fileName+"/zarr.json"))){
+        pybind11::gil_scoped_release release;
+        writeZarray(Zarr);
+    }
     else{
-        Zarr = openZarr(fileName);
+        {
+            pybind11::gil_scoped_release release;
+            Zarr = openZarr(fileName);
+        }
         if (Zarr.get_ndims() != endCoords.size()) {
             throw std::runtime_error("The coordinates have " + std::to_string(endCoords.size()) +
                                      " values but the existing array has " + std::to_string(Zarr.get_ndims()) + " dimensions");
         }
         // The chunks are written with the data's element type, so it has to be the
         // array's (write_zarr converts the data to it)
-        const std::string &arrayType = Zarr.get_dtype();
-        if (arrayType.size() != 3 || arrayType[1] != kind || (uint64_t)(arrayType[2] - '0') != itemsize) {
-            throw std::runtime_error("The data's type (" + std::string(1, kind) + std::to_string(itemsize) +
-                                     ") does not match the existing array's (" + arrayType + ")");
+        const DtypeInfo want = dtypeInfo(Zarr.get_dtype()), have = dtypeInfo(arrayDtype);
+        if (want.kind != have.kind || want.bytes != have.bytes || want.bfloat16 != have.bfloat16) {
+            throw std::runtime_error("The data's type (" + arrayDtype + ") does not match the existing array's (" +
+                                     Zarr.get_dtype() + ")");
         }
     }
 
     std::vector<uint64_t> writeShape(endCoords.size());
     for (size_t d = 0; d < endCoords.size(); d++) writeShape[d] = endCoords[d]-startCoords[d];
-    Zarr.set_chunkInfo(startCoords, endCoords);
+    {
+        pybind11::gil_scoped_release release;
+        Zarr.set_chunkInfo(startCoords, endCoords);
+    }
 
     // Write out the data
-    uint8_t err = parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, inStrides, dtype, true, crop);
+    uint8_t err = 0;
+    {
+        pybind11::gil_scoped_release release;
+        err = parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, inStrides, dtype, true, crop);
+    }
     if(err) throw std::runtime_error(Zarr.get_errString());
 }
 
@@ -253,13 +340,17 @@ PYBIND11_MODULE(cppzarr, m) {
     m.doc() = "cpp-zarr python bindings";
 
 	m.def("pybind11_read_zarr", &pybind11_read_zarr, pybind11::arg("fileName"), pybind11::arg("startCoords"),
-	      pybind11::arg("endCoords"), pybind11::arg("order"), "Read a zarr file");
+	      pybind11::arg("endCoords"), pybind11::arg("order"), pybind11::arg("numThreads") = 0,
+	      pybind11::arg("out") = pybind11::none(), "Read a zarr file");
 
 	m.def("pybind11_write_zarr", &pybind11_write_zarr, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("startCoords"),
 	      pybind11::arg("endCoords"), pybind11::arg("cname"), pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"),
 	      pybind11::arg("dimension_separator"), pybind11::arg("crop"), pybind11::arg("zarr_format"), pybind11::arg("shards"),
-	      "Write a zarr file");
+	      pybind11::arg("numThreads") = 0, "Write a zarr file");
 
 	m.def("pybind11_convert_to_v3", &pybind11_convert_to_v3, pybind11::arg("fileName"),
 	      "Convert a Zarr v2 array to Zarr v3 in place (metadata only)");
+
+	m.def("pybind11_default_threads", &callThreads,
+	      "The threads a call uses by default from the calling thread (OMP_NUM_THREADS, or every CPU it may run on)");
 }

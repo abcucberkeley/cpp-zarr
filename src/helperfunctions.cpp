@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -153,13 +154,54 @@ void makeDimensionFolders(const std::string &fileName){
     mkdirRecursive(fileName.substr(0,lastSlash).c_str());
 }
 
+int callThreads(){
+    return omp_get_max_threads();
+}
+
+void setCallThreads(int n){
+    if(n > 0) omp_set_num_threads(n);
+}
+
 bool isLittleEndian(){
     uint16_t number = 1;
     return *reinterpret_cast<uint8_t*>(&number) == 1;
 }
 
+DtypeInfo dtypeInfo(const std::string &dtype){
+    DtypeInfo t;
+    // A byte order mark ('<', '>', or '|' where it does not apply), then the type
+    const bool mark = !dtype.empty() && (dtype[0] == '<' || dtype[0] == '>' || dtype[0] == '|');
+    const std::string rest = mark ? dtype.substr(1) : dtype;
+    const bool big = mark && dtype[0] == '>';
+    if(rest == "bfloat16"){
+        t.kind = 'f';
+        t.bytes = 2;
+        t.bfloat16 = true;
+        t.bigEndian = big;
+        return t;
+    }
+    // (NumPy's typestr: a kind and a size in bytes, after a mark)
+    if(!mark || rest.size() < 2 || rest.size() > 3) return t;
+    for(size_t i = 1; i < rest.size(); i++) if(rest[i] < '0' || rest[i] > '9') return t;
+    const char kind = rest[0];
+    const uint64_t bytes = std::stoull(rest.substr(1));
+    bool ok = false;
+    if(kind == 'b') ok = bytes == 1;
+    else if(kind == 'i' || kind == 'u') ok = bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8;
+    else if(kind == 'f') ok = bytes == 2 || bytes == 4 || bytes == 8;
+    else if(kind == 'c') ok = bytes == 8 || bytes == 16;
+    if(!ok) return t;
+    t.kind = kind;
+    t.bytes = bytes;
+    t.bigEndian = big && bytes > 1;
+    return t;
+}
+
 bool oppositeEndianness(const std::string &dtype){
-    // '|' means byte order is not applicable (single-byte dtypes like |u1/|i1)
+    const DtypeInfo t = dtypeInfo(dtype);
+    if(t.kind) return t.bytes > 1 && t.bigEndian == isLittleEndian();
+    // (other dtypes, as their byte order mark says; '|' means byte order does not
+    // apply)
     if(dtype.empty() || dtype[0] == '|') return false;
     if(isLittleEndian()){
         if(dtype[0] == '<') return false;
@@ -168,6 +210,110 @@ bool oppositeEndianness(const std::string &dtype){
         if(dtype[0] == '>') return false;
     }
     return true;
+}
+
+// Float to float16, as NumPy converts (npy_floatbits_to_halfbits): overflow gives
+// infinity, NaNs stay NaNs with the top bits of their payload
+uint16_t floatToHalf(float v){
+    uint32_t f;
+    memcpy(&f, &v, 4);
+    const uint16_t sign = (uint16_t)((f & 0x80000000u) >> 16);
+    uint32_t fExp = f & 0x7f800000u;
+    uint32_t fSig;
+    if(fExp >= 0x47800000u){
+        if(fExp == 0x7f800000u && (f & 0x007fffffu)){
+            uint16_t r = (uint16_t)(0x7c00u+((f & 0x007fffffu) >> 13));
+            if(r == 0x7c00u) r++;
+            return (uint16_t)(sign+r);
+        }
+        return (uint16_t)(sign+0x7c00u);
+    }
+    if(fExp <= 0x38000000u){
+        // Subnormal float16 or zero
+        if(fExp < 0x33000000u) return sign;
+        fExp >>= 23;
+        fSig = 0x00800000u+(f & 0x007fffffu);
+        fSig >>= (113-fExp);
+        if((fSig & 0x00003fffu) != 0x00001000u || (f & 0x000007ffu)) fSig += 0x00001000u;
+        return (uint16_t)(sign+(uint16_t)(fSig >> 13));
+    }
+    const uint16_t hExp = (uint16_t)((fExp-0x38000000u) >> 13);
+    fSig = f & 0x007fffffu;
+    if((fSig & 0x00003fffu) != 0x00001000u) fSig += 0x00001000u;
+    // (a carry out of the significand increments the exponent, up to infinity)
+    return (uint16_t)(sign+hExp+(uint16_t)(fSig >> 13));
+}
+
+// Double to float16 directly, as NumPy converts (npy_doublebits_to_halfbits), with
+// no rounding to float first
+uint16_t doubleToHalf(double v){
+    uint64_t d;
+    memcpy(&d, &v, 8);
+    const uint16_t sign = (uint16_t)((d & 0x8000000000000000ULL) >> 48);
+    uint64_t dExp = d & 0x7ff0000000000000ULL;
+    uint64_t dSig;
+    if(dExp >= 0x40f0000000000000ULL){
+        if(dExp == 0x7ff0000000000000ULL && (d & 0x000fffffffffffffULL)){
+            uint16_t r = (uint16_t)(0x7c00u+((d & 0x000fffffffffffffULL) >> 42));
+            if(r == 0x7c00u) r++;
+            return (uint16_t)(sign+r);
+        }
+        return (uint16_t)(sign+0x7c00u);
+    }
+    if(dExp <= 0x3f00000000000000ULL){
+        if(dExp < 0x3e60000000000000ULL) return sign;
+        dExp >>= 52;
+        dSig = 0x0010000000000000ULL+(d & 0x000fffffffffffffULL);
+        dSig <<= (dExp-998);
+        if((dSig & 0x003fffffffffffffULL) != 0x0010000000000000ULL) dSig += 0x0010000000000000ULL;
+        return (uint16_t)(sign+(uint16_t)(dSig >> 53));
+    }
+    const uint16_t hExp = (uint16_t)((dExp-0x3f00000000000000ULL) >> 42);
+    dSig = d & 0x000fffffffffffffULL;
+    if((dSig & 0x000007ffffffffffULL) != 0x0000020000000000ULL) dSig += 0x0000020000000000ULL;
+    return (uint16_t)(sign+hExp+(uint16_t)(dSig >> 42));
+}
+
+float halfToFloat(uint16_t h){
+    const uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    const uint16_t hExp = h & 0x7c00u;
+    uint32_t f;
+    if(hExp == 0){
+        uint16_t sig = h & 0x03ffu;
+        if(!sig) f = sign;
+        else{
+            // Subnormal: normalize it
+            int e = 0;
+            sig <<= 1;
+            while(!(sig & 0x0400u)){
+                sig <<= 1;
+                e++;
+            }
+            f = sign+((uint32_t)(127-15-e) << 23)+((uint32_t)(sig & 0x03ffu) << 13);
+        }
+    }
+    else if(hExp == 0x7c00u) f = sign+0x7f800000u+((uint32_t)(h & 0x03ffu) << 13);
+    else f = sign+(((uint32_t)(h & 0x7fffu)+0x1c000u) << 13);
+    float v;
+    memcpy(&v, &f, 4);
+    return v;
+}
+
+// Float to bfloat16 as ml_dtypes (Eigen) converts: NaNs become the quiet NaN of
+// their sign
+uint16_t floatToBfloat16(float v){
+    uint32_t f;
+    memcpy(&f, &v, 4);
+    if((f & 0x7f800000u) == 0x7f800000u && (f & 0x007fffffu)) return (f & 0x80000000u) ? 0xffc0u : 0x7fc0u;
+    f += 0x7fffu+((f >> 16) & 1u);
+    return (uint16_t)(f >> 16);
+}
+
+float bfloat16ToFloat(uint16_t b){
+    const uint32_t f = (uint32_t)b << 16;
+    float v;
+    memcpy(&v, &f, 4);
+    return v;
 }
 
 int fillValueToInt(const std::string &fillValue){
@@ -223,15 +369,66 @@ uint32_t crc32c(const uint8_t* data, size_t length){
     return ~crc;
 }
 
-void fillValueElement(const std::string &fillValue, const std::string &dtype, uint8_t elem[8]){
-    memset(elem, 0, 8);
-    if(dtype.size() != 3) return;
-    const char kind = dtype[1];
-    const int bytes = dtype[2]-'0';
-    if(bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) return;
+// One float of a fill value, in this machine's byte order: a number, "NaN",
+// "Infinity", "-Infinity" or a "0x..." bit pattern; bytes 2 (float16, or bfloat16),
+// 4 or 8
+static void floatFillElement(const std::string &s, const uint64_t bytes, const bool bfloat16, uint8_t* out){
+    if(s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')){
+        const uint64_t bits = strtoull(s.c_str()+2, NULL, 16);
+        if(bytes == 8) memcpy(out, &bits, 8);
+        else if(bytes == 4){ const uint32_t v = (uint32_t)bits; memcpy(out, &v, 4); }
+        else{ const uint16_t v = (uint16_t)bits; memcpy(out, &v, 2); }
+        return;
+    }
+    double v = 0;
+    if(s == "NaN") v = std::numeric_limits<double>::quiet_NaN();
+    else if(s == "Infinity") v = std::numeric_limits<double>::infinity();
+    else if(s == "-Infinity") v = -std::numeric_limits<double>::infinity();
+    else{
+        char* end = NULL;
+        v = strtod(s.c_str(), &end);
+        if(end == s.c_str()) v = 0;
+    }
+    if(bytes == 8) memcpy(out, &v, 8);
+    else if(bytes == 4){ const float f = (float)v; memcpy(out, &f, 4); }
+    else{ const uint16_t h = bfloat16 ? floatToBfloat16((float)v) : doubleToHalf(v); memcpy(out, &h, 2); }
+}
+
+// The two parts of a complex fill value, [real, imaginary] as JSON keeps it (each
+// a number or a quoted string), or one number for the real part alone
+static void complexFillParts(const std::string &s, std::string &re, std::string &im){
+    auto unquote = [](std::string v){
+        const size_t a = v.find_first_not_of(" \t\r\n"), b = v.find_last_not_of(" \t\r\n");
+        v = a == std::string::npos ? "" : v.substr(a, b-a+1);
+        if(v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size()-2);
+        return v;
+    };
+    const size_t open = s.find('['), close = s.rfind(']');
+    if(open == std::string::npos || close == std::string::npos || close < open){
+        re = unquote(s);
+        im = "0";
+        return;
+    }
+    const std::string inner = s.substr(open+1, close-open-1);
+    const size_t comma = inner.find(',');
+    re = unquote(inner.substr(0, comma));
+    im = comma == std::string::npos ? "0" : unquote(inner.substr(comma+1));
+}
+
+void fillValueElement(const std::string &fillValue, const std::string &dtype, uint8_t elem[16]){
+    memset(elem, 0, 16);
+    const DtypeInfo t = dtypeInfo(dtype);
+    if(!t.kind) return;
+    const uint64_t bytes = t.bytes;
     const std::string &s = fillValue;
     const bool inf = s == "Infinity", negInf = s == "-Infinity";
-    if(s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')){
+    if(t.kind == 'c'){
+        std::string re, im;
+        complexFillParts(s, re, im);
+        floatFillElement(re, bytes/2, false, elem);
+        floatFillElement(im, bytes/2, false, elem+bytes/2);
+    }
+    else if(s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')){
         // A bit pattern (Zarr v3 floats), most significant digit first
         const uint64_t bits = strtoull(s.c_str()+2, NULL, 16);
         if(bytes == 8) memcpy(elem, &bits, 8);
@@ -239,25 +436,14 @@ void fillValueElement(const std::string &fillValue, const std::string &dtype, ui
         else if(bytes == 2){ const uint16_t v = (uint16_t)bits; memcpy(elem, &v, 2); }
         else elem[0] = (uint8_t)bits;
     }
-    else if(kind == 'f'){
-        double v = 0;
-        if(s == "NaN") v = std::numeric_limits<double>::quiet_NaN();
-        else if(inf || negInf) v = inf ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
-        else{
-            char* end = NULL;
-            v = strtod(s.c_str(), &end);
-            if(end == s.c_str()) v = 0;
-        }
-        if(bytes == 8) memcpy(elem, &v, 8);
-        else if(bytes == 4){ const float f = (float)v; memcpy(elem, &f, 4); }
-    }
-    else if(kind == 'b') elem[0] = (s == "1" || s == "true") ? 1 : 0;
-    else if(kind == 'u' || kind == 'i'){
+    else if(t.kind == 'f') floatFillElement(s, bytes, t.bfloat16, elem);
+    else if(t.kind == 'b') elem[0] = (s == "1" || s == "true") ? 1 : 0;
+    else{
         // Infinity and -Infinity (from older metadata) are the type's limits
         uint64_t v = 0;
         if(inf || negInf){
             const uint64_t umax = bytes == 8 ? UINT64_MAX : (1ULL << (8*bytes))-1;
-            if(kind == 'u') v = inf ? umax : 0;
+            if(t.kind == 'u') v = inf ? umax : 0;
             else v = inf ? umax >> 1 : ~(umax >> 1);
         }
         else if(!s.empty() && s[0] == '-') v = (uint64_t)strtoll(s.c_str(), NULL, 10);
@@ -267,13 +453,27 @@ void fillValueElement(const std::string &fillValue, const std::string &dtype, ui
         else if(bytes == 2){ const uint16_t x = (uint16_t)v; memcpy(elem, &x, 2); }
         else elem[0] = (uint8_t)v;
     }
-    if(oppositeEndianness(dtype)) std::reverse(elem, elem+bytes);
+    if(oppositeEndianness(dtype)){
+        for(uint64_t p = 0; p < bytes; p += t.swapBytes()) std::reverse(elem+p, elem+p+t.swapBytes());
+    }
 }
 
 bool fillValueIsZero(const std::string &fillValue){
     char* end = NULL;
     const double v = strtod(fillValue.c_str(), &end);
     return end != fillValue.c_str() && *end == '\0' && v == 0.0;
+}
+
+bool fillValueIsZero(const std::string &fillValue, const std::string &dtype){
+    const DtypeInfo t = dtypeInfo(dtype);
+    if(!t.kind) return fillValueIsZero(fillValue);
+    uint8_t elem[16];
+    fillValueElement(fillValue, dtype, elem);
+    return std::all_of(elem, elem+t.bytes, [](uint8_t b){ return b == 0; });
+}
+
+void swapDtypeEndianness(void* array, const DtypeInfo &dtype, const size_t n){
+    swapArrayEndianness(array, dtype.swapBytes(), n*(dtype.bytes/dtype.swapBytes()));
 }
 
 void swapArrayEndianness(void* array, const size_t elementSize, const size_t numElements){
@@ -345,7 +545,23 @@ template <int SZ> static inline void czTransposeBlock(const uint8_t* src, const 
 #pragma GCC unroll 16
     for(int q = 0; q < N; q++) memcpy(dst+czBitRev(q, BITS)*dstStride, &r[q], 16);
 }
+
+// The register transpose for elements of SZ bytes; 16-byte elements (complex128)
+// fill a whole register row and are moved one by one
+template <int SZ> struct CzBlockTranspose {
+    static const bool available = true;
+    static inline void run(const uint8_t* src, const uint64_t srcStride, uint8_t* dst, const uint64_t dstStride){
+        czTransposeBlock<SZ>(src, srcStride, dst, dstStride);
+    }
+};
+template <> struct CzBlockTranspose<16> {
+    static const bool available = false;
+    static inline void run(const uint8_t*, const uint64_t, uint8_t*, const uint64_t){}
+};
 #endif
+
+// A 16-byte element (complex128), moved as a whole
+struct CzElem16 { uint64_t lo, hi; };
 
 template <typename T>
 static void copyBoxTiled(const T* __restrict src, T* __restrict dst,
@@ -377,7 +593,7 @@ static void copyBoxTiled(const T* __restrict src, T* __restrict dst,
                         for(uint64_t ii = 0; ii < in; ii++) memcpy(buf+ii*TB, sj+(it+ii)*s0+kt, kn*sizeof(T));
                     }
 #ifdef CPPZARR_VECTOR_TRANSPOSE
-                    if(in == TB && kn == TB){
+                    if(CzBlockTranspose<sizeof(T)>::available && in == TB && kn == TB){
                         // Full tile: blocks of N x N elements (16 bytes per block row),
                         // each transposed in registers; a block row of destination
                         // lines is finished before moving on, so each line is
@@ -385,8 +601,8 @@ static void copyBoxTiled(const T* __restrict src, T* __restrict dst,
                         constexpr uint64_t N = 16/sizeof(T);
                         for(uint64_t kb = 0; kb < TB; kb += N){
                             for(uint64_t ib = 0; ib < TB; ib += N){
-                                czTransposeBlock<sizeof(T)>((const uint8_t*)(buf+ib*TB+kb), TB*sizeof(T),
-                                                            (uint8_t*)(dj+(kt+kb)*d2+it+ib), d2*sizeof(T));
+                                CzBlockTranspose<sizeof(T)>::run((const uint8_t*)(buf+ib*TB+kb), TB*sizeof(T),
+                                                                 (uint8_t*)(dj+(kt+kb)*d2+it+ib), d2*sizeof(T));
                             }
                         }
                         continue;
@@ -428,6 +644,7 @@ void copyBoxTransposed(const uint64_t bytes, const void* src, void* dst,
         case 2: copyBoxTiled((const uint16_t*)src, (uint16_t*)dst, n0, n1, n2, s0, s1, s2, d0, d1, d2); break;
         case 4: copyBoxTiled((const uint32_t*)src, (uint32_t*)dst, n0, n1, n2, s0, s1, s2, d0, d1, d2); break;
         case 8: copyBoxTiled((const uint64_t*)src, (uint64_t*)dst, n0, n1, n2, s0, s1, s2, d0, d1, d2); break;
+        case 16: copyBoxTiled((const CzElem16*)src, (CzElem16*)dst, n0, n1, n2, s0, s1, s2, d0, d1, d2); break;
     }
 }
 
@@ -452,6 +669,7 @@ void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void*
         case 2: fillTyped<uint16_t>(dst, n, elem); break;
         case 4: fillTyped<uint32_t>(dst, n, elem); break;
         case 8: fillTyped<uint64_t>(dst, n, elem); break;
+        case 16: fillTyped<CzElem16>(dst, n, elem); break;
     }
 }
 
@@ -636,6 +854,45 @@ static void fillOutsideRec(const uint64_t bytes, uint8_t* base, const uint64_t l
         for(uint64_t i = lo[d]; i < hi[d]; i++){
             fillOutsideRec(bytes, base+i*blk*bytes, level+1, m, order, full, strides, lo, hi, elem);
         }
+    }
+}
+
+void fillBoxND(const uint64_t bytes, void* dst,
+               const std::vector<uint64_t> &extents,
+               const std::vector<uint64_t> &strides,
+               const void* elem){
+    // Contiguous runs as long as the layout allows: from the axis of stride 1, each
+    // axis whose stride continues the run joins it (a missing inner chunk of a
+    // channel-last array is runs of all its channels and x, not of its 2 channels);
+    // the other axes are iterated, innermost first
+    const uint64_t n = extents.size();
+    std::vector<std::pair<uint64_t, uint64_t>> axes;   // (stride, extent)
+    for(uint64_t d = 0; d < n; d++){
+        if(extents[d] == 0) return;
+        if(extents[d] > 1) axes.push_back({strides[d], extents[d]});
+    }
+    std::sort(axes.begin(), axes.end());
+    uint64_t run = 1, k = 0;
+    while(k < axes.size() && axes[k].first == run){
+        run *= axes[k].second;
+        k++;
+    }
+    const uint64_t m = axes.size()-k;
+    std::vector<uint64_t> idx(m, 0);
+    uint8_t* base = (uint8_t*)dst;
+    uint64_t off = 0;
+    while(true){
+        fillElements(bytes, base+off*bytes, run, elem);
+        uint64_t l = 0;
+        for(; l < m; l++){
+            const uint64_t s = axes[k+l].first, e = axes[k+l].second;
+            idx[l]++;
+            off += s;
+            if(idx[l] < e) break;
+            off -= e*s;
+            idx[l] = 0;
+        }
+        if(l == m) return;
     }
 }
 

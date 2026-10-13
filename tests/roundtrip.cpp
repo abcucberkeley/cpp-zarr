@@ -36,6 +36,28 @@
 
 struct Case { const char* name; const char* dtype; uint64_t bits; };
 
+// Two elements of a data type are the same: equal bytes, or NaN in both (each part
+// of a complex number on its own)
+static bool sameElement(const uint8_t* a, const uint8_t* b, const DtypeInfo &t){
+    if (!std::memcmp(a, b, t.bytes)) return true;
+    if (t.kind != 'f' && t.kind != 'c') return false;
+    const uint64_t part = t.swapBytes();
+    for (uint64_t p = 0; p < t.bytes; p += part){
+        if (!std::memcmp(a + p, b + p, part)) continue;
+        bool na = false, nb = false;
+        if (part == 2){
+            uint16_t x, y;
+            std::memcpy(&x, a + p, 2); std::memcpy(&y, b + p, 2);
+            na = std::isnan(t.bfloat16 ? bfloat16ToFloat(x) : halfToFloat(x));
+            nb = std::isnan(t.bfloat16 ? bfloat16ToFloat(y) : halfToFloat(y));
+        }
+        else if (part == 4){ float x, y; std::memcpy(&x, a + p, 4); std::memcpy(&y, b + p, 4); na = std::isnan(x); nb = std::isnan(y); }
+        else { double x, y; std::memcpy(&x, a + p, 8); std::memcpy(&y, b + p, 8); na = std::isnan(x); nb = std::isnan(y); }
+        if (!(na && nb)) return false;
+    }
+    return true;
+}
+
 static void step(const char* name, const char* comp, const char* order, const char* what){
     std::fprintf(stderr, "  [%s/%s/%s] %s\n", name, comp, order, what);
     std::fflush(stderr);
@@ -59,6 +81,8 @@ int main(int argc, char** argv){
         {"uint32", "<u4", 32}, {"int32",  "<i4", 32},
         {"uint64", "<u8", 64}, {"int64",  "<i8", 64},
         {"float",  "<f4", 32}, {"double", "<f8", 64},
+        {"bool",   "|b1", 8},  {"half",   "<f2", 16}, {"bf16", "bfloat16", 16},
+        {"cplx64", "<c8", 64}, {"cplx128", "<c16", 128},
     };
     const char* orders[] = {"F", "C"};
 
@@ -106,8 +130,8 @@ int main(int argc, char** argv){
                     // Metadata (.zarray, or zarr.json) must round trip.
                     step(c.name, comp, order, "read metadata");
                     zarr Zr(path);
-                    // (1-byte types have no byte order: "|u1" in v3)
-                    const std::string wantType = fmt == 3 && c.bits == 8 ? std::string("|") + (c.dtype+1) : c.dtype;
+                    // (1-byte types have no byte order: "|u1", as NumPy names them)
+                    const std::string wantType = c.bits == 8 ? std::string("|") + (c.dtype+1) : c.dtype;
                     metaOK = Zr.get_dtype() == wantType && Zr.get_cname() == comp &&
                              Zr.get_shape(0) == shape[0] && Zr.get_shape(1) == shape[1] &&
                              Zr.get_shape(2) == shape[2] && Zr.get_order() == order &&
@@ -142,6 +166,225 @@ int main(int argc, char** argv){
             }
         }
     }
+    }
+
+    // float16 and bfloat16 conversions: every float16 and bfloat16 value back to the
+    // same bits through float, the rounding of edge cases (ties to even, overflow,
+    // subnormals, NaN), and doubles converted directly (no rounding to float first)
+    {
+        total++;
+        bool ok = true;
+        for (uint32_t h = 0; h < 65536 && ok; h++){
+            // (float to double quiets signaling NaNs: the double path keeps NaNs NaNs)
+            const bool nan = (h & 0x7c00u) == 0x7c00u && (h & 0x03ffu);
+            const uint16_t viaDouble = doubleToHalf((double)halfToFloat((uint16_t)h));
+            ok = floatToHalf(halfToFloat((uint16_t)h)) == h &&
+                 (nan ? (viaDouble & 0xfc00u) == (h & 0xfc00u) && (viaDouble & 0x03ffu) : viaDouble == h);
+            const float b = bfloat16ToFloat((uint16_t)h);
+            if (!std::isnan(b)) ok = ok && floatToBfloat16(b) == h;
+            else ok = ok && (floatToBfloat16(b) & 0x7fffu) == 0x7fc0u;
+        }
+        struct H { double v; uint16_t bits; };
+        const H halves[] = {{1.0, 0x3c00}, {-2.0, 0xc000}, {65504.0, 0x7bff}, {65519.99, 0x7bff}, {65520.0, 0x7c00},
+                            {1e10, 0x7c00}, {-1e10, 0xfc00}, {std::ldexp(1.0, -24), 0x0001}, {std::ldexp(1.0, -25), 0x0000},
+                            {std::ldexp(1.5, -25), 0x0001}, {std::ldexp(1.0, -14), 0x0400}, {-0.0, 0x8000},
+                            {1.0+std::ldexp(1.0, -11), 0x3c00}, {1.0+std::ldexp(3.0, -11), 0x3c02},
+                            // (a double just above a tie: rounding it to float first would land on the tie and round to even)
+                            {1.0+std::ldexp(1.0, -11)+std::ldexp(1.0, -40), 0x3c01},
+                            {std::numeric_limits<double>::infinity(), 0x7c00}};
+        for (const H& c : halves) ok = ok && doubleToHalf(c.v) == c.bits;
+        ok = ok && (doubleToHalf(std::nan("")) & 0x7c00) == 0x7c00 && (doubleToHalf(std::nan("")) & 0x03ff);
+        ok = ok && floatToBfloat16(1.5f) == 0x3fc0 && floatToBfloat16(-2.0f) == 0xc000 && floatToBfloat16(3e38f) == 0x7f62 &&
+             floatToBfloat16(1.0f+std::ldexp(1.0f, -8)) == 0x3f80 && floatToBfloat16(1.0f+std::ldexp(3.0f, -8)) == 0x3f82;
+        std::printf("%s  float16 and bfloat16 conversions\n", ok ? "PASS" : "FAIL");
+        if (!ok) failures++;
+    }
+
+    // Fill values in every data type, Zarr v2 and v3, F and C order: a region written
+    // into a new array leaves the rest of its chunks (and the chunks it does not touch)
+    // reading as the fill value, which the metadata keeps in the form the format uses
+    {
+        struct F { const char* name; const char* dtype; const char* fill; const char* v2json; const char* v3json; };
+        const F fills[] = {
+            {"uint16", "<u2", "5", "5", "5"},
+            {"int32", "<i4", "-7", "-7", "-7"},
+            {"uint64", "<u8", "18446744073709551615", "18446744073709551615", "18446744073709551615"},
+            {"float32", "<f4", "NaN", "\"NaN\"", "\"NaN\""},
+            {"float64", "<f8", "-2.5", "-2.5", "-2.5"},
+            {"float16", "<f2", "1.5", "1.5", "1.5"},
+            {"float16", "<f2", "-Infinity", "\"-Infinity\"", "\"-Infinity\""},
+            {"float16", "<f2", "0x7e00", "\"NaN\"", "\"0x7e00\""},
+            {"bfloat16", "bfloat16", "-2", "-2", "-2.0"},
+            {"complex64", "<c8", "[1.5,\"NaN\"]", "[1.5,\"NaN\"]", "[1.5,\"NaN\"]"},
+            {"complex128", "<c16", "[0,-2.25]", "[0,-2.25]", "[0.0,-2.25]"},
+            {"bool", "|b1", "1", "true", "true"},
+        };
+        const std::vector<uint64_t> shape = {13, 9, 7}, chunks = {8, 4, 4};
+        const std::vector<uint64_t> s = {3, 2, 1}, e = {10, 6, 3};   // partly covers chunks; others untouched
+        for (const F& f : fills){
+            for (const int fmt : {2, 3}){
+                for (const char* order : {"F", "C"}){
+                    total++;
+                    const std::string path = dir + "/rt_fill_" + f.name + "_" + std::to_string(fmt) + order + ".zarr";
+                    std::error_code ec; std::filesystem::remove_all(path, ec);
+                    bool ok = false;
+                    std::string why;
+                    try{
+                        const DtypeInfo info = dtypeInfo(f.dtype);
+                        const uint64_t es = info.bytes;
+                        zarr Zw;
+                        Zw.set_fileName(path);
+                        if (fmt == 3) Zw.set_zarr_format(3);
+                        Zw.set_order(order); Zw.set_cname("zstd"); Zw.set_chunks(chunks);
+                        Zw.set_dtype(f.dtype); Zw.set_fill_value(f.fill); Zw.set_shape(shape);
+                        Zw.write_zarray();
+                        // the region: element i holds bytes i*es+1.. (never the fill value)
+                        uint64_t rn = 1;
+                        std::vector<uint64_t> rshape(3);
+                        for (int d = 0; d < 3; d++){ rshape[d] = e[d] - s[d]; rn *= rshape[d]; }
+                        std::vector<uint8_t> region(rn * es);
+                        for (uint64_t i = 0; i < rn; i++){
+                            for (uint64_t b = 0; b < es; b++) region[i*es+b] = (uint8_t)(0x11 + i + 3*b);
+                            if (info.kind == 'b') region[i*es] = i % 2 == 0 ? 0 : 1;   // (bools: 0 or 1)
+                            if (info.kind == 'b' && region[i*es] == 1) region[i*es] = 0;   // (never the fill, true)
+                            if (info.kind == 'f' || info.kind == 'c') region[i*es+es-1] &= 0x3f; // (no NaNs)
+                        }
+                        zarr Zc(path);
+                        Zc.set_chunkInfo(s, e);
+                        if (parallelWriteZarr(Zc, region.data(), s, e, rshape, es*8, false, true, false))
+                            throw std::string("write: ") + Zc.get_errString();
+                        // read the whole array back (missing chunks are the fill value too)
+                        zarr Zr(path);
+                        void* all = parallelReadZarrWriteWrapper(Zr, false, {0,0,0}, shape, false);
+                        if (!all) throw std::string("read failed");
+                        uint8_t fe[16];
+                        fillValueElement(f.fill, f.dtype, fe);
+                        ok = true;
+                        for (uint64_t z = 0; z < shape[2] && ok; z++)
+                            for (uint64_t y = 0; y < shape[1] && ok; y++)
+                                for (uint64_t x = 0; x < shape[0] && ok; x++){
+                                    const uint8_t* got = (const uint8_t*)all + (x + shape[0]*(y + shape[1]*z))*es;
+                                    const bool in = x >= s[0] && x < e[0] && y >= s[1] && y < e[1] && z >= s[2] && z < e[2];
+                                    const uint8_t* want = fe;
+                                    if (in) want = &region[((x-s[0]) + rshape[0]*((y-s[1]) + rshape[1]*(z-s[2])))*es];
+                                    ok = !std::memcmp(got, want, es);
+                                    if (!ok) why = std::string("element ") + std::to_string(x) + "," + std::to_string(y) + "," +
+                                                   std::to_string(z) + (in ? " (written)" : " (fill)");
+                                }
+                        free(all);
+                        // the metadata's fill value
+                        std::ifstream mf(path + (fmt == 3 ? "/zarr.json" : "/.zarray"));
+                        const json meta = json::parse(mf);
+                        const json want = json::parse(fmt == 3 ? f.v3json : f.v2json);
+                        if (meta.at("fill_value") != want){
+                            ok = false;
+                            why = "fill_value " + meta.at("fill_value").dump() + ", expected " + want.dump();
+                        }
+                    }
+                    catch (const std::string& x){ why = x; }
+                    catch (const std::exception& x){ why = x.what(); }
+                    std::printf("%s  fill value %s %s v%d %s%s%s\n", ok ? "PASS" : "FAIL", f.name, f.fill, fmt, order,
+                                ok ? "" : ": ", why.c_str());
+                    if (!ok) failures++;
+                    std::filesystem::remove_all(path, ec);
+                }
+            }
+        }
+    }
+
+    // Reading into memory that does not hold the fill value (fillMissing): chunks that are
+    // missing, shards that are missing, and inner chunks missing from their shards get
+    // the fill value, and the rest their data, in both orders and on channel-last arrays
+    // (the fill of a missing chunk runs along several axes at once)
+    {
+        struct M { const char* name; std::vector<uint64_t> shape, chunks, inner; const char* order; const char* dtype; const char* fill; };
+        const M ms[] = {
+            {"v2_F", {70, 45, 33}, {16, 16, 8}, {}, "F", "<u2", "7"},
+            {"v3_C", {70, 45, 33}, {16, 16, 8}, {}, "C", "<f4", "NaN"},
+            {"v3_shards_C", {64, 48, 30, 2}, {32, 16, 10, 2}, {8, 8, 5, 2}, "C", "<u2", "3"},
+            {"v3_shards_F", {64, 48, 30, 2}, {32, 16, 10, 2}, {8, 8, 5, 2}, "F", "<c8", "[1.5,\"NaN\"]"},
+        };
+        for (const M& c : ms){
+            total++;
+            bool ok = false;
+            std::string why;
+            const std::string path = dir + "/rt_fillmissing_" + c.name + ".zarr";
+            std::error_code ec; std::filesystem::remove_all(path, ec);
+            try{
+                const DtypeInfo info = dtypeInfo(c.dtype);
+                const uint64_t es = info.bytes, nd = c.shape.size();
+                uint64_t count = 1;
+                for (uint64_t v : c.shape) count *= v;
+                std::vector<uint8_t> data(count * es);
+                for (uint64_t i = 0; i < data.size(); i++) data[i] = (uint8_t)(i * 7 + 3);
+                if (info.kind == 'f' || info.kind == 'c') for (uint64_t i = 0; i < count * es; i += info.swapBytes()) data[i + info.swapBytes() - 1] &= 0x3f;
+                zarr Zw;
+                Zw.set_fileName(path);
+                if (std::string(c.name).rfind("v3", 0) == 0) Zw.set_zarr_format(3);
+                Zw.set_order(c.order); Zw.set_cname("zstd"); Zw.set_dtype(c.dtype); Zw.set_fill_value(c.fill);
+                Zw.set_chunks(c.chunks); Zw.set_shape(c.shape);
+                if (!c.inner.empty()){ Zw.set_shard(true); Zw.set_chunk_shape(c.inner); }
+                Zw.write_zarray();
+                const std::vector<uint64_t> zeros(nd, 0);
+                Zw.set_chunkInfo(zeros, c.shape);
+                if (parallelWriteZarr(Zw, data.data(), zeros, c.shape, c.shape, es * 8, false, false, false))
+                    throw std::string("write: ") + Zw.get_errString();
+                // remove every third chunk or shard file
+                std::vector<std::string> files;
+                for (const auto& f : std::filesystem::recursive_directory_iterator(path))
+                    if (f.is_regular_file() && f.path().filename() != ".zarray" && f.path().filename() != "zarr.json") files.push_back(f.path().string());
+                std::sort(files.begin(), files.end());
+                for (uint64_t i = 0; i < files.size(); i += 3) std::filesystem::remove(files[i]);
+                // and, in the sharded arrays, mark some of the remaining shards' inner chunks missing
+                if (!c.inner.empty()){
+                    uint64_t nInner = 1;
+                    for (uint64_t d = 0; d < nd; d++) nInner *= c.chunks[d] / c.inner[d];
+                    for (uint64_t i = 1; i < files.size(); i += 3){
+                        std::fstream f(files[i], std::ios::in | std::ios::out | std::ios::binary);
+                        f.seekg(0, std::ios::end);
+                        const uint64_t len = (uint64_t)f.tellg(), indexBytes = 16 * nInner;
+                        std::vector<uint64_t> index(2 * nInner);
+                        f.seekg(len - indexBytes - 4);
+                        f.read((char*)index.data(), indexBytes);
+                        for (uint64_t k = 0; k < nInner; k += 2) index[2 * k] = index[2 * k + 1] = std::numeric_limits<uint64_t>::max();
+                        f.seekp(len - indexBytes - 4);
+                        f.write((const char*)index.data(), indexBytes);
+                        const uint32_t crc = crc32c((const uint8_t*)index.data(), indexBytes);
+                        f.write((const char*)&crc, 4);
+                    }
+                }
+                for (bool cOrder : {false, true}){
+                    for (int region = 0; region < 2; region++){
+                        std::vector<uint64_t> s(nd), e(nd), rshape(nd);
+                        uint64_t rn = 1;
+                        for (uint64_t d = 0; d < nd; d++){
+                            s[d] = region ? c.shape[d] / 5 : 0;
+                            e[d] = region ? c.shape[d] - c.shape[d] / 7 : c.shape[d];
+                            rshape[d] = e[d] - s[d];
+                            rn *= rshape[d];
+                        }
+                        zarr Zr(path);
+                        void* want = parallelReadZarrWriteWrapper(Zr, region != 0, s, e, cOrder);
+                        if (!want) throw std::string("read failed");
+                        std::vector<uint8_t> got(rn * es, 0xA5);
+                        uint8_t fe[16];
+                        fillValueElement(Zr.get_fill_value(), Zr.get_dtype(), fe);
+                        zarr Zm(path);
+                        Zm.set_chunkInfo(s, e);
+                        const uint8_t err = parallelReadZarr(Zm, got.data(), s, e, rshape, es * 8, true, false, cOrder, fe);
+                        ok = !err && !std::memcmp(got.data(), want, rn * es);
+                        free(want);
+                        if (!ok){ why = std::string(cOrder ? "C" : "F") + (region ? " region" : " whole") + " read differs"; break; }
+                    }
+                    if (!ok) break;
+                }
+            }
+            catch (const std::string& x){ why = x; }
+            std::printf("%s  reading into memory not holding the fill value, %s%s%s\n", ok ? "PASS" : "FAIL", c.name,
+                        ok ? "" : ": ", why.c_str());
+            if (!ok) failures++;
+            std::filesystem::remove_all(path, ec);
+        }
     }
 
     // Oversize-chunk guard: a blosc chunk >= ~2 GB uncompressed must be rejected
@@ -231,14 +474,14 @@ int main(int argc, char** argv){
                         ok = out[j + i*ry + k*ry*rx] == src[(x0+i) + (y0+j)*sx + (z0+k)*sx*sy];
             free(out);
 
-            // Unsupported dtype (complex64) must yield NULL, not a crash.
-            const std::string cpath = dir + "/rt_imagej_c8.zarr";
+            // Unsupported dtype (raw 2-byte values) must yield NULL, not a crash.
+            const std::string cpath = dir + "/rt_imagej_v2.zarr";
             std::filesystem::remove_all(cpath, ec);
             std::filesystem::create_directories(cpath);
             {
                 std::ofstream z(cpath + "/.zarray");
                 z << "{\"chunks\":[8,8,8],\"compressor\":{\"blocksize\":0,\"clevel\":5,"
-                     "\"cname\":\"lz4\",\"id\":\"blosc\",\"shuffle\":1},\"dtype\":\"<c8\","
+                     "\"cname\":\"lz4\",\"id\":\"blosc\",\"shuffle\":1},\"dtype\":\"<V2\","
                      "\"fill_value\":0,\"filters\":null,\"order\":\"F\","
                      "\"shape\":[8,8,8],\"zarr_format\":2}";
             }
@@ -378,12 +621,12 @@ int main(int argc, char** argv){
         };
         std::mt19937 nrng(4242);
         for (const NdCase& c : ndCases){
-            for (const char* dtype : {"<u2", "<f8"}){
+            for (const char* dtype : {"<u2", "<f8", "<f2", "<c16"}){
                 for (const char* order : {"F", "C"}){
                 for (const int fmt : {2, 3}){
                     if (fmt == 3 && !c.sub.empty()) continue;
                     total++;
-                    const uint64_t bytes = dtype[2]-'0', n = c.shape.size();
+                    const uint64_t bytes = dtypeInfo(dtype).bytes, n = c.shape.size();
                     uint64_t count = 1; for (uint64_t v : c.shape) count *= v;
                     std::vector<uint8_t> orig(count*bytes);
                     for (auto& b : orig) b = (uint8_t)byteDist(rng);
@@ -953,7 +1196,7 @@ int main(int argc, char** argv){
         // at its path, unless fresh.
         auto make = [&](const std::string& name, int fmt, const V& shape, const V& chunks, const V& inner, const char* order,
                         const char* comp, const char* sep, const char* dtype, const std::string& fill = "0", bool fresh = true){
-            Made m{dir + "/rt_v3_" + name + ".zarr", shape, {}, (uint64_t)(dtype[2] - '0')};
+            Made m{dir + "/rt_v3_" + name + ".zarr", shape, {}, dtypeInfo(dtype).bytes};
             std::error_code ec;
             if (fresh) std::filesystem::remove_all(m.path, ec);
             zarr Z;
@@ -1673,18 +1916,14 @@ int main(int argc, char** argv){
                 try{
                     const std::string dt = fx.at("dtype");
                     const std::vector<uint64_t> shape = fx.at("shape").get<std::vector<uint64_t>>();
-                    const uint64_t nd = shape.size(), bytes = dt[2] - '0';
+                    const DtypeInfo info = dtypeInfo(dt);
+                    const uint64_t nd = shape.size(), bytes = info.bytes;
                     uint64_t count = 1;
                     for (uint64_t v : shape) count *= v;
                     std::ifstream bf(v3dir + "/" + name + ".bin", std::ios::binary);
                     const std::vector<uint8_t> want((std::istreambuf_iterator<char>(bf)), std::istreambuf_iterator<char>());
                     // equal elements, NaN equal to NaN
-                    auto same = [&](const uint8_t* a, const uint8_t* b){
-                        if (!std::memcmp(a, b, bytes)) return true;
-                        if (dt[1] != 'f') return false;
-                        if (bytes == 4){ float x, y; std::memcpy(&x, a, 4); std::memcpy(&y, b, 4); return std::isnan(x) && std::isnan(y); }
-                        double x, y; std::memcpy(&x, a, 8); std::memcpy(&y, b, 8); return std::isnan(x) && std::isnan(y);
-                    };
+                    auto same = [&](const uint8_t* a, const uint8_t* b){ return sameElement(a, b, info); };
                     // the expected element at C-order coordinates idx
                     auto at = [&](const std::vector<uint64_t>& idx){
                         uint64_t off = 0;
@@ -1771,7 +2010,8 @@ int main(int argc, char** argv){
                 const std::string name = fx.at("name"), path = dir + "/rt_ta_" + name + ".zarr";
                 const std::string dt = fx.at("dtype");
                 const std::vector<uint64_t> shape = fx.at("shape").get<std::vector<uint64_t>>();
-                const uint64_t nd = shape.size(), bytes = dt[2] - '0';
+                const DtypeInfo info = dtypeInfo(dt);
+                const uint64_t nd = shape.size(), bytes = info.bytes;
                 uint64_t count = 1;
                 for (uint64_t v : shape) count *= v;
                 std::ifstream bf(v3dir + "/" + name + ".bin", std::ios::binary);
@@ -1781,7 +2021,7 @@ int main(int argc, char** argv){
                 // new values, F order (booleans 0 or 1)
                 auto values = [&](uint64_t n){
                     std::vector<uint8_t> v(n * bytes);
-                    for (auto& b : v) b = dt[1] == 'b' ? (uint8_t)(wrng() & 1) : (uint8_t)wrng();
+                    for (auto& b : v) b = info.kind == 'b' ? (uint8_t)(wrng() & 1) : (uint8_t)wrng();
                     return v;
                 };
                 // put an F-order region [s, e) into exp (C order)
@@ -1802,14 +2042,7 @@ int main(int argc, char** argv){
                     const std::vector<uint64_t> zeros(nd, 0);
                     uint8_t* got = (uint8_t*)parallelReadZarrWriteWrapper(Z, false, zeros, shape, true);
                     bool same = got != nullptr;
-                    for (uint64_t i = 0; same && i < count; i++){
-                        const uint8_t *a = got + i * bytes, *b = &exp[i * bytes];
-                        same = !std::memcmp(a, b, bytes);
-                        if (!same && dt[1] == 'f'){
-                            if (bytes == 4){ float x, y; std::memcpy(&x, a, 4); std::memcpy(&y, b, 4); same = std::isnan(x) && std::isnan(y); }
-                            else { double x, y; std::memcpy(&x, a, 8); std::memcpy(&y, b, 8); same = std::isnan(x) && std::isnan(y); }
-                        }
-                    }
+                    for (uint64_t i = 0; same && i < count; i++) same = sameElement(got + i * bytes, &exp[i * bytes], info);
                     free(got);
                     return same;
                 };

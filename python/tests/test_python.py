@@ -6,7 +6,9 @@ region (cropped) read, arrays of 0 to 40 dimensions with region reads and crop
 writes, and arrays in any memory layout (C order, F order, strided views) read
 back in either order, and test arrays written by zarr-python 3 and TensorStore
 (tests/test_arrays: Zarr v3, and v2 with other codecs and fill values), written into
-and converted to Zarr v3. Zarr v3 writing: round trips, shards, crop writes, the
+and converted to Zarr v3. Every data type: booleans, integers, float16, float32,
+float64, complex64, complex128, and bfloat16 when ml_dtypes is installed. Zarr v3
+writing: round trips, shards, crop writes, the
 format of an existing array, conversion, and (when zarr-python and TensorStore are
 installed) reading what cpp-zarr wrote with them. Run automatically by cibuildwheel
 against the freshly built+installed wheel, so it also verifies the wheel imports and
@@ -30,11 +32,28 @@ try:
     import tensorstore as ts
 except ImportError:
     ts = None
+# bfloat16 (ml_dtypes' type)
+try:
+    import ml_dtypes
+except ImportError:
+    ml_dtypes = None
+
+
+def is_bfloat16(dt):
+    return ml_dtypes is not None and np.dtype(dt) == np.dtype(ml_dtypes.bfloat16)
 
 
 def zarr_read(path):
-    # The array as zarr-python reads it (None without zarr-python)
-    return zarr.open_array(path, mode='r')[...] if zarr is not None else None
+    # The array as zarr-python reads it (None without zarr-python, and for bfloat16,
+    # which it does not read)
+    if zarr is None:
+        return None
+    meta = [os.path.join(path, f) for f in ('zarr.json', '.zarray') if os.path.isfile(os.path.join(path, f))]
+    if meta:
+        m = load_json(meta[0])
+        if str(m.get('data_type', m.get('dtype'))).lstrip('<>|') == 'bfloat16':
+            return None
+    return zarr.open_array(path, mode='r')[...]
 
 
 def ts_read(path):
@@ -55,14 +74,22 @@ def same(a, b):
     if a is None or b is None:
         return True
     a, b = np.asarray(a), np.asarray(b)
-    return a.shape == b.shape and a.dtype == b.dtype and np.array_equal(a, b, equal_nan=a.dtype.kind == 'f')
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    if is_bfloat16(a.dtype):
+        a, b = a.astype(np.float32), b.astype(np.float32)
+    return np.array_equal(a, b, equal_nan=a.dtype.kind in 'fc')
 
 
 def values_like(rng, a):
     # Random values of a's dtype and shape (no NaNs)
     a = np.asarray(a)
-    if a.dtype.kind == 'f':
-        return np.asarray(rng.standard_normal(a.shape) * 1000, dtype=a.dtype)
+    if a.dtype.kind == 'b':
+        return rng.random(a.shape) < 0.5
+    if a.dtype.kind == 'c':
+        return np.asarray((rng.standard_normal(a.shape) + 1j * rng.standard_normal(a.shape)) * 1000, dtype=a.dtype)
+    if a.dtype.kind == 'f' or is_bfloat16(a.dtype):
+        return np.asarray(rng.standard_normal(a.shape) * 1000, dtype=np.float32).astype(a.dtype)
     info = np.iinfo(a.dtype)
     return np.asarray(rng.integers(max(info.min, -10**6), min(info.max, 10**6), size=a.shape, endpoint=True), dtype=a.dtype)
 
@@ -72,7 +99,9 @@ def main():
     shape = (40, 24, 18)  # d0, d1, d2 (non-chunk-aligned -> exercises partial chunks)
     chunks = [16, 16, 16]
     dtypes = [np.uint8, np.int8, np.uint16, np.int16, np.uint32, np.int32,
-              np.uint64, np.int64, np.float32, np.float64]
+              np.uint64, np.int64, np.float32, np.float64, np.bool_, np.float16, np.complex64, np.complex128]
+    if ml_dtypes is not None:
+        dtypes.append(ml_dtypes.bfloat16)
     # (compressor, order) combinations. zstd/F is our most-used combo; the others
     # add lz4, gzip, and a C-order case (which exercises the read transpose).
     combos = [("zstd", "F"), ("lz4", "F"), ("zstd", "C"), ("gzip", "F")]
@@ -81,19 +110,16 @@ def main():
     ok = True
     for dt in dtypes:
         name = np.dtype(dt).name
-        if np.issubdtype(dt, np.integer):
-            info = np.iinfo(dt)
-            lo, hi = max(info.min, -1000), min(info.max, 1000)  # negatives exercise signed types
-            data = rng.integers(lo, hi, size=shape, endpoint=True).astype(dt)
-        else:
-            data = (rng.standard_normal(shape) * 1000).astype(dt)
+        # (negatives exercise signed types)
+        data = values_like(rng, np.zeros(shape, dt))
 
         for cname, order in combos:
             path = os.path.join(tmp, f"rt_{name}_{cname}_{order}.zarr")
             cppzarr.write_zarr(path, data, cname=cname, order=order, chunks=chunks)
             back = cppzarr.read_zarr(path)
+            # (zarr-python reads it the same)
             good = (back.dtype == data.dtype and back.shape == data.shape
-                    and np.array_equal(back, data))
+                    and same(back, data) and same(zarr_read(path), data))
             print(f"{name:8s} {cname:8s} {order}  {'OK' if good else 'FAIL'}")
             ok = ok and good
 
@@ -101,7 +127,7 @@ def main():
         h = shape[0] // 2
         path = os.path.join(tmp, f"rt_{name}_lz4_F.zarr")
         sub = cppzarr.read_zarr(path, start_coords=[0, 0, 0], end_coords=[h, shape[1], shape[2]])
-        rgood = sub.shape == (h, shape[1], shape[2]) and np.array_equal(sub, data[0:h])
+        rgood = sub.shape == (h, shape[1], shape[2]) and same(sub, data[0:h])
         print(f"{name:8s} region     {'OK' if rgood else 'FAIL'}")
         ok = ok and rgood
 
@@ -225,6 +251,14 @@ def main():
     else:
         with open(os.path.join(v3dir, 'arrays.json')) as f:
             fixtures = json.load(f)['arrays']
+        # (bfloat16 arrays need ml_dtypes)
+        def fixture_dtype(fx):
+            return np.dtype(ml_dtypes.bfloat16) if fx['dtype'] == 'bfloat16' else np.dtype(fx['dtype'])
+        if ml_dtypes is None:
+            skipped = [fx['name'] for fx in fixtures if fx.get('dtype') == 'bfloat16']
+            fixtures = [fx for fx in fixtures if fx.get('dtype') != 'bfloat16']
+            if skipped:
+                print(f"bfloat16 test arrays skipped (no ml_dtypes): {', '.join(skipped)}")
         for fx in fixtures:
             path = os.path.join(v3dir, fx['name'] + '.zarr')
             if 'error' in fx:
@@ -236,16 +270,16 @@ def main():
                 print(f"test array {fx['name']:36s} rejected  {'OK' if good else 'FAIL'}")
                 ok = ok and good
                 continue
-            exp = np.fromfile(os.path.join(v3dir, fx['name'] + '.bin'), dtype=fx['dtype']).reshape(fx['shape'])
+            exp = np.fromfile(os.path.join(v3dir, fx['name'] + '.bin'), dtype=fixture_dtype(fx)).reshape(fx['shape'])
             good = True
             for o in (None, 'F', 'C'):
                 a = cppzarr.read_zarr(path, order=o)
-                good = good and a.dtype == exp.dtype and np.array_equal(a, exp, equal_nan=exp.dtype.kind == 'f')
+                good = good and same(a, exp)
             if exp.ndim:
                 s = [1 if n > 2 else 0 for n in exp.shape]
                 e = [n - 1 if n > 2 else n for n in exp.shape]
                 region = tuple(slice(a, b) for a, b in zip(s, e))
-                good = good and np.array_equal(cppzarr.read_zarr(path, s, e), exp[region], equal_nan=exp.dtype.kind == 'f')
+                good = good and same(cppzarr.read_zarr(path, s, e), exp[region])
             print(f"test array {fx['name']:36s}           {'OK' if good else 'FAIL'}")
             ok = ok and good
         # Writes into copies of them: a region, then the whole array (as the array's
@@ -255,13 +289,13 @@ def main():
         for fx in fixtures:
             if 'error' in fx:
                 continue
-            exp = np.fromfile(os.path.join(v3dir, fx['name'] + '.bin'), dtype=fx['dtype']).reshape(fx['shape'])
-            if exp.dtype.kind == 'b':      # (cpp-zarr does not write booleans)
-                continue
+            exp = np.fromfile(os.path.join(v3dir, fx['name'] + '.bin'), dtype=fixture_dtype(fx)).reshape(fx['shape'])
             copy = os.path.join(tmp, 'ta_' + fx['name'] + '.zarr')
             shutil.copytree(os.path.join(v3dir, fx['name'] + '.zarr'), copy)
             meta_file = os.path.join(copy, 'zarr.json')
-            big_endian = os.path.isfile(meta_file) and '"endian": "big"' in json.dumps(load_json(meta_file))
+            # (Zarr v3: a bytes codec in big-endian order; v2: a ">" dtype)
+            big_endian = (os.path.isfile(meta_file) and '"endian": "big"' in json.dumps(load_json(meta_file))) or \
+                (os.path.isfile(os.path.join(copy, '.zarray')) and str(load_json(os.path.join(copy, '.zarray'))['dtype']).startswith('>'))
             good = True
             try:
                 if exp.ndim:
@@ -338,7 +372,9 @@ def main():
     # as the MATLAB writer does; data in the other byte order is written correctly
     good = True
     for zf, atype, dtype in [(2, np.uint16, np.float32), (3, np.float32, np.int64), (3, np.uint8, np.int32),
-                             (3, np.int16, np.dtype('>i2')), (2, np.float64, np.dtype('>f4'))]:
+                             (3, np.int16, np.dtype('>i2')), (2, np.float64, np.dtype('>f4')),
+                             (3, np.float16, np.float64), (2, np.complex64, np.float32), (3, np.complex128, np.complex64),
+                             (2, np.bool_, np.uint8), (3, np.float16, np.dtype('>f2'))]:
         # (no "<" or ">" in file names: Windows does not allow them)
         big = '_big_endian' if np.dtype(dtype).byteorder == '>' else ''
         path = os.path.join(tmp, f"convert_v{zf}_{np.dtype(atype).name}_{np.dtype(dtype).name}{big}.zarr")
@@ -406,6 +442,115 @@ def main():
     except Exception as e:
         good = good and 'not a Zarr v2 array' in str(e)
     print(f"v3 existing arrays and conversion  {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
+    # Reading into an array (out=): the region's values, and the fill value where chunks
+    # (or a shard's inner chunks, or whole shards) are missing, whatever out held; out
+    # of another shape, type or layout is refused. num_threads: the same values.
+    good = True
+    for zf, shards, dt in [(2, None, np.uint16), (3, None, np.float32), (3, [32, 32, 16], np.float32), (3, [32, 32, 16], np.complex64)]:
+        p = os.path.join(tmp, f"out_{zf}_{shards}_{np.dtype(dt).name}.zarr")
+        d = values_like(rng, np.zeros((70, 45, 33), dt))
+        cppzarr.write_zarr(p, d, chunks=[16, 16, 8], zarr_format=zf, shards=shards)
+        meta_file = os.path.join(p, 'zarr.json' if zf == 3 else '.zarray')
+        meta = load_json(meta_file)
+        meta['fill_value'] = 7 if dt == np.uint16 else ([1.5, 'NaN'] if dt == np.complex64 else 'NaN')
+        with open(meta_file, 'w') as f:
+            json.dump(meta, f)
+        files = sorted(os.path.join(r, f) for r, _, fs in os.walk(p) for f in fs if f not in ('zarr.json', '.zarray'))
+        for f in files[::3]:
+            os.remove(f)
+        ref = cppzarr.read_zarr(p)
+        for order in 'CF':
+            for s, e in [([0, 0, 0], [70, 45, 33]), ([5, 7, 3], [61, 40, 29])]:
+                region = tuple(slice(a, b) for a, b in zip(s, e))
+                o = np.empty([b - a for a, b in zip(s, e)], dtype=dt, order=order)
+                o[...] = 123
+                got = cppzarr.read_zarr(p, s, e, out=o, num_threads=3)
+                good = good and got is o and same(o, ref[region]) and same(cppzarr.read_zarr(p, s, e, num_threads=1), ref[region])
+    p = os.path.join(tmp, "out_2_None_uint16.zarr")
+    for bad, what in [(np.empty((70, 45, 33), np.float32), 'data type'), (np.empty((70, 45, 32), np.uint16), 'shape'),
+                      (np.empty((70, 45, 66), np.uint16)[:, :, ::2], 'contiguous')]:
+        try:
+            cppzarr.read_zarr(p, out=bad)
+            good = False
+        except Exception as e:
+            good = good and what in str(e)
+    for bad in (0, -1, 1.5):
+        try:
+            cppzarr.read_zarr(p, num_threads=bad)
+            good = False
+        except Exception as e:
+            good = good and 'num_threads' in str(e)
+    print(f"reading into arrays, and num_threads  {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
+    # Batches of reads: the same values as reading each region on its own, in the
+    # requests' order, into new arrays or into given ones (one batch buffer), from
+    # several arrays; and other Python threads run while cpp-zarr reads (the GIL is
+    # released)
+    import threading
+    import time
+    arrays = []
+    for k, (zf, shards) in enumerate([(2, None), (3, [32, 32, 16]), (3, None)]):
+        p = os.path.join(tmp, f"batch_{k}.zarr")
+        d = values_like(rng, np.zeros((70, 45, 33), np.uint16))
+        cppzarr.write_zarr(p, d, chunks=[16, 16, 8], zarr_format=zf, shards=shards)
+        arrays.append((p, d))
+    requests, expected = [], []
+    for i in range(23):
+        p, d = arrays[i % 3]
+        s = [int(rng.integers(0, 40)), int(rng.integers(0, 20)), int(rng.integers(0, 10))]
+        e = [s[0] + 30, s[1] + 25, s[2] + 20]
+        requests.append((p, s, e))
+        expected.append(d[tuple(slice(a, b) for a, b in zip(s, e))])
+    good = True
+    for threads in (None, 1, 4, 64):
+        got = cppzarr.read_zarr_batch(requests, num_threads=threads)
+        good = good and len(got) == len(expected) and all(np.array_equal(g, x) for g, x in zip(got, expected))
+    buffer = np.zeros((len(requests), 30, 25, 20), np.uint16)
+    got = cppzarr.read_zarr_batch([r + (buffer[i],) for i, r in enumerate(requests)], num_threads=4)
+    good = good and all(g.base is buffer or g is buffer[i] for i, g in enumerate(got)) and np.array_equal(buffer, np.stack(expected))
+    good = good and cppzarr.read_zarr_batch([]) == []
+    # batches of other sizes than the reads run at once (10 reads 4 at a time, 5 at 4, 7 at
+    # 3): the same values
+    for k, threads in ((10, 4), (5, 4), (7, 3)):
+        got = cppzarr.read_zarr_batch(requests[:k], num_threads=threads)
+        good = good and len(got) == k and all(np.array_equal(g, x) for g, x in zip(got, expected[:k]))
+    # a read that fails, in an earlier round or in the last one: the batch raises its error
+    missing = (os.path.join(tmp, "missing.zarr"), [0, 0, 0], [30, 25, 20])
+    for batch in (requests[:3] + [missing] + requests[3:10], requests[:9] + [missing]):
+        try:
+            cppzarr.read_zarr_batch(batch, num_threads=4)
+            good = False
+        except Exception as e:
+            good = good and 'missing.zarr' in str(e)
+    # a batch's threads by default are a call's: OMP_NUM_THREADS when it is set
+    import subprocess
+    child = subprocess.run([sys.executable, '-c', 'from cppzarr.cppzarrwrappers import pybind11_default_threads; print(pybind11_default_threads())'],
+                           env=dict(os.environ, OMP_NUM_THREADS='3'), capture_output=True, text=True)
+    good = good and child.stdout.strip() == '3'
+    # whole arrays (no coordinates), and C order asked for
+    whole = cppzarr.read_zarr_batch([(p, None, None) for p, _ in arrays], order='C', num_threads=3)
+    good = good and all(np.array_equal(w, d) and w.flags['C_CONTIGUOUS'] for w, (_, d) in zip(whole, arrays))
+    big = os.path.join(tmp, "gil.zarr")
+    cppzarr.write_zarr(big, values_like(rng, np.zeros((512, 512, 128), np.uint16)), chunks=[128, 128, 64])
+    count = [0]
+    def spin(seconds):
+        end = time.perf_counter() + seconds
+        while time.perf_counter() < end:
+            count[0] += 1
+    spin(0.2)
+    alone = count[0] / 0.2
+    reader = threading.Thread(target=lambda: [cppzarr.read_zarr(big, num_threads=1) for _ in range(3)])
+    count[0] = 0
+    t0 = time.perf_counter()
+    reader.start()
+    while reader.is_alive():
+        count[0] += 1
+    rate = count[0] / (time.perf_counter() - t0)
+    good = good and rate > 0.1 * alone
+    print(f"batches of reads, and the GIL released while reading  {'OK' if good else 'FAIL'}")
     ok = ok and good
 
     if not ok:

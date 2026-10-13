@@ -2,8 +2,6 @@
 #ifdef _WIN32
 #include <stdarg.h>
 #include <sys/time.h>
-#else
-#include <uuid/uuid.h>
 #endif
 #include <sys/stat.h>
 #include "mex.h"
@@ -40,29 +38,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             Zarr.set_cname(mxArrayToString(prhs[i+1]));
         }
         else if(currInput == "dtype"){
-            if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","dtype must be a string\n");
-            std::string dtype = mxArrayToString(prhs[i+1]);
-            if(dtype.size() == 2){
-                dtype.insert(0,1,'<');
-            }
-            else if(dtype.size() != 3) mexErrMsgIdAndTxt("zarr:inputError","dtype must be of length 2 or 3\n");
-
-            if(dtype[0] != '<' && dtype[0] != '>'){
-                mexErrMsgIdAndTxt("zarr:inputError","The first character of dtype must be \"<\" or \">\"\n");
-            }
-
-            if(dtype[1] == 'u' || dtype[1] == 'i'){
-                if(dtype[2] != '1' && dtype[2] != '2' && dtype[2] != '4' && dtype[2] != '8'){
-                    mexErrMsgIdAndTxt("zarr:inputError","For dtype u or i, the third character of dtype must be \"1\", \"2\", \"4\", or \"8\"\n");
-                }
-            }
-            else if(dtype[1] == 'f'){
-                if(dtype[2] != '4' && dtype[2] != '8'){
-                    mexErrMsgIdAndTxt("zarr:inputError","For dtype f, the third character of dtype must be \"4\" or \"8\"\n");
-                }
-            }
-            else mexErrMsgIdAndTxt("zarr:inputError","The second character of dtype must be \"u\", \"i\", or \"f\"\n");
-            Zarr.set_dtype(dtype);
+            Zarr.set_dtype(mexDtype(prhs[i+1]));
         }
         else if(currInput == "order"){
             order = mexOrder(prhs[i+1]);

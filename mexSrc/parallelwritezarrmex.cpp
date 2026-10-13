@@ -18,60 +18,6 @@
 //Windows
 //mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-IC:\Program Files (x86)\bloscZarr\include' '-LC:\Program Files (x86)\bloscZarr\lib' -lblosc '-IC:\Program Files (x86)\cJSON\include\' '-LC:\Program Files (x86)\cJSON\lib' -lcjson '-IC:\Program Files (x86)\blosc\include' '-LC:\Program Files (x86)\blosc\lib' -lblosc2 parallelWriteZarr.c parallelReadZarr.c helperFunctions.c
 
-// Cast-copy between any two supported element types, used when writing into an
-// existing zarr file whose dtype differs from the MATLAB input's type.
-template <typename TDst, typename TSrc>
-static void castCopy(void* dstV, const void* srcV, const uint64_t n){
-    TDst* dst = (TDst*)dstV;
-    const TSrc* src = (const TSrc*)srcV;
-    #pragma omp parallel for
-    for(uint64_t i = 0; i < n; i++){
-        dst[i] = (TDst)src[i];
-    }
-}
-
-template <typename TSrc>
-static void* castToDtype(const std::string &dtype, const void* src, const uint64_t n){
-    const char kind = dtype.size() == 3 ? dtype[1] : '\0';
-    const char dsize = dtype.size() == 3 ? dtype[2] : '\0';
-    void* dst = NULL;
-    if(kind == 'u'){
-        if(dsize == '1'){ dst = malloc(n*sizeof(uint8_t));  castCopy<uint8_t,TSrc>(dst,src,n); }
-        else if(dsize == '2'){ dst = malloc(n*sizeof(uint16_t)); castCopy<uint16_t,TSrc>(dst,src,n); }
-        else if(dsize == '4'){ dst = malloc(n*sizeof(uint32_t)); castCopy<uint32_t,TSrc>(dst,src,n); }
-        else if(dsize == '8'){ dst = malloc(n*sizeof(uint64_t)); castCopy<uint64_t,TSrc>(dst,src,n); }
-    }
-    else if(kind == 'i'){
-        if(dsize == '1'){ dst = malloc(n*sizeof(int8_t));  castCopy<int8_t,TSrc>(dst,src,n); }
-        else if(dsize == '2'){ dst = malloc(n*sizeof(int16_t)); castCopy<int16_t,TSrc>(dst,src,n); }
-        else if(dsize == '4'){ dst = malloc(n*sizeof(int32_t)); castCopy<int32_t,TSrc>(dst,src,n); }
-        else if(dsize == '8'){ dst = malloc(n*sizeof(int64_t)); castCopy<int64_t,TSrc>(dst,src,n); }
-    }
-    else if(kind == 'f'){
-        if(dsize == '4'){ dst = malloc(n*sizeof(float));  castCopy<float,TSrc>(dst,src,n); }
-        else if(dsize == '8'){ dst = malloc(n*sizeof(double)); castCopy<double,TSrc>(dst,src,n); }
-    }
-    return dst;
-}
-
-// Convert a MATLAB array's data to the given zarr dtype. Returns a malloc'd
-// buffer the caller frees, or NULL if either side is unsupported.
-static void* convertMxToDtype(const std::string &dtype, const mxArray* arr, const uint64_t n){
-    switch(mxGetClassID(arr)){
-        case mxUINT8_CLASS:  return castToDtype<uint8_t>(dtype, mxGetData(arr), n);
-        case mxINT8_CLASS:   return castToDtype<int8_t>(dtype, mxGetData(arr), n);
-        case mxUINT16_CLASS: return castToDtype<uint16_t>(dtype, mxGetData(arr), n);
-        case mxINT16_CLASS:  return castToDtype<int16_t>(dtype, mxGetData(arr), n);
-        case mxUINT32_CLASS: return castToDtype<uint32_t>(dtype, mxGetData(arr), n);
-        case mxINT32_CLASS:  return castToDtype<int32_t>(dtype, mxGetData(arr), n);
-        case mxUINT64_CLASS: return castToDtype<uint64_t>(dtype, mxGetData(arr), n);
-        case mxINT64_CLASS:  return castToDtype<int64_t>(dtype, mxGetData(arr), n);
-        case mxSINGLE_CLASS: return castToDtype<float>(dtype, mxGetData(arr), n);
-        case mxDOUBLE_CLASS: return castToDtype<double>(dtype, mxGetData(arr), n);
-        default: return NULL;
-    }
-}
-
 // TODO: FIX MEMORY LEAKS
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
@@ -92,6 +38,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // Applied after the Zarr format, which sets their Zarr v3 defaults
     uint64_t zarrFormat = 0;
     std::string order, dimension_separator;
+    // The data type of a new array (by default the data's)
+    std::string dtypeOption;
 
     // Input data dimensions (MATLAB arrays have at least 2)
     const uint64_t nDataDims = (uint64_t)mxGetNumberOfDimensions(prhs[1]);
@@ -174,9 +122,12 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(currInput == "zarr_format"){
             zarrFormat = mexZarrFormat(prhs[i+1]);
         }
+        else if(currInput == "dtype"){
+            dtypeOption = mexDtype(prhs[i+1]);
+        }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: uuid, bbox, cname, clevel, subfolders, chunks, chunk_shape, sparse, dimension_separator, order, zarr_format\n",currInput.c_str());
+            Currently Supported Names: uuid, bbox, cname, clevel, subfolders, chunks, chunk_shape, sparse, dimension_separator, order, zarr_format, dtype\n",currInput.c_str());
         }
     }
 
@@ -239,20 +190,12 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     void* zarrC = NULL;
 
-    mxClassID mDType = mxGetClassID(prhs[1]);
-    switch(mDType){
-        case mxUINT8_CLASS:  Zarr.set_dtype("<u1"); break;
-        case mxINT8_CLASS:   Zarr.set_dtype("<i1"); break;
-        case mxUINT16_CLASS: Zarr.set_dtype("<u2"); break;
-        case mxINT16_CLASS:  Zarr.set_dtype("<i2"); break;
-        case mxUINT32_CLASS: Zarr.set_dtype("<u4"); break;
-        case mxINT32_CLASS:  Zarr.set_dtype("<i4"); break;
-        case mxUINT64_CLASS: Zarr.set_dtype("<u8"); break;
-        case mxINT64_CLASS:  Zarr.set_dtype("<i8"); break;
-        case mxSINGLE_CLASS: Zarr.set_dtype("<f4"); break;
-        case mxDOUBLE_CLASS: Zarr.set_dtype("<f8"); break;
-        default: mexErrMsgIdAndTxt("zarr:dataTypeError","The input data type is not supported");
-    }
+    // The data's own type (logical is bool, complex single and double are complex64
+    // and complex128), which a new array gets unless the dtype option says otherwise
+    const std::string dataDtype = mexClassDtype(prhs[1]);
+    if(dataDtype.empty()) mexErrMsgIdAndTxt("zarr:dataTypeError","The input data type is not supported");
+    const bool cropExisting = crop && metadataExists;
+    if(!cropExisting) Zarr.set_dtype(dtypeOption.empty() ? dataDtype : dtypeOption);
 
     if(!crop){
         Zarr.set_shape(iDims);
@@ -293,7 +236,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
             }
         }
 
-        const std::string dtypeT(Zarr.get_dtype());
         try{
             Zarr = zarr(folderName);
         }
@@ -307,15 +249,34 @@ void mexFunction(int nlhs, mxArray *plhs[],
             else mexZarrError(e);
         }
         
-        // (the byte order mark of 1-byte types, "<" or "|", does not matter)
-        const std::string &dtypeF = Zarr.get_dtype();
-        const bool sameType = dtypeT == dtypeF || (dtypeT.size() == 3 && dtypeF.size() == 3 &&
-                              dtypeT[2] == '1' && dtypeT.substr(1) == dtypeF.substr(1));
-        if(!sameType){
+        // (the dtype option names the type of a new array: an existing one keeps its own)
+        if(cropExisting && !dtypeOption.empty()){
+            const DtypeInfo want = dtypeInfo(dtypeOption), have = dtypeInfo(Zarr.get_dtype());
+            if(want.kind != have.kind || want.bytes != have.bytes || want.bfloat16 != have.bfloat16){
+                mexErrMsgIdAndTxt("zarr:dataTypeError","%s has data type \"%s\", not \"%s\" (dtype is the data type of a new array)",
+                                  folderName.c_str(),Zarr.get_dtype().c_str(),dtypeOption.c_str());
+            }
+        }
+    }
+
+    // The data in the array's data type: converted as MATLAB converts between classes
+    // (integers rounded and saturated) when the types differ, and complex data with
+    // its real and imaginary parts interleaved, as Zarr stores them
+    {
+        const DtypeInfo out = dtypeInfo(Zarr.get_dtype()), in = dtypeInfo(dataDtype);
+        if(in.kind == 'c' && out.kind != 'c'){
+            mexErrMsgIdAndTxt("zarr:dataTypeError","Complex data can only be written into complex64 or complex128 arrays, not \"%s\"",
+                              Zarr.get_dtype().c_str());
+        }
+        bool convert = out.kind != in.kind || out.bytes != in.bytes || out.bfloat16 != in.bfloat16;
+#if !(MX_HAS_INTERLEAVED_COMPLEX)
+        convert = convert || in.kind == 'c';
+#endif
+        if(convert && out.kind){
             uint64_t size = 1;
-            for(uint64_t d = 0; d < nDims; d++) size *= endCoords[d]-startCoords[d];
-            zarrC = convertMxToDtype(Zarr.get_dtype(), prhs[1], size);
-            if(!zarrC) mexErrMsgIdAndTxt("zarr:dataTypeError","Cannot convert the input data to the existing file's data type \"%s\"",Zarr.get_dtype().c_str());
+            for(uint64_t d = 0; d < nDims; d++) size *= iDims[d];
+            zarrC = mexConvertToDtype(prhs[1], Zarr.get_dtype(), size);
+            if(!zarrC) mexErrMsgIdAndTxt("zarr:dataTypeError","Cannot convert the input data to the data type \"%s\"",Zarr.get_dtype().c_str());
         }
     }
 
@@ -333,12 +294,10 @@ void mexFunction(int nlhs, mxArray *plhs[],
     Zarr.set_chunkInfo(startCoords, endCoords);
     bool err = 0;
     // The write machinery is element-width based, so one generic path covers
-    // every supported dtype: signed/unsigned 8/16/32/64-bit ints, 32/64-bit floats.
+    // every supported dtype
     const std::string &dtypeOut = Zarr.get_dtype();
     const uint64_t outBytes = Zarr.dtypeBytes();
-    const char outKind = dtypeOut.size() == 3 ? dtypeOut[1] : '\0';
-    if(!outBytes || (outKind != 'u' && outKind != 'i' && outKind != 'f') ||
-       (outKind == 'f' && outBytes < 4)){
+    if(!dtypeInfo(dtypeOut).kind){
         free(zarrC);
         mexErrMsgIdAndTxt("zarr:dataTypeError","Data type \"%s\" is not supported",dtypeOut.c_str());
     }
