@@ -1,5 +1,5 @@
 // GPU kernels of cpp-zarr's GPU reads (gpureadzarr.cpp), compiled to PTX by
-// tools/gen_gpu_ptx.py into kernels_ptx.h; the CUDA driver compiles that PTX for the GPU it
+// gen_kernels_ptx.py into kernels_ptx.h; the CUDA driver compiles that PTX for the GPU it
 // runs on. Plain C kernels, no includes, so that NVRTC compiles them as they are.
 
 // Each block of decoded chunk data (a blosc block, or a whole chunk) is n elements of ts bytes
