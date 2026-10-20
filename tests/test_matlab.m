@@ -435,7 +435,102 @@ function test_matlab(mexDir)
         fprintf('SKIP  test arrays not found (make them with tests/make_test_arrays.py)\n');
     end
 
+    % GPU reads (parallelReadZarrGPU): what parallelReadZarr reads, as gpuArrays
+    checkGpuReads(tmp);
+
     disp('MATLAB round-trip tests PASSED');
+end
+
+function checkGpuReads(tmp)
+% parallelReadZarrGPU against parallelReadZarr: every class, compressors decompressed on the GPU
+% and on the host, v2, v3 and sharded arrays, missing chunks (fill value 7), regions that cut
+% chunks, float16 and bfloat16 as single. Skipped when the mex file was not built or MATLAB has
+% no GPU.
+    if exist('parallelReadZarrGPU', 'file') ~= 3
+        fprintf('SKIP  GPU reads (parallelReadZarrGPU was not built)\n');
+        return;
+    end
+    try
+        hasGpu = gpuDeviceCount > 0;
+    catch
+        hasGpu = false;
+    end
+    if ~hasGpu
+        fprintf('SKIP  GPU reads (no GPU MATLAB can use)\n');
+        return;
+    end
+    sz = [70 45 33];
+    specs = {{'uint8', ''}, {'int8', ''}, {'uint16', ''}, {'int16', ''}, {'uint32', ''}, {'int32', ''}, ...
+             {'uint64', ''}, {'int64', ''}, {'single', ''}, {'double', ''}, {'logical', ''}, ...
+             {'single', 'float16'}, {'single', 'bfloat16'}, {'csingle', ''}, {'cdouble', ''}};
+    cnames = {'zstd', 'lz4', 'blosclz', 'gzip'};
+    bboxes = {[], [5 7 3 61 40 29], [17 17 9 18 30 10]};
+    n = 0;
+    for k = 1:numel(specs)
+        [cls, dt] = specs{k}{:};
+        if strcmp(cls, 'logical')
+            data = rand(sz) > 0.5;
+        elseif cls(1) == 'c'
+            cls = cls(2:end);
+            data = complex(cast((rand(sz) - 0.5) * 1000, cls), cast((rand(sz) - 0.5) * 1000, cls));
+        elseif ~isempty(dt)
+            data = single(randi([-100 100], sz));   % (values float16 and bfloat16 hold)
+        else
+            data = cast(randi([0 100], sz), cls);
+        end
+        for c = 1:numel(cnames)
+            for layout = 1:3
+                f = fullfile(tmp, sprintf('gpu_%d_%s_%d.zarr', k, cnames{c}, layout));
+                args = {'cname', cnames{c}, 'chunks', [16 16 8]};
+                if ~isempty(dt)
+                    args = [args, {'dtype', dt}]; %#ok<AGROW>
+                end
+                if layout == 2
+                    args = [args, {'zarr_format', 3}]; %#ok<AGROW>
+                elseif layout == 3
+                    args = {'cname', cnames{c}, 'zarr_format', 3, 'chunks', [32 32 16], 'chunk_shape', [16 16 8]};
+                    if ~isempty(dt)
+                        args = [args, {'dtype', dt}]; %#ok<AGROW>
+                    end
+                end
+                parallelWriteZarr(f, data, args{:});
+                if c == 1 && layout == 1 && strcmp(class(data), 'uint16')
+                    % missing chunks read as the fill value
+                    txt = regexprep(fileread(fullfile(f, '.zarray')), '"fill_value":\s*[^,}]+', '"fill_value": 7');
+                    fid = fopen(fullfile(f, '.zarray'), 'w');
+                    fwrite(fid, txt);
+                    fclose(fid);
+                    chunks = dir(fullfile(f, '*.*.*'));
+                    for j = 1:4:numel(chunks)
+                        delete(fullfile(chunks(j).folder, chunks(j).name));
+                    end
+                end
+                for b = 1:numel(bboxes)
+                    if isempty(bboxes{b})
+                        want = parallelReadZarr(f);
+                        got = parallelReadZarrGPU(f);
+                    else
+                        want = parallelReadZarr(f, 'bbox', bboxes{b});
+                        got = parallelReadZarrGPU(f, 'bbox', bboxes{b});
+                    end
+                    n = n + 1;
+                    assert(isa(got, 'gpuArray') && strcmp(classUnderlying(got), class(want)) && isreal(got) == isreal(want) ...
+                           && isequal(size(got), size(want)) && isequaln(gather(got), want), ...
+                           'GPU read of %s (bbox %d) differs from the CPU read', f, b);
+                end
+            end
+        end
+    end
+    % refused: a region outside the array
+    f = fullfile(tmp, 'gpu_1_zstd_1.zarr');
+    try
+        parallelReadZarrGPU(f, 'bbox', [1 1 1 71 45 33]);
+        refused = false;
+    catch
+        refused = true;
+    end
+    assert(refused, 'a GPU read outside the array was not refused');
+    fprintf('PASS  GPU reads (%d)\n', n);
 end
 
 function checkTestArrays(v3dir, tmp)

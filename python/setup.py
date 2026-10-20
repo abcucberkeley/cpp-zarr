@@ -37,7 +37,9 @@ class BuildExt(build_ext):
             "cmake",
             cmake_source_dir,
             "-B", cmake_build_dir,
-            f"-DCMAKE_INSTALL_PREFIX={install_dir}"
+            f"-DCMAKE_INSTALL_PREFIX={install_dir}",
+            # (the library's C++ runtime kept private, as the module's is: see CMakeLists.txt)
+            "-DCPPZARR_PRIVATE_RUNTIME=ON",
         ]
 
         # Configure and build CMake project
@@ -59,7 +61,8 @@ ext_modules = [
         library_dirs=['build/install/lib64','build/install/lib'],
         libraries=['cppZarr'],
         sources=["cppzarr.cpp"],
-        extra_link_args=['-static-libstdc++']
+        # (the static C++ runtime kept private, as in the library: see CMakeLists.txt)
+        extra_link_args=['-static-libstdc++'] + (['-Wl,--exclude-libs,ALL'] if system == "Linux" else [])
     ),
 ]
 
@@ -76,6 +79,8 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": build_ext},
     install_requires=['numpy>=1.20'],
+    # (reads into GPU memory: nvCOMP, which the library loads when it first reads on a GPU)
+    extras_require={'gpu': ['nvidia-libnvcomp-cu12; platform_system != "Darwin"']},
     package_dir={'cpp-zarr': 'cpp-zarr'},
     package_data={"": shared_libraries} if system!="Linux" else {},
     include_package_data=True,

@@ -4,7 +4,8 @@ import numpy as np
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
-from .cppzarr import pybind11_convert_to_v3, pybind11_default_threads, pybind11_read_zarr, pybind11_write_zarr
+from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11_gpu_available, pybind11_gpu_set_nvcomp,
+                      pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_region_info, pybind11_write_zarr)
 
 
 def _default_chunks(ndim):
@@ -33,7 +34,8 @@ def _threads(num_threads):
     return int(num_threads)
 
 
-def read_zarr(file_name, start_coords=None, end_coords=None, order=None, num_threads=None, out=None):
+def read_zarr(file_name, start_coords=None, end_coords=None, order=None, num_threads=None, out=None, stream=None,
+              gpu=False):
     # order is the memory layout of the returned array: 'F' (first axis
     # contiguous), 'C' (last axis contiguous), or None (the default) for the
     # file's own storage order, like zarr-python (or out's).
@@ -41,11 +43,26 @@ def read_zarr(file_name, start_coords=None, end_coords=None, order=None, num_thr
     # CPU the process may run on). The GIL is released while reading, so reads from
     # several Python threads run at once: give each a share of the CPUs.
     # out: a NumPy array to read into instead of a new one (of the region's shape and
-    # the array's data type, writeable and C- or F-contiguous); it is returned.
-    if not (os.path.isfile(os.path.join(file_name, '.zarray')) or os.path.isfile(os.path.join(file_name, 'zarr.json'))):
-        raise Exception(f'{file_name} does not exist. No .zarray or zarr.json metadata file was found')
+    # the array's data type, writeable and C- or F-contiguous); it is returned. Or GPU
+    # memory: a CuPy array, a PyTorch tensor on a CUDA device, or another array with
+    # __cuda_array_interface__ (C- or F-contiguous): the chunks are then decompressed on
+    # the GPU (see read_zarr_batch), with the GPU work on stream (a PyTorch or CuPy stream,
+    # or a CUDA stream handle; by default the default stream), done when this returns.
+    # gpu=True reads into a new CuPy array on the current CUDA device instead of a NumPy array
+    # (needs CuPy; CuPy has no bfloat16: read bfloat16 arrays into a PyTorch tensor with out=).
     if order not in (None, 'F', 'C'):
         raise Exception(f"order must be 'F', 'C' or None, not {order!r}")
+    if gpu and out is None:
+        out = _new_gpu_arrays([(file_name, start_coords, end_coords)], order)[0]
+    if out is not None and _cuda_array(out) is not None:
+        # (a missing array is reported when its metadata is read)
+        _read_gpu([(file_name, start_coords, end_coords, out)], order, num_threads, stream)
+        return out
+    if gpu:
+        raise Exception('gpu=True reads into GPU memory: out must be GPU memory too (a CuPy array, or a PyTorch tensor on a '
+                        'CUDA device), or None for a new CuPy array')
+    if not (os.path.isfile(os.path.join(file_name, '.zarray')) or os.path.isfile(os.path.join(file_name, 'zarr.json'))):
+        raise Exception(f'{file_name} does not exist. No .zarray or zarr.json metadata file was found')
     # All-zero coordinates mean the whole array, for any number of dimensions
     if start_coords is None:
         start_coords = [0, 0, 0]
@@ -61,6 +78,142 @@ def _cpus():
         return len(os.sched_getaffinity(0))
     except AttributeError:
         return os.cpu_count() or 1
+
+
+# ---- GPU reads
+# The data types of PyTorch tensors, as cpp-zarr names them (its unsigned types beyond uint8 are
+# newer than some versions)
+_TORCH_TYPES = {'uint8': '|u1', 'int8': '|i1', 'int16': '<i2', 'int32': '<i4', 'int64': '<i8', 'uint16': '<u2',
+                'uint32': '<u4', 'uint64': '<u8', 'float16': '<f2', 'bfloat16': 'bfloat16', 'float32': '<f4',
+                'float64': '<f8', 'complex64': '<c8', 'complex128': '<c16', 'bool': '|b1'}
+
+
+def _contiguous(shape, strides):
+    # (C-contiguous, F-contiguous) for element strides
+    def ok(axes):
+        expect = 1
+        for d in axes:
+            if shape[d] != 1 and strides[d] != expect:
+                return False
+            expect *= shape[d]
+        return True
+    n = len(shape)
+    return ok(range(n - 1, -1, -1)), ok(range(n))
+
+
+def _cuda_array(a):
+    # (device pointer, data type, shape, C-contiguous, F-contiguous) of GPU memory a (a PyTorch
+    # tensor on a CUDA device, or anything with __cuda_array_interface__, such as a CuPy
+    # array), or None when a is not GPU memory
+    if type(a).__module__.split('.')[0] == 'torch' and getattr(a, 'is_cuda', False):
+        name = str(a.dtype).replace('torch.', '')
+        if name not in _TORCH_TYPES:
+            raise Exception(f'out has the data type {a.dtype}, which cpp-zarr does not read')
+        shape = tuple(int(v) for v in a.shape)
+        c, f = _contiguous(shape, tuple(a.stride()))
+        return int(a.data_ptr()), _TORCH_TYPES[name], shape, c, f
+    cai = getattr(a, '__cuda_array_interface__', None)
+    if cai is None:
+        return None
+    shape = tuple(int(v) for v in cai['shape'])
+    typestr = cai['typestr']
+    itemsize = np.dtype(typestr).itemsize if typestr[1] != 'V' else int(typestr[2:])
+    strides = cai.get('strides')
+    if strides is None:
+        c, f = True, len([v for v in shape if v != 1]) <= 1
+    else:
+        if any(st % itemsize for st in strides):
+            raise Exception('out must be C- or F-contiguous')
+        c, f = _contiguous(shape, tuple(st // itemsize for st in strides))
+    if typestr[1] in 'iufcb':
+        typestr = np.dtype(typestr).str if np.dtype(typestr).itemsize > 1 else '|' + typestr[1:]
+    if cai.get('readonly', False) or (len(cai['data']) > 1 and cai['data'][1]):
+        raise Exception('out must be writeable')
+    return int(cai['data'][0]), typestr, shape, c, f
+
+
+def _stream_handle(stream):
+    # A CUDA stream's handle: of a PyTorch stream (cuda_stream), a CuPy stream (ptr), or an int
+    if stream is None:
+        return 0
+    for attr in ('cuda_stream', 'ptr'):
+        if hasattr(stream, attr):
+            return int(getattr(stream, attr))
+    if isinstance(stream, int):
+        return stream
+    raise Exception(f'stream must be a PyTorch or CuPy stream, or a CUDA stream handle, not {stream!r}')
+
+
+_nvcomp_looked = False
+
+
+def _find_nvcomp():
+    # nvCOMP from its pip package (nvidia-libnvcomp-cu12, or the older nvidia-nvcomp-cu12/cu13
+    # layout), for the library to load; CPPZARR_NVCOMP_LIBRARY, when set, comes first
+    global _nvcomp_looked
+    if _nvcomp_looked:
+        return
+    _nvcomp_looked = True
+    if os.environ.get('CPPZARR_NVCOMP_LIBRARY'):
+        return
+    import glob, importlib
+    for mod, subs in (('nvidia.libnvcomp', ('lib64', 'lib', 'bin')), ('nvidia.nvcomp', ('', 'lib64', 'lib', 'bin'))):
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        for base in getattr(m, '__path__', []):
+            for sub in subs:
+                found = sorted(f for pat in ('libnvcomp.so*', 'nvcomp*.dll') for f in glob.glob(os.path.join(base, sub, pat))
+                               if 'cpu' not in os.path.basename(f))
+                if found:
+                    pybind11_gpu_set_nvcomp(found[-1])
+                    return
+
+
+def gpu_available():
+    """(True, '') when reads into GPU memory can run here; (False, why) when not (no NVIDIA
+    driver, no nvCOMP: pip install nvidia-libnvcomp-cu12)"""
+    _find_nvcomp()
+    return pybind11_gpu_available()
+
+
+def _new_gpu_arrays(requests, order):
+    # New CuPy arrays on the current CUDA device for (file_name, start_coords, end_coords)
+    # requests: of each region's shape and its array's data type, in order (by default the
+    # array's storage order), as read_zarr makes NumPy arrays
+    try:
+        import cupy
+    except ImportError:
+        raise Exception('gpu=True makes CuPy arrays, and CuPy is not installed (pip install cupy-cuda12x); or pass GPU '
+                        'memory to read into as out= (a PyTorch tensor on a CUDA device, for one)')
+    coords = lambda c: [int(v) for v in c] if c is not None else [0, 0, 0]
+    info = pybind11_region_info([(f, coords(s), coords(e)) for f, s, e in requests])
+    outs = []
+    for (file_name, _, _), (shape, dtype, storage) in zip(requests, info):
+        if dtype == 'bfloat16':
+            raise Exception(f'{file_name} is a bfloat16 array, and CuPy has no bfloat16 type: read it into a PyTorch '
+                            'bfloat16 tensor on a CUDA device with out= instead')
+        outs.append(cupy.empty(tuple(shape), dtype=dtype, order=order or storage))
+    return outs
+
+
+def _read_gpu(requests, order, num_threads, stream):
+    # requests: (file_name, start_coords, end_coords, out) with out GPU memory: one GPU batch for
+    # each order the outputs have (C or F)
+    _find_nvcomp()
+    groups = {}
+    for file_name, start, end, out in requests:
+        ptr, typestr, shape, c, f = _cuda_array(out)
+        if order == 'C' and not c or order == 'F' and not f:
+            raise Exception(f"out must be {order}-contiguous for order '{order}'")
+        if order is None and not (c or f):
+            raise Exception('out must be C- or F-contiguous')
+        o = order or ('C' if c else 'F')
+        groups.setdefault(o, []).append((file_name, [int(v) for v in (start if start is not None else [0, 0, 0])],
+                                         [int(v) for v in (end if end is not None else [0, 0, 0])], ptr, typestr, list(shape)))
+    for o, reqs in groups.items():
+        pybind11_read_zarr_gpu(reqs, o, _threads(num_threads), _stream_handle(stream))
 
 
 # The threads that run batches of reads, one pool per number of threads each read uses:
@@ -106,7 +259,7 @@ def _region_elements(file_name, start_coords, end_coords):
     return 0
 
 
-def read_zarr_batch(requests, order=None, num_threads=None):
+def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=False):
     # Read many regions at once, as reading them one after another with read_zarr does,
     # but with the reads overlapping (the GIL is released while reading): the way to
     # read a batch of regions, from one array or many, when each is small or the
@@ -118,11 +271,31 @@ def read_zarr_batch(requests, order=None, num_threads=None):
     # OMP_NUM_THREADS, or every CPU this process may run on). Each read gets a thread per
     # 8M elements it reads (at least one, at most all of them), and as many reads as the
     # threads allow run at once.
+    # Into GPU memory (every out a CuPy array, a PyTorch tensor on a CUDA device, or an array
+    # with __cuda_array_interface__, all on one GPU): the chunks' stored bytes are read on the
+    # host (the files with at least 32 threads at once, since reading mostly waits on the
+    # storage; num_threads threads prepare them) and decompressed on the GPU (nvCOMP: pip install
+    # nvidia-libnvcomp-cu12), all of the batch's at once, with the GPU work on stream (a
+    # PyTorch or CuPy stream, or a CUDA stream handle; by default the default stream), done
+    # when this returns. Bigger batches use the GPU better. gpu=True reads the requests without
+    # an out into new CuPy arrays on the current CUDA device (see read_zarr).
     requests = [tuple(r) + (None,) * (4 - len(r)) for r in requests]
     if any(len(r) != 4 for r in requests):
         raise Exception('Each request is (file_name, start_coords, end_coords) or (file_name, start_coords, end_coords, out)')
     if not requests:
         return []
+    if gpu:
+        new = [i for i, r in enumerate(requests) if r[3] is None]
+        for i, a in zip(new, _new_gpu_arrays([requests[i][:3] for i in new], order) if new else []):
+            requests[i] = requests[i][:3] + (a,)
+    on_gpu = [r[3] is not None and _cuda_array(r[3]) is not None for r in requests]
+    if gpu or any(on_gpu):
+        if not all(on_gpu):
+            raise Exception('A batch reads into GPU memory or into host memory, not both: give every request a GPU out '
+                            '(or none, with gpu=True)')
+        # (a missing array is reported when its metadata is read, the batch's arrays' at once)
+        _read_gpu(requests, order, num_threads, stream)
+        return [r[3] for r in requests]
     total = _threads(num_threads) or pybind11_default_threads()
     sizes = sorted(_region_elements(r[0], r[1], r[2]) for r in requests)
     per_read = min(total, max(1, round(sizes[len(sizes) // 2] / _ELEMENTS_PER_THREAD)))

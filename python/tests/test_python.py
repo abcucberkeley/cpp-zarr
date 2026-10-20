@@ -17,6 +17,7 @@ bundles its native library. Exits non-zero on any failure.
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -553,9 +554,197 @@ def main():
     print(f"batches of reads, and the GIL released while reading  {'OK' if good else 'FAIL'}")
     ok = ok and good
 
+    # Reading into GPU memory (with an NVIDIA GPU, nvCOMP, and CuPy or PyTorch): the same
+    # values as reading into host memory, for every data type and codec, sharded or not,
+    # regions that cut chunks, missing chunks, both orders, CuPy arrays and PyTorch tensors,
+    # batches of several arrays; and the outputs refused
+    gpu_ok, why = cppzarr.gpu_available()
+    libs = []
+    if gpu_ok:
+        try:
+            import cupy
+            libs.append('cupy')
+        except Exception:
+            pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                libs.append('torch')
+        except Exception:
+            pass
+    if not gpu_ok or not libs:
+        print(f"reading into GPU memory  skipped ({why or 'no CuPy or PyTorch'})")
+    else:
+        ok = ok and test_gpu(tmp, rng, libs)
+
     if not ok:
         sys.exit("cppzarr Python round-trip test FAILED")
     print("cppzarr Python round-trip tests PASSED")
+
+
+def test_gpu(tmp, rng, libs):
+    """GPU reads against host reads (see main)"""
+    import cupy
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
+    def gpu_empty(lib, shape, dt, order):
+        if lib == 'cupy':
+            return cupy.empty(shape, dtype=dt, order=order)
+        tdt = getattr(torch, 'bfloat16' if is_bfloat16(dt) else np.dtype(dt).name)
+        if order == 'C':
+            return torch.empty(shape, dtype=tdt, device='cuda')
+        return torch.empty(shape[::-1], dtype=tdt, device='cuda').permute(*range(len(shape) - 1, -1, -1))
+
+    def host_bytes(lib, a):
+        # the output's bytes in its own order, to compare as they are (NaNs too)
+        if lib == 'cupy':
+            h = a.get(order='A')
+        else:
+            t = a.cpu()
+            if t.dtype == torch.bfloat16:
+                t = t.view(torch.int16)
+            h = t.numpy()
+        return np.asarray(h).tobytes(order='A')
+
+    good = True
+    dtypes = [np.uint8, np.int16, np.uint16, np.int32, np.uint32, np.int64, np.float16, np.float32, np.float64,
+              np.complex64, np.complex128, np.bool_]
+    if ml_dtypes is not None:
+        dtypes.append(ml_dtypes.bfloat16)
+    codecs = [('zstd', 1), ('lz4', 5), ('blosclz', 5), ('gzip', 5), ('none', 0)]
+    shape = (70, 45, 33)
+    arrays = []
+    for dt in dtypes:
+        d = values_like(rng, np.zeros(shape, dt))
+        for cname, clevel in codecs:
+            for zf, shards in [(2, None), (3, None), (3, [32, 32, 16])]:
+                p = os.path.join(tmp, f"gpu_{np.dtype(dt).name}_{cname}_{zf}_{bool(shards)}.zarr")
+                cppzarr.write_zarr(p, d, chunks=[16, 16, 8], cname=cname, clevel=clevel, zarr_format=zf, shards=shards)
+                arrays.append((p, dt))
+    # some chunks (or shards) missing
+    for p, dt in arrays[::7]:
+        files = sorted(os.path.join(r, f) for r, _, fs in os.walk(p) for f in fs if f not in ('zarr.json', '.zarray', '.zattrs'))
+        for f in files[::4]:
+            os.remove(f)
+    regions = [([0, 0, 0], list(shape)), ([5, 7, 3], [61, 40, 29]), ([17, 17, 9], [18, 30, 10])]
+    tried = 0
+    for p, dt in arrays:
+        for s, e in regions:
+            for order in 'CF':
+                ref = cppzarr.read_zarr(p, s, e, order=order)
+                want = ref.tobytes(order='A')
+                for lib in libs:
+                    if lib == 'cupy' and is_bfloat16(dt):
+                        continue      # (CuPy has no bfloat16)
+                    out = gpu_empty(lib, [b - a for a, b in zip(s, e)], dt, order)
+                    try:
+                        got = cppzarr.read_zarr(p, s, e, out=out)
+                    except Exception as ex:
+                        # (a failed GPU read can leave the GPU unusable for the reads after it)
+                        print('  GPU read failed:', lib, p, s, e, order, ex)
+                        return False
+                    tried += 1
+                    if got is not out or host_bytes(lib, out) != want:
+                        good = False
+                        print('  GPU read differs:', lib, p, s, e, order)
+                # a new CuPy array (gpu=True) in order; CuPy has no bfloat16
+                try:
+                    got = cppzarr.read_zarr(p, s, e, order=order, gpu=True)
+                except Exception as ex:
+                    if not (is_bfloat16(dt) and 'bfloat16' in str(ex)):
+                        good = False
+                        print('  gpu=True read failed:', p, s, e, order, ex)
+                    continue
+                tried += 1
+                laid_out = got.flags.c_contiguous if order == 'C' else got.flags.f_contiguous
+                if (is_bfloat16(dt) or not isinstance(got, cupy.ndarray) or got.dtype != ref.dtype or got.shape != ref.shape
+                        or not laid_out or host_bytes('cupy', got) != want):
+                    good = False
+                    print('  gpu=True read differs:', p, s, e, order)
+    # whole arrays into new CuPy arrays in their storage order, as read_zarr's NumPy arrays; and
+    # a batch of new ones
+    for p, dt in arrays[:60]:
+        if is_bfloat16(dt):
+            continue
+        ref, got = cppzarr.read_zarr(p), cppzarr.read_zarr(p, gpu=True)
+        tried += 1
+        if (got.dtype != ref.dtype or got.shape != ref.shape or got.flags.c_contiguous != ref.flags.c_contiguous
+                or got.flags.f_contiguous != ref.flags.f_contiguous or host_bytes('cupy', got) != ref.tobytes(order='A')):
+            good = False
+            print('  gpu=True whole-array read differs:', p)
+    batch = [(p, [5, 7, 3], [61, 40, 29]) for p, dt in arrays[60:100] if not is_bfloat16(dt)]
+    got = cppzarr.read_zarr_batch(batch, gpu=True, num_threads=4)
+    good = good and all(isinstance(g, cupy.ndarray) and host_bytes('cupy', g) == cppzarr.read_zarr(p, s, e).tobytes(order='A')
+                        for g, (p, s, e) in zip(got, batch))
+    # a batch from several arrays (different data types and codecs) into one CuPy buffer each
+    batch = [(p, [5, 7, 3], [61, 40, 29]) for p, dt in arrays[:40] if not is_bfloat16(dt)]
+    outs = [cupy.empty((56, 33, 26), dtype=cppzarr.read_zarr(p, [0, 0, 0], [1, 1, 1]).dtype) for p, _, _ in batch]
+    got = cppzarr.read_zarr_batch([r + (o,) for r, o in zip(batch, outs)], num_threads=4)
+    good = good and all(g is o for g, o in zip(got, outs)) and all(
+        np.array_equal(o.get(), cppzarr.read_zarr(p, s, e, order='C')) for o, (p, s, e) in zip(outs, batch))
+    if torch is not None and 'torch' in libs:
+        st = torch.cuda.Stream()
+        o = torch.empty((56, 33, 26), dtype=torch.uint16, device='cuda')
+        p = [q for q, dt in arrays if dt == np.uint16][0]
+        cppzarr.read_zarr(p, [5, 7, 3], [61, 40, 29], out=o, stream=st)
+        good = good and np.array_equal(o.cpu().numpy(), cppzarr.read_zarr(p, [5, 7, 3], [61, 40, 29], order='C'))
+    # outputs from allocators whose memory belongs to no CUDA context (stream-ordered pools, CUDA's
+    # virtual memory API): CuPy's async pool, and PyTorch's expandable segments and cudaMallocAsync
+    # backend, each in a process of its own (PyTorch takes its allocator setting at its first
+    # allocation)
+    p = [q for q, dt in arrays if dt == np.uint16][0]
+    want = cppzarr.read_zarr(p, [5, 7, 3], [61, 40, 29], order='C')
+    try:
+        pool = cupy.cuda.MemoryAsyncPool()
+    except Exception:
+        pool = None     # (no stream-ordered pools on this GPU or CUDA)
+    if pool is not None:
+        with cupy.cuda.using_allocator(pool.malloc):
+            o = cupy.empty(want.shape, want.dtype)
+        cppzarr.read_zarr(p, [5, 7, 3], [61, 40, 29], out=o)
+        tried += 1
+        if not np.array_equal(o.get(), want):
+            good = False
+            print('  GPU read into memory from a CuPy async pool differs')
+    if torch is not None and 'torch' in libs:
+        code = ("import sys, numpy as np, torch, cppzarr\n"
+                "o = torch.empty((56, 33, 26), dtype=torch.uint16, device='cuda')\n"
+                "cppzarr.read_zarr(sys.argv[1], [5, 7, 3], [61, 40, 29], out=o)\n"
+                "w = cppzarr.read_zarr(sys.argv[1], [5, 7, 3], [61, 40, 29], order='C')\n"
+                "print('SAME' if np.array_equal(o.cpu().numpy(), w) else 'DIFFERENT')\n")
+        for conf in ('expandable_segments:True', 'backend:cudaMallocAsync'):
+            r = subprocess.run([sys.executable, '-c', code, p], env=dict(os.environ, PYTORCH_CUDA_ALLOC_CONF=conf),
+                               capture_output=True, text=True)
+            tried += 1
+            if 'SAME' not in r.stdout:
+                good = False
+                print('  GPU read into PyTorch memory with', conf, 'failed:', (r.stderr.strip().splitlines() or [r.stdout])[-1])
+    # refused: another shape, another data type, a batch of GPU and host outputs, an output
+    # that is not contiguous, a batch with an array that is not there, gpu=True with a host
+    # output (alone, and in a batch)
+    p = [q for q, dt in arrays if dt == np.uint16][0]
+    for bad in (lambda: cppzarr.read_zarr(p, [0, 0, 0], [10, 10, 10], out=cupy.empty((10, 10, 9), np.uint16)),
+                lambda: cppzarr.read_zarr(p, [0, 0, 0], [10, 10, 10], out=cupy.empty((10, 10, 10), np.int16)),
+                lambda: cppzarr.read_zarr_batch([(p, [0, 0, 0], [10, 10, 10], cupy.empty((10, 10, 10), np.uint16)),
+                                                 (p, [0, 0, 0], [10, 10, 10], np.empty((10, 10, 10), np.uint16))]),
+                lambda: cppzarr.read_zarr(p, [0, 0, 0], [10, 10, 10], out=cupy.empty((10, 10, 20), np.uint16)[:, :, ::2]),
+                lambda: cppzarr.read_zarr_batch([(p, [0, 0, 0], [10, 10, 10], cupy.empty((10, 10, 10), np.uint16)),
+                                                 (os.path.join(tmp, 'missing.zarr'), [0, 0, 0], [10, 10, 10],
+                                                  cupy.empty((10, 10, 10), np.uint16))]),
+                lambda: cppzarr.read_zarr(p, [0, 0, 0], [10, 10, 10], out=np.empty((10, 10, 10), np.uint16), gpu=True),
+                lambda: cppzarr.read_zarr_batch([(p, [0, 0, 0], [10, 10, 10]),
+                                                 (p, [0, 0, 0], [10, 10, 10], np.empty((10, 10, 10), np.uint16))], gpu=True)):
+        try:
+            bad()
+            good = False
+            print('  a GPU output that should be refused was not')
+        except Exception:
+            pass
+    print(f"reading into GPU memory ({' and '.join(libs)}, {tried} reads)  {'OK' if good else 'FAIL'}")
+    return good
 
 
 if __name__ == "__main__":

@@ -137,6 +137,44 @@ arrays = cppzarr.read_zarr_batch(regions, num_threads=8)
 cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_threads=8)
 ````
 
+#### Read straight into GPU memory
+````
+import cupy
+import torch
+import cppzarr
+
+# gpu=True returns a CuPy array instead of a NumPy array: the chunks' compressed bytes are
+# read, copied to the GPU and decompressed there with nvCOMP. For data needed on the GPU anyway,
+# that is much less CPU work than decompressing on the CPU and copying the result. Needs an
+# NVIDIA GPU (Volta or newer), CuPy, and nvCOMP: pip install cpp-zarr[gpu]
+im = cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], gpu=True)
+
+# Or read into GPU memory you have (a CuPy array, a PyTorch CUDA tensor, or anything with
+# __cuda_array_interface__); bfloat16 arrays need a PyTorch tensor, since CuPy has no bfloat16
+out = cupy.empty((128, 128, 128), dtype=cupy.uint16)
+cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=out)
+
+# A batch goes to the GPU together (one decompression for all of its chunks, which is what GPUs
+# do fast), here into the slots of a batch tensor, on a stream (the default stream otherwise);
+# the call returns once the data is in place
+batch = torch.empty((8, 128, 128, 128), dtype=torch.uint16, device='cuda')
+regions = [('filename.zarr', [0, 0, 128*i], [128, 128, 128*(i+1)]) for i in range(8)]
+cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], stream=torch.cuda.current_stream())
+
+# Whether GPU reads can run here, and if not, why
+ok, why = cppzarr.gpu_available()
+````
+The GPU decompresses blosc's zstd, lz4 and zlib streams (byte shuffle or none) and Zarr's zstd and
+gzip codecs; other chunks (blosclz, bitshuffle, ...) are decompressed on the CPU in the same call.
+The values are the same as `read_zarr`'s, missing chunks the fill value. nvCOMP checks less than
+the CPU's decoders do: the reader checks each zstd stream's structure first (one that fails is
+decoded on the CPU, which reports damage), but damage inside a stream's entropy-coded data can
+make nvCOMP fail with a GPU error or never finish (the call then returns an error after
+CPPZARR_GPU_TIMEOUT seconds, 30 plus 1 per 50 MB by default). Arrays with checksums (Zarr v3's
+crc32c codec) are checked on the CPU before anything goes to the GPU. For GPU reads, num_threads
+sets the threads that prepare the chunks; the files are read with at least 32 threads at once
+(CPPZARR_GPU_READS), since reading mostly waits on the storage.
+
 #### Write a region to an existing Zarr file
 ````
 import cppzarr
@@ -175,6 +213,21 @@ cd build
 cmake ..
 make -j
 make install
+````
+
+### Reading into GPU memory
+gpureadzarr.h reads regions of arrays straight into GPU memory, decompressing on the GPU (see the
+Python section). Building needs nothing more: the library loads the NVIDIA driver and nvCOMP (5 or
+newer; set CPPZARR_NVCOMP_LIBRARY to its libnvcomp file, or put it on the library path) when it
+first reads on a GPU.
+````
+#include "gpureadzarr.h"
+zarr z("filename.zarr");
+// out: device memory for 128x128x128 uint16s (cudaMalloc, or a framework's tensor)
+std::vector<GpuRegion> regions{{&z, {0, 0, 0}, {128, 128, 128}, out}};
+std::string err;
+if(gpuReadZarr(regions, true /* C order */, stream /* or nullptr */, 0 /* threads: the default */, err))
+    printf("%s\n", err.c_str());
 ````
 
 ## MATLAB
@@ -226,6 +279,14 @@ parallelWriteZarr('path/to/file.zarr',im,'zarr_format',3);
 % New Zarr v2 files put their chunk files in nested folders (files named 0/0/0) by default. '.' names them
 % 0.0.0 in one folder, which writes much slower on network file systems.
 parallelWriteZarr('path/to/file.zarr',im,'dimension_separator','.');
+````
+
+#### parallelReadZarrGPU - Read a Zarr image into a gpuArray
+````
+% As parallelReadZarr, decompressing on the GPU (Linux; needs the Parallel Computing Toolbox, an
+% NVIDIA GPU and nvCOMP: setenv('CPPZARR_NVCOMP_LIBRARY', 'path/to/libnvcomp.so.6') before the first
+% read, or put it next to libcppZarr.so)
+im = parallelReadZarrGPU('path/to/file.zarr', 'bbox', [1 1 1 100 100 50]);
 ````
 
 #### convertZarrToV3 - Convert a Zarr v2 file to Zarr v3

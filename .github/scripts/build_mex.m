@@ -1,7 +1,8 @@
 function build_mex(installDir, outDir)
 %BUILD_MEX Compile the cpp-zarr mex files for the GitHub Actions tests.
 %   BUILD_MEX(installDir, outDir) builds parallelReadZarr, parallelWriteZarr,
-%   createZarrFile and convertZarrToV3 into outDir, linked against the cpp-zarr
+%   createZarrFile and convertZarrToV3 (and parallelReadZarrGPU, on Linux with the
+%   Parallel Computing Toolbox) into outDir, linked against the cpp-zarr
 %   library that CMake installed into installDir. The compile_*.m scripts in mexSrc build the
 %   release binaries from each Jenkins agent's own paths, so CI uses this.
     inc = fullfile(installDir, 'include');
@@ -63,5 +64,10 @@ function build_mex(installDir, outDir)
 
     for i = 1:size(mexes, 1)
         mex(args{:}, '-output', mexes{i, 2}, fullfile(src, mexes{i, 1}));
+    end
+    % parallelReadZarrGPU, on Linux where MATLAB has the Parallel Computing Toolbox's GPU MEX API
+    gpuInc = fullfile(matlabroot, 'toolbox', 'parallel', 'gpu', 'extern', 'include');
+    if isunix && ~ismac && exist(gpuInc, 'dir')
+        mex(args{:}, ['-I' gpuInc], '-lmwgpu', '-output', 'parallelReadZarrGPU', fullfile(src, 'parallelreadzarrgpumex.cpp'));
     end
 end

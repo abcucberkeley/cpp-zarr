@@ -145,9 +145,11 @@ target_include_directories(zlibstaticCPPZARR PUBLIC ${zlib_SOURCE_DIR} ${ZLIB_GE
 
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_library(cppZarr_shared SHARED ${SRC_DIR}/zarr.cpp ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/parallelreadzarr.cpp ${SRC_DIR}/parallelwritezarr.cpp)
+# (GPU reads: the CUDA driver and nvCOMP are loaded at run time, so they need nothing to build)
+add_library(cppZarr_shared SHARED ${SRC_DIR}/zarr.cpp ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/parallelreadzarr.cpp ${SRC_DIR}/parallelwritezarr.cpp
+            ${SRC_DIR}/gpureadzarr.cpp ${SRC_DIR}/gpu/cudaapi.cpp)
 set_target_properties(cppZarr_shared PROPERTIES OUTPUT_NAME cppZarr)
-set_target_properties(cppZarr_shared PROPERTIES PUBLIC_HEADER "${SRC_DIR}/zarr.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/parallelreadzarr.h;${SRC_DIR}/parallelwritezarr.h")
+set_target_properties(cppZarr_shared PROPERTIES PUBLIC_HEADER "${SRC_DIR}/zarr.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/parallelreadzarr.h;${SRC_DIR}/parallelwritezarr.h;${SRC_DIR}/gpureadzarr.h")
 
 if(UNIX)
     add_dependencies(cppZarr_shared uuid_external)
@@ -171,13 +173,25 @@ target_link_libraries(cppZarr_shared PRIVATE
     blosc_static
     zlibstaticCPPZARR
     nlohmann_json::nlohmann_json
-    -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX
+    ${CMAKE_DL_LIBS}
 )
 
 if(MINGW)
     target_link_options(cppZarr_shared PRIVATE -Wl,--allow-multiple-definition)
+endif()
+# CPPZARR_PRIVATE_RUNTIME (Linux): keep the static C++ runtime (and the other static libraries)
+# private to the library. Exported, programs that load another C++ runtime after cpp-zarr (Python
+# with PyTorch, for one) bound some of its symbols to this copy and crashed, so the Python wheel
+# turns it on. Off by default: programs built against the library's exported runtime (Parallel
+# Imaris Writer) need it. With it on, the unwinder is the shared libgcc_s every C++ program uses:
+# a private static copy could not unwind the library's exceptions through its callers' code.
+option(CPPZARR_PRIVATE_RUNTIME "Keep the library's static C++ runtime private (Linux)" OFF)
+if(UNIX AND NOT APPLE AND CPPZARR_PRIVATE_RUNTIME)
+    target_link_options(cppZarr_shared PRIVATE -Wl,--exclude-libs,ALL)
+else()
+    target_link_libraries(cppZarr_shared PRIVATE -static-libgcc)
 endif()
 
 install(TARGETS cppZarr_shared
@@ -205,4 +219,11 @@ if(CPPZARR_BUILD_TESTS)
     target_compile_definitions(roundtripTest PRIVATE CPPZARR_TEST_ARRAYS="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_arrays")
     target_link_libraries(roundtripTest PRIVATE cppZarr_shared OpenMP::OpenMP_CXX)
     add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
+    # GPU reads against the CPU reader (skipped without an NVIDIA GPU, driver and nvCOMP)
+    add_executable(gpuTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/gputest.cpp)
+    set_target_properties(gpuTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(gpuTest PRIVATE ${SRC_DIR} ${nlohmann_json_SOURCE_DIR}/include)
+    target_compile_definitions(gpuTest PRIVATE CPPZARR_TEST_ARRAYS="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_arrays")
+    target_link_libraries(gpuTest PRIVATE cppZarr_shared OpenMP::OpenMP_CXX)
+    add_test(NAME gpu COMMAND gpuTest ${CMAKE_CURRENT_BINARY_DIR})
 endif()
