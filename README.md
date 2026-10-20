@@ -30,12 +30,19 @@ Mac Intel: Support has been discontinued as of v1.5.0 (macOS 12 or newer is requ
 Windows: Windows 10 or newer is required
 
 ### Installation
+
+#### Standard
 ````
 pip install cpp-zarr
+````
 
-# With reads straight into GPU memory (Linux, NVIDIA GPUs): also installs nvCOMP, which
-# decompresses on the GPU (see "Read straight into GPU memory" below)
+#### With GPU reads
+Reading straight into GPU memory needs Linux, an NVIDIA GPU (Volta or newer) and its driver. The gpu extra also installs nvCOMP, which decompresses on the GPU and which cppzarr finds by itself (see "Read straight into GPU memory" below).
+````
 pip install "cpp-zarr[gpu]"
+
+# gpu=True returns CuPy arrays, so it also needs CuPy (reading into PyTorch tensors does not)
+pip install cupy-cuda12x
 ````
 
 ### Usage
