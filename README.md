@@ -32,6 +32,10 @@ Windows: Windows 10 or newer is required
 ### Installation
 ````
 pip install cpp-zarr
+
+# With reads straight into GPU memory (Linux, NVIDIA GPUs): also installs nvCOMP, which
+# decompresses on the GPU (see "Read straight into GPU memory" below)
+pip install "cpp-zarr[gpu]"
 ````
 
 ### Usage
@@ -140,7 +144,7 @@ cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_th
 #### Read straight into GPU memory
 GPU reads are supported on Linux for now: Windows builds include them, but they have not been
 tested on a Windows GPU yet, and macOS has no NVIDIA GPUs (`gpu_available()` says why a machine
-cannot read). `pip install cpp-zarr[gpu]` also installs nvCOMP, which cppzarr finds by itself; the
+cannot read). `pip install "cpp-zarr[gpu]"` also installs nvCOMP, which cppzarr finds by itself; the
 NVIDIA driver has to be installed already.
 ````
 import cupy
@@ -150,7 +154,7 @@ import cppzarr
 # gpu=True returns a CuPy array instead of a NumPy array: the chunks' compressed bytes are
 # read, copied to the GPU and decompressed there with nvCOMP. For data needed on the GPU anyway,
 # that is much less CPU work than decompressing on the CPU and copying the result. Needs an
-# NVIDIA GPU (Volta or newer), CuPy, and nvCOMP: pip install cpp-zarr[gpu]
+# NVIDIA GPU (Volta or newer), CuPy (pip install cupy-cuda12x), and nvCOMP (pip install "cpp-zarr[gpu]")
 im = cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], gpu=True)
 
 # Or read into GPU memory you have (a CuPy array, a PyTorch CUDA tensor, or anything with
@@ -252,6 +256,7 @@ if(gpuReadZarr(regions, true /* C order */, stream /* or nullptr */, 0 /* thread
 ````
 % Note the created .zarray file is probably hidden by default on your system
 createZarrFile('path/to/file.zarr');
+
 % Zarr v3 metadata (zarr.json) instead, with 1024x1024x1024 shards made of 256x256x256 chunks
 createZarrFile('path/to/file.zarr','shape',[2048 2048 1024],'dtype','<u2','chunks',[1024 1024 1024],'chunk_shape',[256 256 256],'zarr_format',3);
 ````
@@ -259,6 +264,7 @@ createZarrFile('path/to/file.zarr','shape',[2048 2048 1024],'dtype','<u2','chunk
 #### parallelReadZarr - Read a Zarr image into an array
 ````
 im = parallelReadZarr('path/to/file.zarr');
+
 % Read a region: [starts ends] with one start and one end per axis (1-based, inclusive)
 im = parallelReadZarr('path/to/file.zarr', 'bbox', [1 1 1 100 100 50]);
 ````
@@ -267,19 +273,25 @@ im = parallelReadZarr('path/to/file.zarr', 'bbox', [1 1 1 100 100 50]);
 ````
 im = rand(100,100,100);
 parallelWriteZarr('path/to/file.zarr',im);
+
 % Write with a chunk size (one value per axis)
 parallelWriteZarr('path/to/file.zarr',im,'chunks',[64 64 64]);
+
 % Write with a compressor and compression level (blosc's lz4 at level 5 by default; levels go from 0 to 9)
 parallelWriteZarr('path/to/file.zarr',im,'cname','zstd','clevel',1);
+
 % Write a new array of another data type than the data's (here float16; also 'bfloat16', 'uint16', 'single', '<u2', ...).
 % MATLAB has no 16-bit float class: float16 and bfloat16 arrays read as single. Logical arrays are written as bool,
 % complex single and double as complex64 and complex128, and data written into an existing array is converted to its
 % data type as MATLAB converts between classes.
 parallelWriteZarr('path/to/file.zarr',single(im),'dtype','float16');
+
 % Write into a region of an existing Zarr file ([starts ends] as in parallelReadZarr); the file keeps its Zarr version
 parallelWriteZarr('path/to/file.zarr',im(1:50,:,:),'bbox',[1 1 1 50 100 100]);
+
 % Write a Zarr v3 file (C order and chunk files named c/0/0/0 by default; 'order','F' still works)
 parallelWriteZarr('path/to/file.zarr',im,'zarr_format',3);
+
 % New Zarr v2 files put their chunk files in nested folders (files named 0/0/0) by default. '.' names them
 % 0.0.0 in one folder, which writes much slower on network file systems.
 parallelWriteZarr('path/to/file.zarr',im,'dimension_separator','.');
