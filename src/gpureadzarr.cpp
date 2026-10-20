@@ -1360,7 +1360,9 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
                                                      (const size_t*)(uintptr_t)(comp+where["cap"+kn]), (size_t*)(uintptr_t)got, n,
                                                      (void*)(uintptr_t)slot.temp, slot.tempBytes, (void* const*)(uintptr_t)outp, o,
                                                      (int*)(uintptr_t)st, s);
-                if(dr) throw Fail("nvCOMP could not start decompressing (status "+std::to_string(dr)+")");
+                if(dr) throw Fail("nvCOMP could not start decompressing (status "+std::to_string(dr)+", "+a->nvcompPath+")"+
+                                  (dr == 10 ? ": that nvCOMP may not run on this GPU (CUDA 13 builds need a Turing or newer one; "
+                                              "pip install nvidia-libnvcomp-cu12, or set CPPZARR_NVCOMP_LIBRARY)" : ""));
                 CUdeviceptr pst = st, pgot = got, pcap = comp+where["cap"+kn], pck = ck_;
                 void* cargs[] = {&pst, &pgot, &pcap, &nn, &pck};
                 ck(a, a->cuLaunchKernel(cx->check, (unsigned)std::min<uint64_t>((n+255)/256, 1024), 1, 1, 256, 1, 1, 0, s, cargs, nullptr), "cuLaunchKernel (check)");

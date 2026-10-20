@@ -138,6 +138,10 @@ cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_th
 ````
 
 #### Read straight into GPU memory
+GPU reads are supported on Linux for now: Windows builds include them, but they have not been
+tested on a Windows GPU yet, and macOS has no NVIDIA GPUs (`gpu_available()` says why a machine
+cannot read). `pip install cpp-zarr[gpu]` also installs nvCOMP, which cppzarr finds by itself; the
+NVIDIA driver has to be installed already.
 ````
 import cupy
 import torch
@@ -217,7 +221,7 @@ make install
 
 ### Reading into GPU memory
 gpureadzarr.h reads regions of arrays straight into GPU memory, decompressing on the GPU (see the
-Python section). Building needs nothing more: the library loads the NVIDIA driver and nvCOMP (5 or
+Python section; Linux only for now). Building needs nothing more: the library loads the NVIDIA driver and nvCOMP (5 or
 newer; set CPPZARR_NVCOMP_LIBRARY to its libnvcomp file, or put it on the library path) when it
 first reads on a GPU.
 ````

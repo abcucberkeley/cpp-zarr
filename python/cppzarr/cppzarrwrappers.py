@@ -148,27 +148,36 @@ _nvcomp_looked = False
 
 
 def _find_nvcomp():
-    # nvCOMP from its pip package (nvidia-libnvcomp-cu12, or the older nvidia-nvcomp-cu12/cu13
-    # layout), for the library to load; CPPZARR_NVCOMP_LIBRARY, when set, comes first
+    # nvCOMP from its pip package, for the library to load, found from pip's record of the files
+    # it installed: importing the package failed where another package named nvidia hid it (as in
+    # NVIDIA's PyTorch containers), and the older one loads its own nvCOMP when imported. The
+    # CUDA 12 build first, which the gpu extra installs and which runs on every GPU from Volta on
+    # (CUDA 13 builds need a Turing or newer one), then the CUDA 13 one and the older
+    # nvidia-nvcomp layout. CPPZARR_NVCOMP_LIBRARY, when set, comes first.
     global _nvcomp_looked
     if _nvcomp_looked:
         return
     _nvcomp_looked = True
     if os.environ.get('CPPZARR_NVCOMP_LIBRARY'):
         return
-    import glob, importlib
-    for mod, subs in (('nvidia.libnvcomp', ('lib64', 'lib', 'bin')), ('nvidia.nvcomp', ('', 'lib64', 'lib', 'bin'))):
-        try:
-            m = importlib.import_module(mod)
-        except ImportError:
+    from importlib import metadata
+    for name in ('nvidia-libnvcomp-cu12', 'nvidia-libnvcomp-cu13', 'nvidia-nvcomp-cu12', 'nvidia-nvcomp-cu13'):
+        dist = None
+        for spelling in (name, name.replace('-', '_')):
+            try:
+                dist = metadata.distribution(spelling)
+                break
+            except metadata.PackageNotFoundError:
+                pass
+        if dist is None:
             continue
-        for base in getattr(m, '__path__', []):
-            for sub in subs:
-                found = sorted(f for pat in ('libnvcomp.so*', 'nvcomp*.dll') for f in glob.glob(os.path.join(base, sub, pat))
-                               if 'cpu' not in os.path.basename(f))
-                if found:
-                    pybind11_gpu_set_nvcomp(found[-1])
-                    return
+        libs = sorted(str(dist.locate_file(f)) for f in (dist.files or [])
+                      if (f.name.startswith('libnvcomp.so') or (f.name.startswith('nvcomp') and f.name.endswith('.dll')))
+                      and 'cpu' not in f.name)
+        libs = [p for p in libs if os.path.exists(p)]
+        if libs:
+            pybind11_gpu_set_nvcomp(libs[-1])
+            return
 
 
 def gpu_available():

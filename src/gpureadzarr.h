@@ -13,7 +13,9 @@
 //
 // Needs, at run time only, an NVIDIA driver and nvCOMP 5 or later (pip install
 // nvidia-libnvcomp-cu12, or set CPPZARR_NVCOMP_LIBRARY to its libnvcomp file): cpp-zarr loads
-// them on the first GPU read, and builds and runs without them.
+// them on the first GPU read, and builds and runs without them. Supported on Linux for now:
+// Windows builds include it, untested on a Windows GPU, and macOS has no NVIDIA GPUs
+// (gpuReadAvailable says why a machine cannot read).
 //
 // Environment variables: CPPZARR_NVCOMP_LIBRARY (nvCOMP's library file); CPPZARR_GPU_TIMEOUT
 // (seconds a read waits for the GPU before it fails, 0 for no limit; by default 30 plus 1 per 50 MB
