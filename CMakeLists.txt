@@ -182,11 +182,21 @@ endif()
 # private to the library. Exported, programs that load another C++ runtime after cpp-zarr (Python
 # with PyTorch, for one) bound some of its symbols to this copy and crashed, so the Python wheel
 # turns it on. Off by default: programs built against the library's exported runtime (Parallel
-# Imaris Writer) need it. With it on, the unwinder is the shared libgcc_s every C++ program uses:
-# a private static copy could not unwind the library's exceptions through its callers' code.
+# Imaris Writer) need it.
+#
+# On Linux the library's own calls are bound to its own static blosc, zstd, LZ4, zlib and C++
+# runtime (-Bsymbolic; the symbols stay exported). Otherwise, once the host has loaded another
+# zstd into its global scope (MATLAB loads its own at startup), the library's zstd calls went to
+# that one: writes of zstd arrays from MATLAB took 1.25 times as long. The unwinder is the shared
+# libgcc_s every C++ program uses: a private static copy could not unwind the library's
+# exceptions through its callers' code. (macOS and Windows already bind a library's calls to its
+# own definitions.)
 option(CPPZARR_PRIVATE_RUNTIME "Keep the library's static C++ runtime private (Linux)" OFF)
-if(UNIX AND NOT APPLE AND CPPZARR_PRIVATE_RUNTIME)
-    target_link_options(cppZarr_shared PRIVATE -Wl,--exclude-libs,ALL)
+if(UNIX AND NOT APPLE)
+    if(CPPZARR_PRIVATE_RUNTIME)
+        target_link_options(cppZarr_shared PRIVATE -Wl,--exclude-libs,ALL)
+    endif()
+    target_link_options(cppZarr_shared PRIVATE -Wl,-Bsymbolic)
 else()
     target_link_libraries(cppZarr_shared PRIVATE -static-libgcc)
 endif()
