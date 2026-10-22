@@ -1614,6 +1614,56 @@ int main(int argc, char** argv){
             return ok;
         });
 
+        check("writes store the same bytes with 1, 8 and 16 threads (blosc's threads, given to calls of fewer chunks than threads, finish a chunk's blocks in any order)", [&](){
+            // Every file of an array (its chunks or shards; the metadata is the same anyway)
+            auto files = [&](const std::string& path){
+                std::vector<std::pair<std::string, std::string>> out;
+                for (const auto& e : std::filesystem::recursive_directory_iterator(path)){
+                    if (!e.is_regular_file()) continue;
+                    std::ifstream f(e.path(), std::ios::binary);
+                    out.push_back({std::filesystem::relative(e.path(), path).string(), std::string(std::istreambuf_iterator<char>(f), {})});
+                }
+                std::sort(out.begin(), out.end());
+                return out;
+            };
+            bool ok = true;
+            // (one chunk of 160 blocks; 4 inner chunks of a shard; 2 chunks in C order; and
+            // a Zarr v3 array whose chunks end in a crc32c checksum, as other writers can
+            // make them, rewritten after its metadata says so)
+            for (const auto& c : std::vector<std::pair<std::string, int>>{{"same_lz4", 1}, {"same_shard", 2}, {"same_zstd", 3}, {"same_crc", 4}}){
+                std::vector<std::pair<std::string, std::string>> first;
+                for (int threads : {1, 8, 16, 8, 16}){
+                    omp_set_num_threads(threads);
+                    const Arr a = c.second == 1 ? makeArr(c.first, 2, {150, 130, 64}, {150, 130, 64}, {}, "F", "lz4") :
+                                  c.second == 2 ? makeArr(c.first, 3, {300, 260, 64}, {300, 260, 64}, {150, 130, 64}, "F", "lz4") :
+                                  c.second == 3 ? makeArr(c.first, 2, {300, 130, 64}, {150, 130, 64}, {}, "C", "zstd") :
+                                                  makeArr(c.first, 3, {150, 130, 64}, {150, 130, 64}, {}, "F", "lz4");
+                    if (c.second == 4){
+                        json m;
+                        { std::ifstream f(a.path + "/zarr.json"); m = json::parse(f); }
+                        m["codecs"].push_back({{"name", "crc32c"}});
+                        std::ofstream(a.path + "/zarr.json") << m.dump();
+                        zarr W(a.path);
+                        W.set_chunkInfo({0, 0, 0}, a.shape);
+                        if (!W.get_chunkChecksum() || parallelWriteZarr(W, const_cast<uint16_t*>(a.data.data()), {0, 0, 0}, a.shape, a.shape, 16, true, false, false)){
+                            std::fprintf(stderr, "    %s: could not write with a crc32c codec\n", a.path.c_str());
+                            ok = false;
+                            break;
+                        }
+                    }
+                    const auto got = files(a.path);
+                    if (first.empty()) first = got;
+                    else if (got != first){
+                        std::fprintf(stderr, "    %s: other bytes with %d threads\n", a.path.c_str(), threads);
+                        ok = false;
+                    }
+                    ok = ok && regionOk(a, {0, 0, 0}, a.shape, false);
+                }
+            }
+            omp_set_num_threads(maxThreads);
+            return ok;
+        });
+
         check("reads of big chunks of the zstd codec itself (decoded a part at a time), regions in F and C order, 1, 8 and 16 threads", [&](){
             // A chunk's zstd frame rewritten: without its content size in its header (with a
             // window as big as its data instead, which a single-segment frame does not state),
