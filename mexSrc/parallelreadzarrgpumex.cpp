@@ -22,6 +22,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     std::vector<uint64_t> endCoords;
     std::vector<uint64_t> bboxVals;
     bool bbox = false;
+    int threads = 0;
     std::string folderName(mxArrayToString(prhs[0]));
 
     for(int i = 1; i < nrhs; i+=2){
@@ -39,11 +40,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(currInput == "sparse"){
             // (accepted as parallelReadZarr takes it: missing chunks always read as the fill value)
         }
+        else if(currInput == "threads"){
+            // (the threads that prepare the chunks; the files are read with at least 32 at once)
+            threads = mexThreads(prhs[i+1]);
+        }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: bbox, sparse\n",currInput.c_str());
+            Currently Supported Names: bbox, sparse, threads\n",currInput.c_str());
         }
     }
+    const MexCallThreads callThreadsSet(threads);
 
     if(mxInitGPU() != MX_GPU_SUCCESS) mexErrMsgIdAndTxt("zarr:gpuError","No GPU MATLAB can use (mxInitGPU failed)");
     std::string why;
