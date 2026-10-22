@@ -1587,11 +1587,16 @@ int main(int argc, char** argv){
 
         check("reads of chunks of 1 MB or more that do not spread evenly over the threads (decoded in pieces, copied in slabs), F and C order, 1, 8 and 16 threads", [&](){
             // 2 MB chunks: with 8 or 16 threads most regions below take the three steps (the
-            // whole array, 18 chunks, in 3 or 2 groups), with one thread a chunk at a time
+            // whole array, 18 chunks, in 3 or 2 groups), with one thread a chunk at a time.
+            // Slices of 150x130 elements (39,000 bytes) are not held whole by blosc's
+            // blocks: those chunks are decoded in pieces by the copies that need them
             const std::vector<Arr> big = {
                 makeArr("big_zstd_F", 2, {300, 260, 70}, {128, 128, 64}, {}, "F", "zstd"),
                 makeArr("big_shard_C", 3, {300, 260, 70}, {256, 256, 64}, {128, 128, 64}, "C", "lz4"),
                 makeArr("big_gzip_C", 2, {300, 260, 70}, {128, 128, 64}, {}, "C", "gzip"),
+                makeArr("big_odd_lz4_F", 2, {300, 260, 70}, {150, 130, 64}, {}, "F", "lz4"),
+                makeArr("big_odd_zstd_F", 2, {300, 260, 70}, {150, 130, 64}, {}, "F", "zstd"),
+                makeArr("big_odd_shard_F", 3, {300, 260, 70}, {300, 260, 64}, {150, 130, 64}, "F", "zstd"),
             };
             const std::vector<std::pair<V, V>> regions = {
                 {{0, 0, 0}, {300, 260, 70}}, {{0, 0, 0}, {128, 128, 64}}, {{5, 3, 1}, {250, 200, 69}},
