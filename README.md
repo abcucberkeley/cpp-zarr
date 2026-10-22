@@ -206,6 +206,11 @@ im = parallelReadZarr('path/to/file.zarr');
 
 % Read a region: [starts ends] with one start and one end per axis (1-based, inclusive)
 im = parallelReadZarr('path/to/file.zarr', 'bbox', [1 1 1 100 100 50]);
+
+% Read with 4 threads. By default a call uses OpenMP's thread count for MATLAB, which on Linux
+% follows maxNumCompThreads (OMP_NUM_THREADS has no effect there). parallelWriteZarr takes
+% 'threads' too.
+im = parallelReadZarr('path/to/file.zarr', 'threads', 4);
 ````
 
 #### parallelWriteZarr - Write an array out as a Zarr image
@@ -234,6 +239,13 @@ parallelWriteZarr('path/to/file.zarr',im,'zarr_format',3);
 % New Zarr v2 files put their chunk files in nested folders (files named 0/0/0) by default. '.' names them
 % 0.0.0 in one folder, which writes much slower on network file systems.
 parallelWriteZarr('path/to/file.zarr',im,'dimension_separator','.');
+
+% Write each chunk file directly. By default each one is written to a temporary file that is then
+% renamed into place, so readers never see a partly written chunk and a write that fails keeps the
+% old one. Skipping that writes faster on network file systems. It is safe for a new array that
+% nothing reads until the write is done (for example one written under a temporary name and renamed
+% after), as long as no two writers write the same chunk.
+parallelWriteZarr('path/to/file.zarr',im,'uuid',false);
 ````
 
 #### convertZarrToV3 - Convert a Zarr v2 file to Zarr v3

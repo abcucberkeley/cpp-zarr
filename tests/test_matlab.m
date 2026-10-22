@@ -224,6 +224,48 @@ function test_matlab(mexDir)
     end
     fprintf('PASS  clevel\n');
 
+    % threads sets a call's thread count (0 or [] for the default) and leaves MATLAB's
+    % own setting as it was. The stored bytes are the same at any count, also when one
+    % chunk is compressed by several of blosc's threads (lz4 at level 1: small blocks)
+    a4 = cast(randi([0 1000], [64 64 64]), 'uint16');
+    before = maxNumCompThreads;
+    counts = {1, 8, 8, 8, 0, []};
+    for k = 1:numel(counts)
+        ft = fullfile(tmp, sprintf('threads_%d.zarr', k));
+        parallelWriteZarr(ft, a4, 'chunks', [64 64 64], 'cname', 'lz4', 'clevel', 1, 'threads', counts{k});
+        assert(maxNumCompThreads == before, 'threads %s changed maxNumCompThreads', mat2str(counts{k}));
+        assert(isequal(parallelReadZarr(ft, 'threads', counts{k}), a4), 'threads %s round-trip mismatch', mat2str(counts{k}));
+        assert(isequal(parallelReadZarr(ft, 'bbox', [5 6 7 60 50 33], 'threads', counts{k}), a4(5:60, 6:50, 7:33)), ...
+               'threads %s bbox read mismatch', mat2str(counts{k}));
+        fid = fopen(fullfile(ft, '0', '0', '0'), 'r');
+        stored = fread(fid, Inf, 'uint8=>uint8');
+        fclose(fid);
+        if k == 1
+            ref = stored;
+        else
+            assert(isequal(stored, ref), 'threads %s stored other bytes than one thread', mat2str(counts{k}));
+        end
+    end
+    bad = {-1, 1.5, 'a', [1 2]};
+    for k = 1:numel(bad)
+        rejected = false;
+        try
+            parallelWriteZarr(fullfile(tmp, 'threads_bad.zarr'), a4, 'threads', bad{k});
+        catch e
+            rejected = strcmp(e.identifier, 'zarr:inputError');
+        end
+        assert(rejected, 'threads %s was not rejected by parallelWriteZarr', mat2str(bad{k}));
+        rejected = false;
+        try
+            parallelReadZarr(ft, 'threads', bad{k});
+        catch e
+            rejected = strcmp(e.identifier, 'zarr:inputError');
+        end
+        assert(rejected, 'threads %s was not rejected by parallelReadZarr', mat2str(bad{k}));
+    end
+    assert(maxNumCompThreads == before, 'a rejected threads value changed maxNumCompThreads');
+    fprintf('PASS  threads\n');
+
     for nd = [4 5]
         sz = [9 7 6 5 4];  sz = sz(1:nd);
         ch = [4 3 4 2 3];  ch = ch(1:nd);
@@ -421,6 +463,32 @@ function test_matlab(mexDir)
     z = parallelReadZarr(fc);
     assert(isequal(size(z), sz) && isa(z, 'uint16') && ~any(z(:)), 'createZarrFile mismatch');
     fprintf('PASS  createZarrFile\n');
+
+    % A missing array and metadata that cannot be read are errors MATLAB can catch: the
+    % library reports them by throwing, and the mex files catch that (so this also checks
+    % that an exception gets from the library to the mex files)
+    for k = 1:3
+        caught = '';
+        try
+            parallelReadZarr(fullfile(tmp, 'no_such_array.zarr'));
+        catch e
+            caught = e.identifier;
+        end
+        assert(strcmp(caught, 'zarr:zarrayError'), 'reading a missing array raised "%s", not zarr:zarrayError', caught);
+    end
+    fbad = fullfile(tmp, 'incomplete.zarr');
+    mkdir(fbad);
+    fid = fopen(fullfile(fbad, '.zarray'), 'w');
+    fprintf(fid, '{"zarr_format": 2}');
+    fclose(fid);
+    caught = '';
+    try
+        parallelWriteZarr(fbad, zeros(4, 4, 4, 'uint16'), 'bbox', [1 1 1 4 4 4]);
+    catch e
+        caught = e.identifier;
+    end
+    assert(strcmp(caught, 'zarr:zarrayError'), 'writing into incomplete metadata raised "%s", not zarr:zarrayError', caught);
+    fprintf('PASS  errors\n');
 
     % Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
     % arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
