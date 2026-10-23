@@ -171,13 +171,24 @@ target_link_libraries(cppZarr_shared PRIVATE
     blosc_static
     zlibstaticCPPZARR
     nlohmann_json::nlohmann_json
-    -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX
 )
 
 if(MINGW)
     target_link_options(cppZarr_shared PRIVATE -Wl,--allow-multiple-definition)
+endif()
+# CPPZARR_PRIVATE_RUNTIME (Linux): keep the static C++ runtime (and the other static libraries)
+# private to the library. Exported, programs that load another C++ runtime after cpp-zarr (Python
+# with PyTorch, for one) bound some of its symbols to this copy and crashed, so the Python wheel
+# turns it on. Off by default: programs built against the library's exported runtime (Parallel
+# Imaris Writer) need it. With it on, the unwinder is the shared libgcc_s every C++ program uses:
+# a private static copy could not unwind the library's exceptions through its callers' code.
+option(CPPZARR_PRIVATE_RUNTIME "Keep the library's static C++ runtime private (Linux)" OFF)
+if(UNIX AND NOT APPLE AND CPPZARR_PRIVATE_RUNTIME)
+    target_link_options(cppZarr_shared PRIVATE -Wl,--exclude-libs,ALL)
+else()
+    target_link_libraries(cppZarr_shared PRIVATE -static-libgcc)
 endif()
 
 install(TARGETS cppZarr_shared

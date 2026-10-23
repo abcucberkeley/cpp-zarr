@@ -37,7 +37,9 @@ class BuildExt(build_ext):
             "cmake",
             cmake_source_dir,
             "-B", cmake_build_dir,
-            f"-DCMAKE_INSTALL_PREFIX={install_dir}"
+            f"-DCMAKE_INSTALL_PREFIX={install_dir}",
+            # (the library's C++ runtime kept private, as the module's is: see CMakeLists.txt)
+            "-DCPPZARR_PRIVATE_RUNTIME=ON",
         ]
 
         # Configure and build CMake project
@@ -59,7 +61,8 @@ ext_modules = [
         library_dirs=['build/install/lib64','build/install/lib'],
         libraries=['cppZarr'],
         sources=["cppzarr.cpp"],
-        extra_link_args=['-static-libstdc++']
+        # (the static C++ runtime kept private, as in the library: see CMakeLists.txt)
+        extra_link_args=['-static-libstdc++'] + (['-Wl,--exclude-libs,ALL'] if system == "Linux" else [])
     ),
 ]
 
