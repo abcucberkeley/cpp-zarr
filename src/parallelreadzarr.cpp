@@ -419,6 +419,8 @@ struct ReadScratch {
     }
 };
 ScratchPool<ReadScratch> readScratchPool;
+// (ends a child's thread for parallel regions with the library: see ForkSafety)
+ForkSafetyOwner forkSafetyOwner;
 
 // Chunks of this many bytes or more are decoded in pieces or a part at a time (a test
 // build sets it lower, to take those ways with small arrays)
@@ -462,6 +464,14 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool cOrder,
                          const void* fillMissing)
 {
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        uint8_t r = 1;
+        ForkSafety::get().onRegionThread([&]{
+            r = parallelReadZarr(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, cOrder, fillMissing);
+        });
+        return r;
+    }
     // Linux's automatic NUMA balancing is kept off the threads that read, for the call (see
     // LocalMemoryPolicy): the calling thread for all of it, and every thread of each
     // parallel region, also those with nothing to do (any thread can mark the process's
@@ -2179,6 +2189,12 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
 }
 
 void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t startY, uint64_t startZ, uint64_t endX, uint64_t endY, uint64_t endZ, uint8_t imageJIm){
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        void* r = nullptr;
+        ForkSafety::get().onRegionThread([&]{ r = readZarrParallelHelper(folderName, startX, startY, startZ, endX, endY, endZ, imageJIm); });
+        return r;
+    }
     // Arrays that cannot be read (missing or unsupported metadata) give NULL too
     zarr Zarr;
     try{

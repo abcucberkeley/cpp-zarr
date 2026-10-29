@@ -11,6 +11,7 @@
 #include <fstream>
 #include "zarr.h"
 #include "helperfunctions.h"
+#include "parallelwork.h"
 
 // A metadata fill_value as the zarr class keeps it: integers in decimal, other
 // numbers in full precision, "NaN", "Infinity", "-Infinity" and Zarr v3's "0x..."
@@ -1019,6 +1020,11 @@ static std::string gridIndexName(uint64_t i, const std::vector<uint64_t> &first,
 
 // Create subfolder "chunks"
 void zarr::createSubfolders(){
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        ForkSafety::get().onRegionThread([&]{ createSubfolders(); });
+        return;
+    }
     normalizeDims();
     const uint64_t n = shape.size();
 
@@ -1167,6 +1173,11 @@ const std::vector<uint64_t> zarr::get_chunkAxisVals(const std::string &fileName)
 void zarr::set_chunkInfo(const std::vector<uint64_t> &startCoords,
                          const std::vector<uint64_t> &endCoords)
 {
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        ForkSafety::get().onRegionThread([&]{ set_chunkInfo(startCoords, endCoords); });
+        return;
+    }
     normalizeDims();
     const uint64_t n = shape.size();
     // A 0-dimensional array (scalar) is a single chunk named "0"

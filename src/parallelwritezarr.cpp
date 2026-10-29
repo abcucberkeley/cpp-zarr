@@ -246,6 +246,14 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                           const std::vector<uint64_t> &inStrides,
                           const uint64_t bits, const bool useUuid,
                           const bool crop, const bool sparse){
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        uint8_t r = 1;
+        ForkSafety::get().onRegionThread([&]{
+            r = parallelWriteZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, inStrides, bits, useUuid, crop, sparse);
+        });
+        return r;
+    }
     // A 0-dimensional array is a single element: sharding does not apply
     if(Zarr.get_ndims() == 0 && Zarr.get_shard()){
         Zarr.set_errString("Sharding is not supported for 0-dimensional arrays\n");

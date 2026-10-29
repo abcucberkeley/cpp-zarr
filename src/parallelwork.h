@@ -8,16 +8,169 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
-#ifdef __linux__
+#ifndef _WIN32
 #include <pthread.h>
+#endif
+#ifdef __linux__
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+// fork() and the library. A child made by fork() has only the thread that forked, and the rest
+// of the library's state as it was then:
+// - GCC's OpenMP (libgomp) keeps the thread's team of threads, which are not in the child: its
+//   next parallel region of more than one thread waits for them forever (a training loader's
+//   workers, made by fork() after the main process had read with more than one thread, hung at
+//   their first read). So in such a child, the functions that run parallel regions run them on
+//   a thread of the child when called on the thread that forked (onRegionThread): OpenMP makes a
+//   team anew for it. Threads the child makes have teams of their own.
+// - A lock that another thread held at the fork would be held in the child for good: the locks of
+//   the library's pools of buffers are taken around fork() (guardAcrossFork), so that the child
+//   gets the pools whole and unlocked.
+class ForkSafety {
+    // (a thread of a child for the parallel regions of the thread that forked)
+    class RegionThread {
+        std::mutex m;
+        std::condition_variable cv;
+        const std::function<void()>* job = nullptr;
+        std::exception_ptr error;
+        bool busy = false, stop = false;
+        std::thread t;
+        void work(){
+            std::unique_lock<std::mutex> lk(m);
+            while(true){
+                cv.wait(lk, [&]{ return busy || stop; });
+                if(!busy) return;
+                lk.unlock();
+                std::exception_ptr e;
+                try{
+                    (*job)();
+                }
+                catch(...){
+                    e = std::current_exception();
+                }
+                lk.lock();
+                error = e;
+                busy = false;
+                cv.notify_all();
+            }
+        }
+    public:
+        RegionThread() : t(&RegionThread::work, this) {}
+        RegionThread(const RegionThread&) = delete;
+        RegionThread& operator=(const RegionThread&) = delete;
+        ~RegionThread(){
+            {
+                std::lock_guard<std::mutex> g(m);
+                stop = true;
+            }
+            cv.notify_all();
+            if(t.joinable()) t.join();
+        }
+        void run(const std::function<void()> &f){
+            std::unique_lock<std::mutex> lk(m);
+            job = &f;
+            busy = true;
+            cv.notify_all();
+            cv.wait(lk, [&]{ return !busy; });
+            job = nullptr;
+            if(error){
+                std::exception_ptr e = error;
+                error = nullptr;
+                std::rethrow_exception(e);
+            }
+        }
+    };
+    std::mutex* guarded[8];
+    std::atomic<int> nGuarded{0};
+#ifndef _WIN32
+    std::atomic<int> forked{0};
+    pthread_t forker;
+    std::mutex regionMutex;
+    std::atomic<RegionThread*> regions{nullptr};
+    static void prepare(){
+        ForkSafety &f = get();
+        for(int i = 0; i < f.nGuarded.load(std::memory_order_acquire); i++) f.guarded[i]->lock();
+    }
+    static void parent(){
+        ForkSafety &f = get();
+        for(int i = f.nGuarded.load(std::memory_order_acquire)-1; i >= 0; i--) f.guarded[i]->unlock();
+    }
+    static void child(){
+        ForkSafety &f = get();
+        for(int i = f.nGuarded.load(std::memory_order_acquire)-1; i >= 0; i--) f.guarded[i]->unlock();
+        // (the parent's region thread, if any, is not in the child: left alone)
+        new (&f.regionMutex) std::mutex();
+        f.regions.store(nullptr, std::memory_order_relaxed);
+        f.forker = pthread_self();
+        f.forked.fetch_add(1, std::memory_order_release);
+    }
+#endif
+    ForkSafety(){
+#ifndef _WIN32
+        pthread_atfork(&ForkSafety::prepare, &ForkSafety::parent, &ForkSafety::child);
+#endif
+    }
+public:
+    // The process's (made at the library's start, by the pools of buffers; never destroyed, as a
+    // child of a fork may run its handlers until it ends)
+    static ForkSafety& get(){
+        static ForkSafety* f = new ForkSafety();
+        return *f;
+    }
+    // Hold m around fork() (m must never be held while taking another lock)
+    void guardAcrossFork(std::mutex &m){
+        const int i = nGuarded.load(std::memory_order_relaxed);
+        if(i < 8){
+            guarded[i] = &m;
+            nGuarded.store(i+1, std::memory_order_release);
+        }
+    }
+    // Whether this thread's parallel regions must run on another (see above)
+    bool needRegionThread(){
+#ifndef _WIN32
+        return forked.load(std::memory_order_acquire) != 0 && pthread_equal(pthread_self(), forker);
+#else
+        return false;
+#endif
+    }
+    // Run f on the child's thread for the parallel regions of the thread that forked (made on first
+    // use), and wait for it; an exception f throws is thrown here
+    void onRegionThread(const std::function<void()> &f){
+#ifndef _WIN32
+        RegionThread* r = regions.load(std::memory_order_acquire);
+        if(!r){
+            std::lock_guard<std::mutex> g(regionMutex);
+            r = regions.load(std::memory_order_acquire);
+            if(!r){
+                r = new RegionThread();
+                regions.store(r, std::memory_order_release);
+            }
+        }
+        r->run(f);
+#else
+        f();
+#endif
+    }
+    // (at the library's end: the region thread of a child, if any, is ended)
+    void end(){
+#ifndef _WIN32
+        delete regions.exchange(nullptr);
+#endif
+    }
+};
+// Ends the region thread with the library (its code goes with it)
+struct ForkSafetyOwner {
+    ForkSafetyOwner(){ ForkSafety::get(); }
+    ~ForkSafetyOwner(){ ForkSafety::get().end(); }
+};
 
 // Contiguous blocks of work items with work stealing. Each thread starts with its
 // own contiguous block of the items, so neighboring chunks stay with one thread and
@@ -109,6 +262,9 @@ class ScratchPool {
     std::mutex m;
     std::vector<std::unique_ptr<T>> byPlace, idle;
 public:
+    ScratchPool(){ ForkSafety::get().guardAcrossFork(m); }
+    ScratchPool(const ScratchPool&) = delete;
+    ScratchPool& operator=(const ScratchPool&) = delete;
     // place < 0: any
     std::unique_ptr<T> take(const int place){
         {

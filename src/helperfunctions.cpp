@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include "helperfunctions.h"
+#include "parallelwork.h"
 #include "zarr.h"
 
 #ifndef _WIN32
@@ -477,6 +478,11 @@ void swapDtypeEndianness(void* array, const DtypeInfo &dtype, const size_t n){
 }
 
 void swapArrayEndianness(void* array, const size_t elementSize, const size_t numElements){
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        ForkSafety::get().onRegionThread([&]{ swapArrayEndianness(array, elementSize, numElements); });
+        return;
+    }
     uint8_t* data = reinterpret_cast<uint8_t*>(array); // Cast array to byte pointer
 
     #pragma omp parallel for

@@ -138,7 +138,8 @@ cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 # (a multiprocessing pool, a data loader's workers): give each process a share with
 # num_threads (a bigger one to those with more to read), or OMP_NUM_THREADS set before
 # cppzarr is imported. Processes that each use every CPU make one another's reads several
-# times slower.
+# times slower. Processes made by fork() (multiprocessing's default on Linux, PyTorch's
+# DataLoader workers) can read and write too, also after their parent did with several threads.
 
 # Or read a batch of regions at once (from one array or several), new arrays or into given ones:
 # the reads overlap and share num_threads threads (by default, as for a call, OMP_NUM_THREADS
