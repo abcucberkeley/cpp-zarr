@@ -1,6 +1,7 @@
 #include "cudaapi.h"
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 // (without windows.h's min and max macros, which the std::min and std::max calls would expand)
@@ -13,6 +14,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 namespace czcuda {
@@ -72,6 +74,7 @@ bool loadDriver(Api &a, std::string &why){
               get(lib, a.cuMemFreeHost, "cuMemFreeHost") && get(lib, a.cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2") &&
               get(lib, a.cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2") && get(lib, a.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2") &&
               get(lib, a.cuMemsetD8Async, "cuMemsetD8Async") && get(lib, a.cuStreamSynchronize, "cuStreamSynchronize") &&
+              get(lib, a.cuStreamCreate, "cuStreamCreate") &&
               get(lib, a.cuStreamWaitEvent, "cuStreamWaitEvent") && get(lib, a.cuEventCreate, "cuEventCreate") &&
               get(lib, a.cuEventRecord, "cuEventRecord") && get(lib, a.cuEventSynchronize, "cuEventSynchronize") &&
               get(lib, a.cuEventQuery, "cuEventQuery") && get(lib, a.cuEventDestroy, "cuEventDestroy_v2") &&
@@ -151,6 +154,76 @@ const Api* api(std::string* why){
     }
     if(!result && why) *why = failure;
     return result;
+}
+
+namespace {
+std::string cufilePathSet;
+bool cufileTried = false;
+Cufile cufileLoaded;
+const Cufile* cufileResult = nullptr;
+std::string cufileFailure;
+}  // namespace
+
+bool nvidiaFsLoaded(){
+#ifdef _WIN32
+    return false;
+#else
+    return access("/proc/driver/nvidia-fs/version", R_OK) == 0;
+#endif
+}
+
+void setCufileLibrary(const std::string &path){
+    std::lock_guard<std::mutex> g(loadMutex);
+    if(!cufileTried) cufilePathSet = path;
+}
+
+const Cufile* cufile(std::string* why){
+    std::lock_guard<std::mutex> g(loadMutex);
+    if(!cufileTried){
+        cufileTried = true;
+    #ifdef _WIN32
+        cufileFailure = "GPUDirect Storage is not available on Windows";
+    #else
+        std::vector<std::string> names;
+        if(!cufilePathSet.empty()) names.push_back(cufilePathSet);
+        const char* env = std::getenv("CPPZARR_CUFILE_LIBRARY");
+        if(env && *env) names.push_back(env);
+        for(const char* n : {"libcufile.so.0", "libcufile.so"}) names.push_back(n);
+        // (cuFile calls shm_open without linking librt, where it is on glibc before 2.34, such as
+        // RHEL 8's: loaded into the global scope first, or cuFile does not load from Python or MATLAB)
+        dlopen("librt.so.1", RTLD_NOW | RTLD_GLOBAL);
+        void* lib = nullptr;
+        Cufile c;
+        for(const auto &n : names){
+            lib = openLibrary(n);
+            if(lib){
+                c.path = n;
+                break;
+            }
+        }
+        if(!lib) cufileFailure = "cuFile was not found (pip install nvidia-cufile-cu12, or set CPPZARR_CUFILE_LIBRARY to its libcufile)";
+        else if(!(get(lib, c.driverOpen, "cuFileDriverOpen") && get(lib, c.handleRegister, "cuFileHandleRegister") &&
+                  get(lib, c.handleDeregister, "cuFileHandleDeregister") && get(lib, c.bufRegister, "cuFileBufRegister") &&
+                  get(lib, c.bufDeregister, "cuFileBufDeregister") && get(lib, c.read, "cuFileRead"))){
+            cufileFailure = "the cuFile found ("+c.path+") lacks functions cpp-zarr needs";
+        }
+        else{
+            // (on a thread of its own: opening cuFile's driver leaves a context of its own current,
+            // which the caller's later calls would then have used, its stream created in it)
+            CUfileError_t e{};
+            std::thread t([&](){ e = c.driverOpen(); });
+            t.join();
+            if(e.err) cufileFailure = "cuFile's driver could not be opened (cuFile error "+std::to_string(e.err)+")";
+            else{
+                c.nvfs = nvidiaFsLoaded();
+                cufileLoaded = c;
+                cufileResult = &cufileLoaded;
+            }
+        }
+    #endif
+    }
+    if(!cufileResult && why) *why = cufileFailure;
+    return cufileResult;
 }
 
 std::string errorText(const Api* a, CUresult r){

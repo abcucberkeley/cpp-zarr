@@ -26,12 +26,21 @@
 // at once, 32 by default: reading mostly waits on the storage); CPPZARR_GPU_PART_MAX_MB (bigger
 // reads go in parts of at most this many MB, 1024 by default, so that a read's own GPU buffers stay
 // small next to its outputs).
+//
+// GPUDirect Storage (Linux): where its nvidia-fs driver is loaded, the stored bytes are read with
+// cuFile straight into GPU memory (pip install nvidia-cufile-cu12, or set CPPZARR_CUFILE_LIBRARY to
+// its libcufile file; cuFile's own settings are in its cufile.json). CPPZARR_GDS=0 reads through
+// host memory anyway, CPPZARR_GDS=1 reads with cuFile even without nvidia-fs (its compatibility
+// mode, which reads through host memory itself: for testing).
 
 // Whether GPU reads can run here; if not, why (no NVIDIA driver, no nvCOMP, ...)
 bool gpuReadAvailable(std::string &why);
 
 // Where to load nvCOMP from (a libnvcomp file), before the first GPU read
 void gpuSetNvcompLibrary(const std::string &path);
+
+// Where to load cuFile from (a libcufile file), before the first GPU read
+void gpuSetCufileLibrary(const std::string &path);
 
 // One region to read: an opened array, the region [start, end) (whole array when both are
 // empty) and the GPU memory it goes to (the region's shape, in the call's order), all regions'

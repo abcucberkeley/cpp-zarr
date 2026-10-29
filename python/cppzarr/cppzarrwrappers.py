@@ -4,7 +4,7 @@ import numpy as np
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
-from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11_gpu_available, pybind11_gpu_set_nvcomp,
+from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11_gpu_available, pybind11_gpu_set_cufile, pybind11_gpu_set_nvcomp,
                       pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_region_info, pybind11_write_zarr)
 
 
@@ -158,6 +158,7 @@ def _find_nvcomp():
     if _nvcomp_looked:
         return
     _nvcomp_looked = True
+    _find_cufile()
     if os.environ.get('CPPZARR_NVCOMP_LIBRARY'):
         return
     from importlib import metadata
@@ -177,6 +178,30 @@ def _find_nvcomp():
         libs = [p for p in libs if os.path.exists(p)]
         if libs:
             pybind11_gpu_set_nvcomp(libs[-1])
+            return
+
+
+def _find_cufile():
+    # cuFile (GPUDirect Storage) from its pip package, found as nvCOMP is, for reads where GDS's
+    # nvidia-fs driver is loaded: the CUDA 12 build first. CPPZARR_CUFILE_LIBRARY, when set, comes
+    # first.
+    if os.environ.get('CPPZARR_CUFILE_LIBRARY'):
+        return
+    from importlib import metadata
+    for name in ('nvidia-cufile-cu12', 'nvidia-cufile-cu13', 'nvidia-cufile'):
+        dist = None
+        for spelling in (name, name.replace('-', '_')):
+            try:
+                dist = metadata.distribution(spelling)
+                break
+            except metadata.PackageNotFoundError:
+                pass
+        if dist is None:
+            continue
+        libs = sorted(str(dist.locate_file(f)) for f in (dist.files or []) if f.name.startswith('libcufile.so'))
+        libs = [p for p in libs if os.path.exists(p)]
+        if libs:
+            pybind11_gpu_set_cufile(libs[0])
             return
 
 

@@ -202,6 +202,7 @@ struct Slot {
     uint8_t* small = nullptr;        // pinned: the decompression checks' results
     CUdeviceptr comp = 0, dec = 0, work = 0, temp = 0;
     size_t compBytes = 0, decBytes = 0, workBytes = 0, tempBytes = 0;
+    bool compRegistered = false;     // (comp registered with cuFile, which then reads into it directly)
 };
 struct Ctx {
     CUcontext ctx = nullptr;
@@ -209,6 +210,7 @@ struct Ctx {
     CUfunction scatter32 = nullptr, scatter64 = nullptr, resolve = nullptr, fill = nullptr, check = nullptr;
     int sms = 1;
     NvcompAlignments align[NCodecs];
+    CUstream copyStream = nullptr;   // (GDS reads: the stored bytes' copies to the host, on their own)
     std::mutex m;
     std::vector<std::unique_ptr<Slot>> slots;
 };
@@ -269,6 +271,35 @@ void growDevice(const Api* a, CUdeviceptr &p, size_t &have, const size_t need){
     const size_t n = std::max<size_t>(need+need/4, 1 << 20);
     ck(a, a->cuMemAlloc(&p, n), "Could not allocate GPU memory (cuMemAlloc)");
     have = n;
+}
+
+// A slot's buffer for stored bytes of at least need bytes, keeping its first keep bytes (copied on
+// stream s, which then finishes); registered with cuFile when cf is given, so that GDS reads go
+// straight into it
+void growComp(const Api* a, const Cufile* cf, Slot &sl, const size_t need, const size_t keep, CUstream s){
+    if(need <= sl.compBytes) return;
+    auto release = [&](){
+        if(sl.compRegistered){
+            if(const Cufile* c = cufile(nullptr)) c->bufDeregister((const void*)(uintptr_t)sl.comp);
+        }
+        a->cuMemFree(sl.comp);
+        sl.comp = 0;
+        sl.compBytes = 0;
+        sl.compRegistered = false;
+    };
+    // (freed first unless some of it is kept, so that the old and new buffers are not both held)
+    if(sl.comp && !keep) release();
+    const size_t n = std::max<size_t>(need+need/4, 1 << 20);
+    CUdeviceptr p = 0;
+    ck(a, a->cuMemAlloc(&p, n), "Could not allocate GPU memory (cuMemAlloc)");
+    if(sl.comp){
+        ck(a, a->cuMemcpyDtoDAsync(p, sl.comp, keep, s), "cuMemcpyDtoDAsync");
+        ck(a, a->cuStreamSynchronize(s), "cuStreamSynchronize");
+        release();
+    }
+    sl.comp = p;
+    sl.compBytes = n;
+    sl.compRegistered = cf && cf->bufRegister((const void*)(uintptr_t)p, n, 0).err == 0;
 }
 
 // Pinned host memory of at least need bytes, keeping the first keep bytes
@@ -858,12 +889,98 @@ struct Pending {
     std::vector<uint32_t> streamChunk[NCodecs];
 };
 
+// A run of a part's chunks in one file: its bytes in the file, and its place in the part's buffers;
+// and a piece of a run that one thread reads
+struct Run { const std::string* path; uint64_t off, bytes, at; };
+struct Piece { size_t run; uint64_t off, bytes; };
+
+// A thread with ctx current for a cuFile call, and its own context current again after it (cuFile's
+// compatibility mode can leave another one, or none, current: the copies after the reads then
+// failed with an invalid context)
+struct CtxFor {
+    const Api* a;
+    CUcontext was = nullptr;
+    CtxFor(const Api* api, CUcontext c) : a(api){ a->cuCtxGetCurrent(&was); a->cuCtxSetCurrent(c); }
+    ~CtxFor(){ a->cuCtxSetCurrent(was); }
+    CtxFor(const CtxFor&) = delete;
+    CtxFor& operator=(const CtxFor&) = delete;
+};
+
+// A part's reads with cuFile (GPUDirect Storage, or its compatibility mode): each run's whole
+// 4 KiB blocks (pieces from the block its first byte is in) into the slot's GPU buffer, then the
+// stored bytes copied to the host, where its chunks are set up. A file cuFile does not take (its
+// registering failed, as it did for a small chunk file under several threads' reads) or a piece it
+// does not read is read as other reads are, into host memory, and copied to the GPU buffer.
+void readGds(const Api* a, const Cufile* cf, CUcontext ctx, CUstream copyStream, Slot &slot,
+             const std::vector<Run> &runs, const std::vector<Piece> &pieces, const uint64_t stored, const int readers){
+    growComp(a, cf, slot, stored+std::max<uint64_t>(stored/4, 64 << 20), 0, nullptr);
+    // the part's files, opened without the page cache (as GDS reads them) and registered
+    std::vector<const std::string*> paths;
+    std::map<const std::string*, size_t> fileOf;
+    for(const auto &r : runs) if(fileOf.emplace(r.path, paths.size()).second) paths.push_back(r.path);
+    struct Files {
+        const Api* a;
+        CUcontext ctx;
+        const Cufile* cf;
+        std::vector<int> fds;
+        std::vector<CUfileHandle_t> fhs;
+        ~Files(){
+            const CtxFor current(a, ctx);
+            for(size_t i = 0; i < fds.size(); i++){
+                if(fhs[i]) cf->handleDeregister(fhs[i]);
+            #ifndef _WIN32
+                if(fds[i] >= 0) ::close(fds[i]);
+            #endif
+            }
+        }
+    } files{a, ctx, cf, std::vector<int>(paths.size(), -1), std::vector<CUfileHandle_t>(paths.size(), nullptr)};
+    std::string err = pool().run((int64_t)paths.size(), readers, [&](int64_t i){
+    #ifdef _WIN32
+        throw Fail("GPUDirect Storage is not available on Windows");
+    #else
+        files.fds[i] = ::open(paths[i]->c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if(files.fds[i] < 0) throw Fail("The file "+*paths[i]+" could not be opened");
+        CUfileDescr_t d{};
+        d.type = 1;                  // CU_FILE_HANDLE_TYPE_OPAQUE_FD
+        d.handle.fd = files.fds[i];
+        const CtxFor current(a, ctx);
+        if(cf->handleRegister(&files.fhs[i], &d).err) files.fhs[i] = nullptr;
+    #endif
+    });
+    if(!err.empty()) throw Fail(err);
+    // (the host's pieces: their places, and bytes, to copy to the GPU buffer)
+    std::vector<std::pair<uint64_t, uint64_t>> onHost(pieces.size(), {0, 0});
+    err = pool().run((int64_t)pieces.size(), readers, [&](int64_t i){
+        const Piece &p = pieces[i];
+        const Run &r = runs[p.run];
+        const uint64_t from = r.off & ~uint64_t(4095), place = r.at-(r.off-from);
+        // (the bytes of the run in this piece: past the file's end there are fewer than the piece)
+        const uint64_t need = std::min<uint64_t>(p.bytes, r.off+r.bytes-from-std::min<uint64_t>(p.off, r.off+r.bytes-from));
+        const CUfileHandle_t fh = files.fhs[fileOf.at(r.path)];
+        if(fh){
+            const CtxFor current(a, ctx);
+            const long long got = cf->read(fh, (void*)(uintptr_t)slot.comp, p.bytes, (long long)(from+p.off), (long long)(place+p.off));
+            if(got >= (long long)need) return;
+        }
+        File f;
+        if(!f.open(*r.path) || !f.readAt(from+p.off, slot.host+place+p.off, need)) throw Fail("The file "+*r.path+" could not be read");
+        onHost[i] = {place+p.off, need};
+    });
+    if(!err.empty()) throw Fail(err);
+    for(const auto &h : onHost){
+        if(h.second) ck(a, a->cuMemcpyHtoDAsync(slot.comp+h.first, slot.host+h.first, h.second, copyStream), "cuMemcpyHtoDAsync");
+    }
+    ck(a, a->cuMemcpyDtoHAsync(slot.host, slot.comp, stored, copyStream), "cuMemcpyDtoHAsync");
+    ck(a, a->cuStreamSynchronize(copyStream), "cuStreamSynchronize");
+}
+
 // What CPPZARR_GPU_PROFILE prints about a read
 struct ReadStats {
     uint64_t stored = 0, onHost = 0, streams = 0;
     size_t parts = 0;
     double find = 0, host = 0, read = 0;
     float gpu[3] = {0, 0, 0};
+    int gds = 0;                     // read with cuFile: 1 compatibility mode, 2 GPUDirect Storage
 };
 
 }  // namespace
@@ -874,6 +991,10 @@ bool gpuReadAvailable(std::string &why){
 
 void gpuSetNvcompLibrary(const std::string &path){
     setNvcompLibrary(path);
+}
+
+void gpuSetCufileLibrary(const std::string &path){
+    setCufileLibrary(path);
 }
 
 uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* stream, const int threadsIn,
@@ -1075,6 +1196,26 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
         // read took longer than 4, and a 10x8 MiB read was faster in one.) Bigger reads are split
         // into parts of at most CPPZARR_GPU_PART_MAX_MB (1024) MB, so that the buffers of the two
         // parts in flight stay small next to the outputs, however much a call reads.
+        // GPUDirect Storage: each part's stored bytes read with cuFile straight into its GPU buffer
+        // (then copied to the host, where its chunks are set up as for other reads) where nvidia-fs
+        // is loaded, or wherever CPPZARR_GDS=1 asks for it (without nvidia-fs cuFile reads through
+        // host memory: for testing). CPPZARR_GDS=0: never. (Not loaded at all without nvidia-fs:
+        // opening cuFile's driver can leave a cufile.log in the working folder.)
+        static const int gdsWanted = [](){
+            const char* e = std::getenv("CPPZARR_GDS");
+            return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+        }();
+        const Cufile* cf = nullptr;
+        if(gdsWanted > 0 || (gdsWanted < 0 && nvidiaFsLoaded())){
+            std::string w;
+            cf = cufile(&w);
+            if(!cf && gdsWanted > 0) throw Fail("GPUDirect Storage was asked for (CPPZARR_GDS=1), but "+w);
+        }
+        if(cf){
+            std::lock_guard<std::mutex> g(cx->m);
+            if(!cx->copyStream) ck(a, a->cuStreamCreate(&cx->copyStream, 1 /* CU_STREAM_NON_BLOCKING */), "cuStreamCreate");
+        }
+        stats.gds = cf ? (cf->nvfs ? 2 : 1) : 0;
         double partMB = 32, partMaxMB = 1024;
         if(const char* e = std::getenv("CPPZARR_GPU_PART_MB")) partMB = std::atof(e);
         if(const char* e = std::getenv("CPPZARR_GPU_PART_MAX_MB")) partMaxMB = std::atof(e);
@@ -1108,7 +1249,6 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
             const size_t c0 = part.first, nc = part.second-part.first;
             // runs of the part's chunks in each file (gaps up to 64 KiB read too), laid out in the
             // staging buffer; a chunk's at becomes its place there
-            struct Run { const std::string* path; uint64_t off, bytes, at; };
             std::vector<Run> runs;
             std::vector<size_t> runOf(nc);
             for(size_t i = 0; i < nc; i++){
@@ -1118,8 +1258,14 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
                 else runs.push_back({c.path, c.at, c.bytes, 0});
                 runOf[i] = runs.size()-1;
             }
+            // (cuFile reads whole 4 KiB blocks into 4 KiB-aligned places: a run's bytes start as far
+            // into their block as in the file)
             uint64_t stored = 0;
-            for(auto &r : runs){ r.at = stored; stored += al16(r.bytes); }
+            if(cf){
+                for(auto &r : runs){ stored = (stored+4095) & ~uint64_t(4095); r.at = stored+(r.off & 4095); stored = r.at+r.bytes; }
+                stored = al16(stored);
+            }
+            else for(auto &r : runs){ r.at = stored; stored += al16(r.bytes); }
             for(size_t i = 0; i < nc; i++){
                 Chunk &c = P.chunks[c0+i];
                 const Run &r = runs[runOf[i]];
@@ -1131,20 +1277,25 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
             // more reads going: single time points of 128^3 x 2 hypercubes (5 MB runs) read cold
             // from VAST up to 1.14 times as fast in 1 MiB pieces, but 4 processes reading 42 MB
             // runs at once were 1.36 times as slow in them
-            struct Piece { size_t run; uint64_t off, bytes; };
             std::vector<Piece> pieces;
             for(size_t i = 0; i < runs.size(); i++){
-                const uint64_t pieceBytes = runs[i].bytes < (8 << 20) ? (1 << 20) : (4 << 20);
-                for(uint64_t o = 0; o < runs[i].bytes; o += pieceBytes) pieces.push_back({i, o, std::min(pieceBytes, runs[i].bytes-o)});
+                // (with cuFile: from the run's first whole block to past its end)
+                const uint64_t from = cf ? runs[i].off & ~uint64_t(4095) : runs[i].off;
+                const uint64_t span = cf ? ((runs[i].off+runs[i].bytes+4095) & ~uint64_t(4095))-from : runs[i].bytes;
+                const uint64_t pieceBytes = span < (8 << 20) ? (1 << 20) : (4 << 20);
+                for(uint64_t o = 0; o < span; o += pieceBytes) pieces.push_back({i, o, std::min(pieceBytes, span-o)});
             }
             const double r0 = now();
-            err = pool().run((int64_t)pieces.size(), readers, [&](int64_t i){
-                const Piece &p = pieces[i];
-                const Run &r = runs[p.run];
-                File f;
-                if(!f.open(*r.path) || !f.readAt(r.off+p.off, slot.host+r.at+p.off, p.bytes))
-                    throw Fail("The file "+*r.path+" could not be read");
-            });
+            if(cf) readGds(a, cf, ctx, cx->copyStream, slot, runs, pieces, stored, readers);
+            else{
+                err = pool().run((int64_t)pieces.size(), readers, [&](int64_t i){
+                    const Piece &p = pieces[i];
+                    const Run &r = runs[p.run];
+                    File f;
+                    if(!f.open(*r.path) || !f.readAt(r.off+p.off, slot.host+r.at+p.off, p.bytes))
+                        throw Fail("The file "+*r.path+" could not be read");
+                });
+            }
             stats.read += now()-r0;
             if(!err.empty()) throw Fail(err);
 
@@ -1326,7 +1477,7 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
                     throw Fail("Not enough GPU memory for this read ("+std::to_string(need >> 20)+" MiB more needed, "+
                                std::to_string(freeB >> 20)+" MiB free): read fewer regions at a time");
             }
-            growDevice(a, slot.comp, slot.compBytes, total);
+            growComp(a, cf, slot, total, cf ? stored : 0, s);
             growDevice(a, slot.dec, slot.decBytes, std::max<uint64_t>(decTotal, 16));
             uint64_t nmax = 1;
             for(int k = 0; k < NCodecs; k++) nmax = std::max<uint64_t>(nmax, sin[k].size());
@@ -1338,7 +1489,8 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
             const CUdeviceptr checks = work+perCodec*NCodecs;
             if(prof) for(CUevent &e : q.ev) ck(a, a->cuEventCreate(&e, 0), "cuEventCreate");
             if(prof) a->cuEventRecord(q.ev[0], s);
-            ck(a, a->cuMemcpyHtoDAsync(comp, slot.host, total, s), "cuMemcpyHtoDAsync");
+            const uint64_t onGpu = cf ? stored : 0;
+            if(total > onGpu) ck(a, a->cuMemcpyHtoDAsync(comp+onGpu, slot.host+onGpu, total-onGpu, s), "cuMemcpyHtoDAsync");
             for(const auto &cpy : copies) ck(a, a->cuMemcpyDtoDAsync(dec+cpy.to, comp+cpy.from, cpy.bytes, s), "cuMemcpyDtoDAsync");
             if(prof) a->cuEventRecord(q.ev[1], s);
             ck(a, a->cuMemsetD8Async(checks, 0, 16*NCodecs, s), "cuMemsetD8Async");
@@ -1420,9 +1572,10 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
                 outBytes += n;
             }
             fprintf(stderr, "cppzarr GPU read: %zu regions, %zu chunks (%llu decoded on the host), %llu streams in %zu parts, %.1f MB "
-                    "read, %.1f MB out | find %.1f ms, then reading %.1f ms and setting up %.1f ms | on the GPU: copy %.1f, decompress "
+                    "read, %.1f MB out | find %.1f ms, then reading %.1f ms%s and setting up %.1f ms | on the GPU: copy %.1f, decompress "
                     "%.1f, place %.1f ms | done at %.1f ms\n", P.regions.size(), P.chunks.size(), (unsigned long long)stats.onHost,
                     (unsigned long long)stats.streams, stats.parts, stats.stored/1e6, outBytes/1e6, stats.find, stats.read,
+                    stats.gds == 2 ? " (GPUDirect Storage)" : stats.gds == 1 ? " (cuFile, compatibility mode)" : "",
                     stats.host-stats.read, stats.gpu[0], stats.gpu[1], stats.gpu[2], now());
         }
     }

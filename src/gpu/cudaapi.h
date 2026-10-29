@@ -55,6 +55,7 @@ struct Api {
     CUresult (*cuMemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
     CUresult (*cuMemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream);
     CUresult (*cuStreamSynchronize)(CUstream);
+    CUresult (*cuStreamCreate)(CUstream*, unsigned int);
     CUresult (*cuStreamWaitEvent)(CUstream, CUevent, unsigned int);
     CUresult (*cuEventCreate)(CUevent*, unsigned int);
     CUresult (*cuEventRecord)(CUevent, CUstream);
@@ -83,6 +84,35 @@ void setNvcompLibrary(const std::string &path);
 
 // A driver error's text
 std::string errorText(const Api* a, CUresult r);
+
+// GPUDirect Storage (cuFile, Linux), loaded when a GPU read first uses it: stored bytes read
+// straight into GPU memory where the system has GDS (the nvidia-fs driver and a file system it
+// supports, such as NFS over RDMA), without passing through host memory. Without nvidia-fs,
+// cuFile's compatibility mode reads through host memory.
+typedef void* CUfileHandle_t;
+struct CUfileError_t { int err; CUresult cu_err; };
+struct CUfileDescr_t { int type; union { int fd; void* handle; } handle; const void* fs_ops; };
+struct Cufile {
+    CUfileError_t (*driverOpen)();
+    CUfileError_t (*handleRegister)(CUfileHandle_t*, CUfileDescr_t*);
+    void (*handleDeregister)(CUfileHandle_t);
+    CUfileError_t (*bufRegister)(const void*, size_t, int);
+    CUfileError_t (*bufDeregister)(const void*);
+    long long (*read)(CUfileHandle_t, void*, size_t, long long, long long);   // (ssize_t, off_t, off_t)
+    bool nvfs = false;           // nvidia-fs is loaded: reads can go straight to GPU memory
+    std::string path;
+};
+
+// Whether nvidia-fs, GDS's kernel driver, is loaded (Linux)
+bool nvidiaFsLoaded();
+
+// The loaded cuFile (its driver opened), or nullptr with the reason in why. Loads once.
+const Cufile* cufile(std::string* why);
+
+// Where to load cuFile from (a libcufile file), before the first GPU read: bindings that know where
+// a pip-installed cuFile is (the nvidia-cufile-cu12 package) set it. Otherwise CPPZARR_CUFILE_LIBRARY,
+// then the system's library path.
+void setCufileLibrary(const std::string &path);
 
 }  // namespace czcuda
 #endif

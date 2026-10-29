@@ -476,6 +476,9 @@ PYBIND11_MODULE(cppzarr, m) {
 	m.def("pybind11_gpu_set_nvcomp", &gpuSetNvcompLibrary, pybind11::arg("path"),
 	      "Where to load nvCOMP from, before the first GPU read");
 
+	m.def("pybind11_gpu_set_cufile", &gpuSetCufileLibrary, pybind11::arg("path"),
+	      "Where to load cuFile (GPUDirect Storage) from, before the first GPU read");
+
 	m.def("pybind11_default_threads", &callThreads,
 	      "The threads a call uses by default from the calling thread (OMP_NUM_THREADS, or every CPU it may run on)");
 }
