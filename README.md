@@ -147,6 +147,12 @@ cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 regions = [('filename.zarr', [0, 0, 128*i], [128, 128, 128*(i+1)]) for i in range(8)]
 arrays = cppzarr.read_zarr_batch(regions, num_threads=8)
 cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_threads=8)
+
+# On network storage (NFS and the like), reads keep more reads of the storage in flight than
+# they have threads (Linux): once a thread finds its shard's chunks come from the server, it
+# asks for its next ones ahead, and in calls of up to 8 threads a pool of threads opens and
+# reads the next chunk files of arrays without shards. CPPZARR_READ_AHEAD_MB (4) sets how far
+# a thread reads ahead (0: not at all), CPPZARR_READS the most threads the pool uses (64).
 ````
 
 #### Read straight into GPU memory
