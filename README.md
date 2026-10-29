@@ -142,7 +142,8 @@ cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 
 # Or read a batch of regions at once (from one array or several), new arrays or into given ones:
 # the reads overlap and share num_threads threads (by default, as for a call, OMP_NUM_THREADS
-# or every CPU), each read getting more of them the larger it is
+# or every CPU), each read getting more of them the larger it is (a thread per 32M elements,
+# so that a batch of many reads runs many of them at once)
 regions = [('filename.zarr', [0, 0, 128*i], [128, 128, 128*(i+1)]) for i in range(8)]
 arrays = cppzarr.read_zarr_batch(regions, num_threads=8)
 cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_threads=8)

@@ -272,10 +272,20 @@ def _pool(threads_per_read):
         return pool
 
 
-# Elements a read's thread works on: reads of up to this many use one thread each, and
-# larger ones a thread per this many (an 8 MiB uint16 region with 64 chunks spent a third
-# of its time on a call's fixed costs at 12 threads; a 128 MiB one scaled to 16 threads)
-_ELEMENTS_PER_THREAD = 8 << 20
+# Elements a read's thread works on in a batch: reads of up to this many use one thread each,
+# and larger ones a thread per this many, so that a batch of many reads runs more of them at
+# once, each with fewer threads (a read's own fixed costs, its files' opening and the wait for
+# its first bytes, then overlap with the other reads'): cold batches of 32 and 128 Cell
+# Observatory hypercubes (64M uint16 elements) read from VAST on 16 cores 2.0-2.2 times as fast
+# with 2 threads a read (8 reads at once) as with 8 (2 at once), as fast as with 64 threads, in
+# less CPU time
+_ELEMENTS_PER_THREAD = 32 << 20
+
+# Reads of more than one thread each run at most half of a batch at once (but two), so that the
+# batch takes at least two rounds of them: in one, it waits for its slowest read (8 hypercubes from
+# the page cache took 1.13 times as long with all 8 at once). Smaller reads, whose time goes more to
+# waiting for the storage, all run at once as the threads allow.
+_LEAST_ROUNDS = 2
 
 
 def _region_elements(file_name, start_coords, end_coords):
@@ -303,8 +313,9 @@ def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=Fal
     # order of the requests.
     # num_threads: the threads the batch uses (by default, as for read_zarr,
     # OMP_NUM_THREADS, or every CPU this process may run on). Each read gets a thread per
-    # 8M elements it reads (at least one, at most all of them), and as many reads as the
-    # threads allow run at once.
+    # 32M elements it reads (at least one, at most all of them), and as many reads as the
+    # threads allow run at once (with fewer reads than that, the threads are shared out
+    # among them).
     # Into GPU memory (every out a CuPy array, a PyTorch tensor on a CUDA device, or an array
     # with __cuda_array_interface__, all on one GPU): the chunks' stored bytes are read on the
     # host (the files with at least 32 threads at once, since reading mostly waits on the
@@ -334,6 +345,8 @@ def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=Fal
     sizes = sorted(_region_elements(r[0], r[1], r[2]) for r in requests)
     per_read = min(total, max(1, round(sizes[len(sizes) // 2] / _ELEMENTS_PER_THREAD)))
     at_once = max(1, min(len(requests), round(total / per_read)))
+    if per_read > 1 and _LEAST_ROUNDS > 1:
+        at_once = min(at_once, max(2, -(-len(requests) // _LEAST_ROUNDS)))
     # (the threads split as evenly as they go: some reads may get one more)
     threads = [total // at_once + (i < total % at_once) for i in range(at_once)]
     results = [None] * len(requests)
