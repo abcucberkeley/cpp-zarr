@@ -1319,11 +1319,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // thread and 1.3-1.6 at 8 (256^3: 1.4-1.8 at 1), and with the files in the page cache 1.2-1.8
     // times less (the pool's opens of them, each asking the server, overlap).
     int readThreads = 0;
+    #ifdef __linux__
     static const uint64_t readAheadBytes = [](){
         const char* e = std::getenv("CPPZARR_READ_AHEAD_MB");
         return (uint64_t)std::max(0.0, (e && *e ? std::atof(e) : 4.0)*(1 << 20));
     }();
-    #ifdef __linux__
     if(!Zarr.get_shard() && numWorkers <= 8 && nItems >= 8*(int64_t)numWorkers && readAheadBytes > 0){
         static const int wanted = [](){
             const char* e = std::getenv("CPPZARR_READS");

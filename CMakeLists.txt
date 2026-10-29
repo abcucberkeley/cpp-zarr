@@ -116,6 +116,22 @@ FetchContent_Declare(zlib
 
 FetchContent_MakeAvailable(cblosc cblosc2 nlohmann_json)
 
+# c-blosc compiles its own pthreads into blosc.c for every Windows build (win32/pthread.c), under
+# pthread_create's and pthread_cond_*'s own names. Linked into the library together with MinGW's C++
+# runtime (and --allow-multiple-definition, below), those took the place of winpthreads' for the
+# runtime too: its threads, condition variables and thread-safe statics then went to blosc's, which
+# do not know winpthreads' types, and the first static with a run-time initializer crashed every
+# read. Renamed, blosc keeps its own and the runtime gets winpthreads'.
+if(WIN32)
+    target_compile_definitions(blosc_static PRIVATE
+        pthread_create=blosc_win32_pthread_create
+        pthread_cond_init=blosc_win32_pthread_cond_init
+        pthread_cond_destroy=blosc_win32_pthread_cond_destroy
+        pthread_cond_wait=blosc_win32_pthread_cond_wait
+        pthread_cond_signal=blosc_win32_pthread_cond_signal
+        pthread_cond_broadcast=blosc_win32_pthread_cond_broadcast)
+endif()
+
 # c-blosc/c-blosc2 build their own bundled zlib/zlib-ng as CMake targets named
 # "zlib"/"zlibstatic", so stock zlib cannot be allowed to create those same
 # targets. Populate zlib's sources only and compile them into a uniquely-named
