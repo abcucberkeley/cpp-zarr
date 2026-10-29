@@ -935,8 +935,9 @@ void readGds(const Api* a, const Cufile* cf, CUcontext ctx, CUstream copyStream,
         }
     } files{a, ctx, cf, std::vector<int>(paths.size(), -1), std::vector<CUfileHandle_t>(paths.size(), nullptr)};
     std::string err = pool().run((int64_t)paths.size(), readers, [&](int64_t i){
-    #ifdef _WIN32
-        throw Fail("GPUDirect Storage is not available on Windows");
+    #ifndef __linux__
+        (void)i;
+        throw Fail("GPUDirect Storage is only available on Linux");
     #else
         files.fds[i] = ::open(paths[i]->c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         if(files.fds[i] < 0) throw Fail("The file "+*paths[i]+" could not be opened");
