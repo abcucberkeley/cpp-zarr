@@ -24,7 +24,7 @@
 // this many MB of stored bytes, 32 by default, so that reading the next part overlaps the GPU's
 // work on the one before); CPPZARR_GPU_READS (the files are read with at least this many threads
 // at once, 32 by default: reading mostly waits on the storage); CPPZARR_GPU_PART_MAX_MB (bigger
-// reads go in parts of at most this many MB, 1024 by default, so that a read's own GPU buffers stay
+// reads go in parts of at most this many MB, 256 by default, so that a read's own GPU buffers stay
 // small next to its outputs).
 //
 // GPUDirect Storage (Linux): where its nvidia-fs driver is loaded, the stored bytes are read with

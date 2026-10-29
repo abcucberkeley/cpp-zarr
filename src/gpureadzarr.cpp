@@ -1194,8 +1194,11 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
         // reading overlaps its GPU work, and its GPU buffers hold a part of it, not all of it. (Each
         // part costs the GPU about 1.5 ms more on a TITAN V, nvCOMP's own: 10 parts of a 4x128 MiB
         // read took longer than 4, and a 10x8 MiB read was faster in one.) Bigger reads are split
-        // into parts of at most CPPZARR_GPU_PART_MAX_MB (1024) MB, so that the buffers of the two
-        // parts in flight stay small next to the outputs, however much a call reads.
+        // into parts of at most CPPZARR_GPU_PART_MAX_MB (256) MB, so that the buffers of the parts in
+        // flight stay small next to the outputs, however much a call reads: batches of 128
+        // hypercubes of 128 MiB, two calls at once on a B200, read as fast in 256 MB parts as in
+        // 1024 MB ones with half the GPU memory (51 GiB against 102), and batches of 512 ran out of
+        // memory in 1024 MB parts.
         // GPUDirect Storage: each part's stored bytes read with cuFile straight into its GPU buffer
         // (then copied to the host, where its chunks are set up as for other reads) where nvidia-fs
         // is loaded, or wherever CPPZARR_GDS=1 asks for it (without nvidia-fs cuFile reads through
@@ -1216,7 +1219,7 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
             if(!cx->copyStream) ck(a, a->cuStreamCreate(&cx->copyStream, 1 /* CU_STREAM_NON_BLOCKING */), "cuStreamCreate");
         }
         stats.gds = cf ? (cf->nvfs ? 2 : 1) : 0;
-        double partMB = 32, partMaxMB = 1024;
+        double partMB = 32, partMaxMB = 256;
         if(const char* e = std::getenv("CPPZARR_GPU_PART_MB")) partMB = std::atof(e);
         if(const char* e = std::getenv("CPPZARR_GPU_PART_MAX_MB")) partMaxMB = std::atof(e);
         const uint64_t partBytes = std::max<uint64_t>({1, (uint64_t)(partMB*1e6),
