@@ -23,7 +23,9 @@
 // time went to stderr); CPPZARR_GPU_PART_MB (a read goes to the GPU in up to 4 parts of at least
 // this many MB of stored bytes, 32 by default, so that reading the next part overlaps the GPU's
 // work on the one before); CPPZARR_GPU_READS (the files are read with at least this many threads
-// at once, 32 by default: reading mostly waits on the storage).
+// at once, 32 by default: reading mostly waits on the storage); CPPZARR_GPU_PART_MAX_MB (bigger
+// reads go in parts of at most this many MB, 1024 by default, so that a read's own GPU buffers stay
+// small next to its outputs).
 
 // Whether GPU reads can run here; if not, why (no NVIDIA driver, no nvCOMP, ...)
 bool gpuReadAvailable(std::string &why);

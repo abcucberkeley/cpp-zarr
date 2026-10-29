@@ -862,7 +862,7 @@ struct Pending {
 struct ReadStats {
     uint64_t stored = 0, onHost = 0, streams = 0;
     size_t parts = 0;
-    double find = 0, host = 0;
+    double find = 0, host = 0, read = 0;
     float gpu[3] = {0, 0, 0};
 };
 
@@ -1072,10 +1072,14 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
         // and set up on the host while the GPU decompresses and places the one before it: a call's
         // reading overlaps its GPU work, and its GPU buffers hold a part of it, not all of it. (Each
         // part costs the GPU about 1.5 ms more on a TITAN V, nvCOMP's own: 10 parts of a 4x128 MiB
-        // read took longer than 4, and a 10x8 MiB read was faster in one.)
-        double partMB = 32;
+        // read took longer than 4, and a 10x8 MiB read was faster in one.) Bigger reads are split
+        // into parts of at most CPPZARR_GPU_PART_MAX_MB (1024) MB, so that the buffers of the two
+        // parts in flight stay small next to the outputs, however much a call reads.
+        double partMB = 32, partMaxMB = 1024;
         if(const char* e = std::getenv("CPPZARR_GPU_PART_MB")) partMB = std::atof(e);
-        const uint64_t partBytes = std::max<uint64_t>({1, (uint64_t)(partMB*1e6), (stats.stored+3)/4});
+        if(const char* e = std::getenv("CPPZARR_GPU_PART_MAX_MB")) partMaxMB = std::atof(e);
+        const uint64_t partBytes = std::max<uint64_t>({1, (uint64_t)(partMB*1e6),
+                                                       std::min<uint64_t>((stats.stored+3)/4, (uint64_t)(partMaxMB*1e6))});
         std::vector<std::pair<size_t, size_t>> parts;
         {
             size_t c0 = 0;
@@ -1133,6 +1137,7 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
                 const uint64_t pieceBytes = runs[i].bytes < (8 << 20) ? (1 << 20) : (4 << 20);
                 for(uint64_t o = 0; o < runs[i].bytes; o += pieceBytes) pieces.push_back({i, o, std::min(pieceBytes, runs[i].bytes-o)});
             }
+            const double r0 = now();
             err = pool().run((int64_t)pieces.size(), readers, [&](int64_t i){
                 const Piece &p = pieces[i];
                 const Run &r = runs[p.run];
@@ -1140,6 +1145,7 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
                 if(!f.open(*r.path) || !f.readAt(r.off+p.off, slot.host+r.at+p.off, p.bytes))
                     throw Fail("The file "+*r.path+" could not be read");
             });
+            stats.read += now()-r0;
             if(!err.empty()) throw Fail(err);
 
             // the chunks' blocks and streams (their chunk: the chunk's index in the part); chunks
@@ -1414,10 +1420,10 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
                 outBytes += n;
             }
             fprintf(stderr, "cppzarr GPU read: %zu regions, %zu chunks (%llu decoded on the host), %llu streams in %zu parts, %.1f MB "
-                    "read, %.1f MB out | find %.1f ms, then reading and setting up %.1f ms | on the GPU: copy %.1f, decompress %.1f, "
-                    "place %.1f ms | done at %.1f ms\n", P.regions.size(), P.chunks.size(), (unsigned long long)stats.onHost,
-                    (unsigned long long)stats.streams, stats.parts, stats.stored/1e6, outBytes/1e6, stats.find, stats.host,
-                    stats.gpu[0], stats.gpu[1], stats.gpu[2], now());
+                    "read, %.1f MB out | find %.1f ms, then reading %.1f ms and setting up %.1f ms | on the GPU: copy %.1f, decompress "
+                    "%.1f, place %.1f ms | done at %.1f ms\n", P.regions.size(), P.chunks.size(), (unsigned long long)stats.onHost,
+                    (unsigned long long)stats.streams, stats.parts, stats.stored/1e6, outBytes/1e6, stats.find, stats.read,
+                    stats.host-stats.read, stats.gpu[0], stats.gpu[1], stats.gpu[2], now());
         }
     }
     catch(const std::exception &e){
