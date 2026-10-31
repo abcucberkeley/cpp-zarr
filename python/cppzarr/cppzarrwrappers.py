@@ -288,6 +288,25 @@ _ELEMENTS_PER_THREAD = 32 << 20
 _LEAST_ROUNDS = 2
 
 
+def _read_ahead_threads():
+    # CPPZARR_READ_AHEAD_THREADS, as the library reads it (64 when unset)
+    v = os.environ.get('CPPZARR_READ_AHEAD_THREADS')
+    if not v:
+        return 64
+    try:
+        return max(0, int(v))
+    except ValueError:
+        return 0
+
+
+# Batches of more threads than this split as 1.7.3's did: a thread per 8M elements, as many reads at
+# once as the threads allow. Their reads do not read ahead (the library's reads do not while the
+# process's reads have more threads than CPPZARR_READ_AHEAD_THREADS), and without it hypercubes read
+# 2 threads at a time with a B200 node's 128 cores took 1.4 times as long as 8 at a time.
+_READ_AHEAD_THREADS = _read_ahead_threads()
+_ELEMENTS_PER_THREAD_MANY = 8 << 20
+
+
 def _region_elements(file_name, start_coords, end_coords):
     # The number of elements a request reads (for the whole array, from its metadata)
     if start_coords is not None and end_coords is not None and any(end_coords):
@@ -313,9 +332,9 @@ def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=Fal
     # order of the requests.
     # num_threads: the threads the batch uses (by default, as for read_zarr,
     # OMP_NUM_THREADS, or every CPU this process may run on). Each read gets a thread per
-    # 32M elements it reads (at least one, at most all of them), and as many reads as the
-    # threads allow run at once (with fewer reads than that, the threads are shared out
-    # among them).
+    # 32M elements it reads (at least one, at most all of them; with more threads than
+    # CPPZARR_READ_AHEAD_THREADS, 64, a thread per 8M), and as many reads as the threads
+    # allow run at once (with fewer reads than that, the threads are shared out among them).
     # Into GPU memory (every out a CuPy array, a PyTorch tensor on a CUDA device, or an array
     # with __cuda_array_interface__, all on one GPU): the chunks' stored bytes are read on the
     # host (the files with at least 32 threads at once, since reading mostly waits on the
@@ -343,10 +362,17 @@ def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=Fal
         return [r[3] for r in requests]
     total = _threads(num_threads) or pybind11_default_threads()
     sizes = sorted(_region_elements(r[0], r[1], r[2]) for r in requests)
-    per_read = min(total, max(1, round(sizes[len(sizes) // 2] / _ELEMENTS_PER_THREAD)))
+    many = total > _READ_AHEAD_THREADS
+    per_read = min(total, max(1, round(sizes[len(sizes) // 2] / (_ELEMENTS_PER_THREAD_MANY if many else _ELEMENTS_PER_THREAD))))
     at_once = max(1, min(len(requests), round(total / per_read)))
-    if per_read > 1 and _LEAST_ROUNDS > 1:
+    if per_read > 1 and _LEAST_ROUNDS > 1 and not many:
         at_once = min(at_once, max(2, -(-len(requests) // _LEAST_ROUNDS)))
+    # (reads of more than one thread each share the threads evenly, or run one at a time: 4
+    # hypercubes read 3 and 2 threads a read, two at a time, took 1.2 times as long with 5 threads as
+    # one at a time, from the page cache, VAST and two other NFS servers; the read with fewer threads
+    # ends the batch)
+    while per_read > 1 and at_once > 1 and total % at_once and not many:
+        at_once -= 1
     # (the threads split as evenly as they go: some reads may get one more)
     threads = [total // at_once + (i < total % at_once) for i in range(at_once)]
     results = [None] * len(requests)

@@ -218,6 +218,24 @@ bool networkFs(const dev_t dev){
     return net;
 }
 
+// The threads in the process's reads now, all calls' (see the main reads' reading ahead)
+std::atomic<int64_t> activeReadThreads{0};
+
+// The most threads the process's reads may have at once for them to read ahead
+// (CPPZARR_READ_AHEAD_THREADS, 64: see the main reads)
+int64_t readAheadThreads(){
+    static const int64_t most = [](){
+        const char* e = std::getenv("CPPZARR_READ_AHEAD_THREADS");
+        return (int64_t)(e && *e ? std::max(0, std::atoi(e)) : 64);
+    }();
+    return most;
+}
+
+// Whether the process's reads have few enough threads now to read ahead
+bool fewReadThreads(){
+    return activeReadThreads.load(std::memory_order_relaxed) <= readAheadThreads();
+}
+
 // Whether the array in folder is on network storage (found once per folder: a stat of it can
 // ask an NFS server)
 bool arrayOnNetwork(const std::string &folder){
@@ -854,13 +872,17 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         }
     };
     // A thread's chunks of its shard from item it on in its block (it included: the chunk it reads
-    // next comes first), until their stored bytes reach aheadBudget, asked to be read ahead, neighbors
+    // next comes first), until their stored bytes reach its budget, asked to be read ahead, neighbors
     // less than 256 KB apart together (as readAheadShard asks for a shard's); asked for again once
     // less than half of that is left, so that the server gets reads of several chunks, not one at a
     // time
     auto aheadInShard = [&](ShardState &ss, const int w, const int64_t it, const std::vector<uint64_t> &cAV){
     #ifdef __linux__
-        if(w < 0 || !aheadWork) return;
+        // (none while the process's reads have many threads, and half as far while they have more
+        // than 16: see the main reads)
+        const int64_t active = activeReadThreads.load(std::memory_order_relaxed);
+        if(w < 0 || !aheadWork || active > readAheadThreads()) return;
+        const uint64_t budget = active > 16 ? aheadBudget/2 : aheadBudget;
         // (after a jump to chunks taken from another thread, from there; chunks other threads took
         // from this one are no longer waited for)
         const int64_t end = aheadWork->ownEnd(w);
@@ -873,13 +895,13 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         while(!ss.asked.empty() && ss.asked.back().first >= end) ss.asked.pop_back();
         uint64_t pending = 0;
         for(const auto &a : ss.asked) pending += a.second;
-        if(!ss.asked.empty() && pending > aheadBudget/2) return;
+        if(!ss.asked.empty() && pending > budget/2) return;
         const bool fresh = ss.asked.empty();
         if(ss.aheadNext < it) ss.aheadNext = it;
         uint64_t o = 0;
         for(uint64_t d = 0; d < nDims; d++) o += (cAV[d]/innerCount[d]-outerFirst[d])*outerStride[d];
         std::vector<std::pair<uint64_t, uint64_t>> ranges;
-        while(pending < aheadBudget && ss.aheadNext < end){
+        while(pending < budget && ss.aheadNext < end){
             const std::vector<uint64_t> next = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(items[ss.aheadNext]));
             uint64_t on = 0;
             for(uint64_t d = 0; d < nDims; d++) on += (next[d]/innerCount[d]-outerFirst[d])*outerStride[d];
@@ -991,8 +1013,13 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     const char* e = std::getenv("CPPZARR_READ_COLD");
                     return e && *e == '1';
                 }();
-                if(aheadWork) ss.cold = allCold || indexTook > 300e-6+indexBytes/2e9;
-                else if(shardOpened) readAheadShard(ss.file, ss.index, cAV, indexTook, indexBytes);
+                // (while the process's reads have many threads, as without reading a thread's chunks
+                // ahead: see the main reads)
+                #ifdef __linux__
+                if(aheadWork && fewReadThreads()) ss.cold = allCold || indexTook > 300e-6+indexBytes/2e9;
+                else
+                #endif
+                if(shardOpened) readAheadShard(ss.file, ss.index, cAV, allCold ? 1.0 : indexTook, indexBytes);
             }
             if(ss.cold) aheadInShard(ss, w, it, cAV);
             const uint64_t pos = Zarr.get_chunkShardPosition(cAV);
@@ -1015,11 +1042,14 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 ss.firstReadTimed = true;
                 const double took = std::chrono::duration<double>(std::chrono::steady_clock::now()-readStart).count();
                 if(took > 300e-6+nbytes/2e9){
-                    if(aheadWork){
+                    #ifdef __linux__
+                    if(aheadWork && fewReadThreads()){
                         ss.cold = true;
                         aheadInShard(ss, w, it, cAV);
                     }
-                    else if(disk() == 0) readAheadShard(ss.file, ss.index, cAV, 1.0, 0);
+                    else
+                    #endif
+                    if(fewThreads && disk() == 0) readAheadShard(ss.file, ss.index, cAV, 1.0, 0);
                 }
             }
         }
@@ -1309,12 +1339,22 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // Reading ahead on network storage. A thread reads one chunk at a time, and there its reads
     // mostly wait for the server (the kernel itself reads ahead 128 KB a file), so a call keeps
     // about as many reads in flight as it has threads. Both ways below read ahead up to
-    // CPPZARR_READ_AHEAD_MB (4) MB a thread (0: neither reads ahead): of a shard's stored bytes,
-    // or of chunk files, counted at their chunks' size.
-    // - Shards (see aheadInShard): once a thread finds its shard's bytes come from the server (its
-    //   index read, or its first read of the shard's chunks, took long), it asks the kernel to read
-    //   its next chunks of the shard ahead, and reads and decodes them one at a time as before.
-    //   (This takes the place of the read-ahead of whole shards in calls of up to 5 threads.)
+    // CPPZARR_READ_AHEAD_MB (4) MB a thread (0: neither reads ahead; shards half as far while the
+    // process's reads have more than 16 threads, see below): of a shard's stored bytes, or of chunk
+    // files, counted at their chunks' size.
+    // - Shards, in calls of 2 to 5 threads (see aheadInShard): once a thread finds its shard's
+    //   bytes come from the server (its index read, or its first read of the shard's chunks, took
+    //   long), it asks the kernel to read its next chunks of the shard ahead, and reads and decodes
+    //   them one at a time as before. This takes the place of the read-ahead of whole shards there,
+    //   but for inner chunks of 1 MiB or more: there a thread's few chunks in flight kept fewer reads
+    //   going than the whole shard's, and cold regions of shards of 4 MiB inner chunks read from
+    //   three NFS servers with 1-4 threads took 1.14-1.41 times as long. (A call of one thread,
+    //   whose next chunks are its region's part of the shard, still asks for that whole part: a
+    //   6x64x140x400x2 region read with one thread, its shards' indexes cached and their chunks not,
+    //   took 1.06-1.16 times as long from VAST and two other NFS servers asking a thread's 4 MB at a
+    //   time. Calls of more threads keep enough reads going: a hypercube read cold from two other
+    //   NFS servers with 6-8 threads took 1.04-1.08 times as long reading ahead, and from VAST as
+    //   long.)
     // - Chunk files (unsharded arrays, in calls of up to 8 threads with at least 8 chunks a thread,
     //   see readFilesAhead): the read pool opens and reads a thread's next files, in
     //   pieces of up to CPPZARR_READ_PIECE_MB (1) MB, while the thread decodes the ones before:
@@ -1328,20 +1368,39 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // chunks of 64^3 (files) from VAST and two other NFS servers took 1.9-3.1 times less time at 1
     // thread and 1.3-1.6 at 8 (256^3: 1.4-1.8 at 1), and with the files in the page cache 1.2-1.8
     // times less (the pool's opens of them, each asking the server, overlap).
+    // Neither reads ahead while the process's reads (this one's and others' at the same time) have
+    // more than CPPZARR_READ_AHEAD_THREADS (64) threads: then a thread that finds its shard cold
+    // reads it as without this (see readAheadShard), and threads already reading ahead stop asking
+    // (read_zarr_batch then also splits a batch as 1.7.3 did, into reads of more threads each). One
+    // process reading those hypercubes from VAST in batches of 32 (16 reads at once) with a B200
+    // node's cores, reading ahead, read them 2.0-2.8 times as fast as 1.7.3's reads with 32-48
+    // threads and 1.45 times with 64, but 0.57-0.85 times as fast with 72-128; with every core of
+    // 24- and 48-core nodes 1.7-2.6 times as fast. And shards are read ahead half as far while the
+    // process's reads have more than 16 threads: two processes of 64 threads on a B200 node read
+    // them in batches of 32 0.85 times as fast as without reading ahead (0.76-1.13 times, run to
+    // run) and 1.18 times with half as far, where one process of 16 threads read them 3.4-4.0 times
+    // as fast as 1.7.3's reads, and 3.2-3.6 with half as far.
     int readThreads = 0;
     #ifdef __linux__
+    // (this call's threads counted among the process's reads' while it reads)
+    struct ActiveReads {
+        const int64_t n;
+        explicit ActiveReads(const int64_t k) : n(k) { activeReadThreads.fetch_add(n); }
+        ~ActiveReads(){ activeReadThreads.fetch_sub(n); }
+    } activeReads(numWorkers);
     static const uint64_t readAheadBytes = [](){
         const char* e = std::getenv("CPPZARR_READ_AHEAD_MB");
         return (uint64_t)std::max(0.0, (e && *e ? std::atof(e) : 4.0)*(1 << 20));
     }();
-    if(!Zarr.get_shard() && numWorkers <= 8 && nItems >= 8*(int64_t)numWorkers && readAheadBytes > 0){
+    if(!Zarr.get_shard() && numWorkers <= 8 && nItems >= 8*(int64_t)numWorkers && readAheadBytes > 0 && fewReadThreads()){
         static const int wanted = [](){
             const char* e = std::getenv("CPPZARR_READS");
             return e && *e ? std::max(0, std::atoi(e)) : 64;
         }();
         if(wanted > 0 && arrayOnNetwork(Zarr.get_fileName())) readThreads = wanted;
     }
-    if(shardOpened && readAheadBytes > 0 && arrayOnNetwork(Zarr.get_fileName())) aheadBudget = readAheadBytes;
+    if(fewThreads && numWorkers >= 2 && sB < (1 << 20) && readAheadBytes > 0 && arrayOnNetwork(Zarr.get_fileName()))
+        aheadBudget = readAheadBytes;
     #endif
     auto readFilesAhead = [&](const int32_t team, WorkRanges &work){
     #ifdef __linux__

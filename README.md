@@ -144,16 +144,20 @@ cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 # Or read a batch of regions at once (from one array or several), new arrays or into given ones:
 # the reads overlap and share num_threads threads (by default, as for a call, OMP_NUM_THREADS
 # or every CPU), each read getting more of them the larger it is (a thread per 32M elements,
-# so that a batch of many reads runs many of them at once)
+# so that a batch of many reads runs many of them at once; with more than
+# CPPZARR_READ_AHEAD_THREADS threads, see below, a thread per 8M)
 regions = [('filename.zarr', [0, 0, 128*i], [128, 128, 128*(i+1)]) for i in range(8)]
 arrays = cppzarr.read_zarr_batch(regions, num_threads=8)
 cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_threads=8)
 
 # On network storage (NFS and the like), reads keep more reads of the storage in flight than
-# they have threads (Linux): once a thread finds its shard's chunks come from the server, it
-# asks for its next ones ahead, and in calls of up to 8 threads a pool of threads opens and
-# reads the next chunk files of arrays without shards. CPPZARR_READ_AHEAD_MB (4) sets how far
-# a thread reads ahead (0: not at all), CPPZARR_READS the most threads the pool uses (64).
+# they have threads (Linux): in calls of 2 to 5 threads, once a thread finds its shard's
+# chunks come from the server, it asks for its next ones ahead, and in calls of up to 8 threads
+# a pool of threads opens and reads the next chunk files of arrays without shards.
+# CPPZARR_READ_AHEAD_MB (4) sets how far a thread reads ahead (0: not at all; in shards half as
+# far while the process's reads have more than 16 threads), CPPZARR_READS the most threads the
+# pool uses (64). Neither reads ahead while the process's reads have more than
+# CPPZARR_READ_AHEAD_THREADS (64) threads in all, where reading ahead slowed reads down.
 ````
 
 #### Read straight into GPU memory

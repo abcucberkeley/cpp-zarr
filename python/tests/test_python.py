@@ -518,6 +518,24 @@ def main():
     for k, threads in ((10, 4), (5, 4), (7, 3)):
         got = cppzarr.read_zarr_batch(requests[:k], num_threads=threads)
         good = good and len(got) == k and all(np.array_equal(g, x) for g, x in zip(got, expected[:k]))
+    # batches of more threads than CPPZARR_READ_AHEAD_THREADS (split as 1.7.3's, a thread per 8M
+    # elements: here 3 reads of 32 threads) and of as many: the same values; the setting read as
+    # the library reads it
+    from cppzarr import cppzarrwrappers as wrappers
+    many = os.path.join(tmp, "many.zarr")
+    dm = values_like(rng, np.zeros((256, 256, 256), np.uint8))
+    cppzarr.write_zarr(many, dm, chunks=[64, 64, 64], zarr_format=3, shards=[128, 128, 128])
+    for threads in (wrappers._READ_AHEAD_THREADS, wrappers._READ_AHEAD_THREADS + 32):
+        got = cppzarr.read_zarr_batch([(many, None, None)] * 3, num_threads=threads)
+        good = good and all(np.array_equal(g, dm) for g in got)
+    saved = os.environ.get('CPPZARR_READ_AHEAD_THREADS')
+    for v, n in (('', 64), ('12', 12), ('-3', 0), ('x', 0)):
+        os.environ['CPPZARR_READ_AHEAD_THREADS'] = v
+        good = good and wrappers._read_ahead_threads() == n
+    if saved is None:
+        del os.environ['CPPZARR_READ_AHEAD_THREADS']
+    else:
+        os.environ['CPPZARR_READ_AHEAD_THREADS'] = saved
     # a read that fails, in an earlier round or in the last one: the batch raises its error
     missing = (os.path.join(tmp, "missing.zarr"), [0, 0, 0], [30, 25, 20])
     for batch in (requests[:3] + [missing] + requests[3:10], requests[:9] + [missing]):
