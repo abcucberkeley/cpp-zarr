@@ -161,11 +161,11 @@ target_include_directories(zlibstaticCPPZARR PUBLIC ${zlib_SOURCE_DIR} ${ZLIB_GE
 
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-# (GPU reads: the CUDA driver and nvCOMP are loaded at run time, so they need nothing to build)
+# (GPU reads and writes: the CUDA driver and nvCOMP are loaded at run time, so they need nothing to build)
 add_library(cppZarr_shared SHARED ${SRC_DIR}/zarr.cpp ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/parallelreadzarr.cpp ${SRC_DIR}/parallelwritezarr.cpp
-            ${SRC_DIR}/gpureadzarr.cpp ${SRC_DIR}/gpu/cudaapi.cpp)
+            ${SRC_DIR}/gpureadzarr.cpp ${SRC_DIR}/gpuwritezarr.cpp ${SRC_DIR}/gpu/cudaapi.cpp ${SRC_DIR}/gpu/gpucommon.cpp)
 set_target_properties(cppZarr_shared PROPERTIES OUTPUT_NAME cppZarr)
-set_target_properties(cppZarr_shared PROPERTIES PUBLIC_HEADER "${SRC_DIR}/zarr.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/parallelreadzarr.h;${SRC_DIR}/parallelwritezarr.h;${SRC_DIR}/gpureadzarr.h")
+set_target_properties(cppZarr_shared PROPERTIES PUBLIC_HEADER "${SRC_DIR}/zarr.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/parallelreadzarr.h;${SRC_DIR}/parallelwritezarr.h;${SRC_DIR}/gpureadzarr.h;${SRC_DIR}/gpuwritezarr.h")
 
 if(UNIX)
     add_dependencies(cppZarr_shared uuid_external)
@@ -252,4 +252,11 @@ if(CPPZARR_BUILD_TESTS)
     target_compile_definitions(gpuTest PRIVATE CPPZARR_TEST_ARRAYS="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_arrays")
     target_link_libraries(gpuTest PRIVATE cppZarr_shared OpenMP::OpenMP_CXX)
     add_test(NAME gpu COMMAND gpuTest ${CMAKE_CURRENT_BINARY_DIR})
+    # GPU writes against CPU writes (skipped without an NVIDIA GPU, driver and nvCOMP)
+    add_executable(gpuWriteTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpuwritetest.cpp)
+    set_target_properties(gpuWriteTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(gpuWriteTest PRIVATE ${SRC_DIR} ${nlohmann_json_SOURCE_DIR}/include)
+    target_compile_definitions(gpuWriteTest PRIVATE CPPZARR_TEST_ARRAYS="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_arrays")
+    target_link_libraries(gpuWriteTest PRIVATE cppZarr_shared OpenMP::OpenMP_CXX)
+    add_test(NAME gpuwrite COMMAND gpuWriteTest ${CMAKE_CURRENT_BINARY_DIR})
 endif()

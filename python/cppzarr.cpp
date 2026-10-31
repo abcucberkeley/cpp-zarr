@@ -11,6 +11,7 @@
 #include "parallelwritezarr.h"
 #include "helperfunctions.h"
 #include "gpureadzarr.h"
+#include "gpuwritezarr.h"
 
 // The NumPy dtype for an array's data type: bfloat16 is ml_dtypes' type, the others
 // NumPy's own
@@ -214,17 +215,12 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
     return createArray(data, dims, cOrder, dt);
 }
 
-void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
-                         const std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &cname = "zstd",
-                         const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> &chunks = std::vector<uint64_t>{256, 256, 256},
-                         const std::string &dimension_separator = ".", const bool crop = false, const uint64_t zarr_format = 2,
-                         const std::vector<uint64_t> &shards = std::vector<uint64_t>{}, const int64_t numThreads = 0){
-    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
-    const CallThreads threads(numThreads);
-
-    zarr Zarr;
+// A new write's array settings: format first (it sets the Zarr v3 defaults for order and
+// dimension_separator), then the compressor, order, chunk file names and chunks or shards
+static void configureWrite(zarr &Zarr, const std::string &fileName, const std::string &cname, const uint64_t clevel,
+                           const std::string &order, const std::vector<uint64_t> &chunks, const std::string &dimension_separator,
+                           const uint64_t zarr_format, const std::vector<uint64_t> &shards) {
     Zarr.set_fileName(fileName);
-    // (first: it sets the Zarr v3 defaults for order and dimension_separator)
     try {
         Zarr.set_zarr_format(zarr_format);
     }
@@ -242,6 +238,50 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
         Zarr.set_shard(true);
         Zarr.set_chunk_shape(chunks);
     }
+}
+
+// Once the data type is set: the shape, then the new metadata (.zarray or zarr.json) written,
+// unless the write goes into an existing array (crop), whose metadata is read instead and whose
+// data type the data must have; then the array set up for the region. (The GIL is released for
+// the file system work.)
+static void startWrite(zarr &Zarr, const std::string &fileName, const std::string &arrayDtype, const std::vector<uint64_t> &startCoords,
+                       const std::vector<uint64_t> &endCoords, const bool crop) {
+    Zarr.set_shape(endCoords);
+    if(!crop || !(fileExists(fileName+"/.zarray") || fileExists(fileName+"/zarr.json"))){
+        pybind11::gil_scoped_release release;
+        writeZarray(Zarr);
+    }
+    else{
+        {
+            pybind11::gil_scoped_release release;
+            Zarr = openZarr(fileName);
+        }
+        if (Zarr.get_ndims() != endCoords.size()) {
+            throw std::runtime_error("The coordinates have " + std::to_string(endCoords.size()) +
+                                     " values but the existing array has " + std::to_string(Zarr.get_ndims()) + " dimensions");
+        }
+        // The chunks are written with the data's element type, so it has to be the
+        // array's (write_zarr converts the data to it)
+        const DtypeInfo want = dtypeInfo(Zarr.get_dtype()), have = dtypeInfo(arrayDtype);
+        if (want.kind != have.kind || want.bytes != have.bytes || want.bfloat16 != have.bfloat16) {
+            throw std::runtime_error("The data's type (" + arrayDtype + ") does not match the existing array's (" +
+                                     Zarr.get_dtype() + ")");
+        }
+    }
+    pybind11::gil_scoped_release release;
+    Zarr.set_chunkInfo(startCoords, endCoords);
+}
+
+void pybind11_write_zarr(const std::string &fileName, const pybind11::array &data, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
+                         const std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &cname = "zstd",
+                         const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> &chunks = std::vector<uint64_t>{256, 256, 256},
+                         const std::string &dimension_separator = ".", const bool crop = false, const uint64_t zarr_format = 2,
+                         const std::vector<uint64_t> &shards = std::vector<uint64_t>{}, const int64_t numThreads = 0){
+    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
+    const CallThreads threads(numThreads);
+
+    zarr Zarr;
+    configureWrite(Zarr, fileName, cname, clevel, order, chunks, dimension_separator, zarr_format, shards);
 
     // Map the numpy dtype via kind ('b' bool, 'u' unsigned int, 'i' signed int,
     // 'f' float, 'c' complex) and element size, and ml_dtypes' bfloat16 by name.
@@ -286,38 +326,9 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
         inStrides[d] = (uint64_t)info.strides[d] / itemsize;
     }
 
-    Zarr.set_shape(endCoords);
-
-    // Write out the new metadata (.zarray or zarr.json), unless writing a region of an
-    // existing array. (The GIL is released for the file system work and the write.)
-    if(!crop || !(fileExists(fileName+"/.zarray") || fileExists(fileName+"/zarr.json"))){
-        pybind11::gil_scoped_release release;
-        writeZarray(Zarr);
-    }
-    else{
-        {
-            pybind11::gil_scoped_release release;
-            Zarr = openZarr(fileName);
-        }
-        if (Zarr.get_ndims() != endCoords.size()) {
-            throw std::runtime_error("The coordinates have " + std::to_string(endCoords.size()) +
-                                     " values but the existing array has " + std::to_string(Zarr.get_ndims()) + " dimensions");
-        }
-        // The chunks are written with the data's element type, so it has to be the
-        // array's (write_zarr converts the data to it)
-        const DtypeInfo want = dtypeInfo(Zarr.get_dtype()), have = dtypeInfo(arrayDtype);
-        if (want.kind != have.kind || want.bytes != have.bytes || want.bfloat16 != have.bfloat16) {
-            throw std::runtime_error("The data's type (" + arrayDtype + ") does not match the existing array's (" +
-                                     Zarr.get_dtype() + ")");
-        }
-    }
-
+    startWrite(Zarr, fileName, arrayDtype, startCoords, endCoords, crop);
     std::vector<uint64_t> writeShape(endCoords.size());
     for (size_t d = 0; d < endCoords.size(); d++) writeShape[d] = endCoords[d]-startCoords[d];
-    {
-        pybind11::gil_scoped_release release;
-        Zarr.set_chunkInfo(startCoords, endCoords);
-    }
 
     // Write out the data
     uint8_t err = 0;
@@ -326,6 +337,45 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
         err = parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, inStrides, dtype, true, crop);
     }
     if(err) throw std::runtime_error(Zarr.get_errString());
+}
+
+// Writing from GPU memory: the data at the device pointer ptr, of the data type dtype (a typestr in
+// this machine's byte order, or "bfloat16"), shape and element strides, compressed on the GPU (see
+// gpuwritezarr.h) with the GPU work on stream (a CUDA stream handle, 0 for the default stream);
+// otherwise as pybind11_write_zarr. The GIL is released for the file system work and the write.
+void pybind11_write_zarr_gpu(const std::string &fileName, const uint64_t ptr, const std::string &dtype, const std::vector<uint64_t> &shape,
+                             const std::vector<int64_t> &strides, const std::vector<uint64_t> &startCoords,
+                             const std::vector<uint64_t> &endCoords, const std::string &cname, const uint64_t clevel, const std::string &order,
+                             const std::vector<uint64_t> &chunks, const std::string &dimension_separator, const bool crop,
+                             const uint64_t zarr_format, const std::vector<uint64_t> &shards, const int64_t numThreads, const uint64_t stream){
+    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
+    const CallThreads threads(numThreads);
+    zarr Zarr;
+    configureWrite(Zarr, fileName, cname, clevel, order, chunks, dimension_separator, zarr_format, shards);
+    const DtypeInfo t = dtypeInfo(dtype);
+    if (!t.kind || t.bigEndian) throw std::runtime_error("Unsupported data type for a write from GPU memory: " + dtype);
+    Zarr.set_dtype(dtype);
+    // (strides along axes past the data's, and along axes of length 1, are never used)
+    std::vector<uint64_t> inStrides(endCoords.size(), 0);
+    for (size_t d = 0; d < shape.size() && d < inStrides.size(); d++) {
+        if (shape[d] <= 1) continue;
+        if (strides[d] <= 0) throw std::runtime_error("Unsupported memory layout: strides must be positive");
+        inStrides[d] = (uint64_t)strides[d];
+    }
+    startWrite(Zarr, fileName, dtype, startCoords, endCoords, crop);
+    std::vector<uint64_t> writeShape(endCoords.size());
+    for (size_t d = 0; d < endCoords.size(); d++) writeShape[d] = endCoords[d]-startCoords[d];
+    uint8_t err = 0;
+    {
+        pybind11::gil_scoped_release release;
+        err = gpuWriteZarr(Zarr, reinterpret_cast<const void*>(static_cast<uintptr_t>(ptr)), startCoords, endCoords, writeShape, inStrides,
+                           t.bytes*8, true, crop, true, reinterpret_cast<void*>(static_cast<uintptr_t>(stream)));
+    }
+    if (err) {
+        std::string e = Zarr.get_errString();
+        while (!e.empty() && e.back() == '\n') e.pop_back();
+        throw std::runtime_error(e);
+    }
 }
 
 // Turn a Zarr v2 array into a Zarr v3 one in place (only its metadata is rewritten)
@@ -460,6 +510,12 @@ PYBIND11_MODULE(cppzarr, m) {
 	      pybind11::arg("endCoords"), pybind11::arg("cname"), pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"),
 	      pybind11::arg("dimension_separator"), pybind11::arg("crop"), pybind11::arg("zarr_format"), pybind11::arg("shards"),
 	      pybind11::arg("numThreads") = 0, "Write a zarr file");
+
+	m.def("pybind11_write_zarr_gpu", &pybind11_write_zarr_gpu, pybind11::arg("fileName"), pybind11::arg("ptr"), pybind11::arg("dtype"),
+	      pybind11::arg("shape"), pybind11::arg("strides"), pybind11::arg("startCoords"), pybind11::arg("endCoords"), pybind11::arg("cname"),
+	      pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"), pybind11::arg("dimension_separator"),
+	      pybind11::arg("crop"), pybind11::arg("zarr_format"), pybind11::arg("shards"), pybind11::arg("numThreads") = 0,
+	      pybind11::arg("stream") = 0, "Write a zarr file from GPU memory");
 
 	m.def("pybind11_convert_to_v3", &pybind11_convert_to_v3, pybind11::arg("fileName"),
 	      "Convert a Zarr v2 array to Zarr v3 in place (metadata only)");

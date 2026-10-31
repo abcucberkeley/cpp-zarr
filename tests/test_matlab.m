@@ -506,6 +506,9 @@ function test_matlab(mexDir)
     % GPU reads (parallelReadZarrGPU): what parallelReadZarr reads, as gpuArrays
     checkGpuReads(tmp);
 
+    % GPU writes (parallelWriteZarrGPU): what parallelWriteZarr writes, from gpuArrays
+    checkGpuWrites(tmp);
+
     disp('MATLAB round-trip tests PASSED');
 end
 
@@ -599,6 +602,111 @@ function checkGpuReads(tmp)
     end
     assert(refused, 'a GPU read outside the array was not refused');
     fprintf('PASS  GPU reads (%d)\n', n);
+end
+
+function checkGpuWrites(tmp)
+% parallelWriteZarrGPU against parallelWriteZarr: every class, compressors the GPU compresses (zstd,
+% lz4) and ones written through host memory (blosclz, gzip), v2, v3 and sharded arrays, whole arrays
+% and then regions that cut chunks, all-zero chunks (left out), and data converted to the array's
+% data type (a region of other data, and float16 and bfloat16 arrays): the two arrays must read the
+% same and hold the same chunk files. Skipped when the mex file was not built or MATLAB has no GPU.
+    if exist('parallelWriteZarrGPU', 'file') ~= 3
+        fprintf('SKIP  GPU writes (parallelWriteZarrGPU was not built)\n');
+        return;
+    end
+    try
+        hasGpu = gpuDeviceCount > 0;
+    catch
+        hasGpu = false;
+    end
+    if ~hasGpu
+        fprintf('SKIP  GPU writes (no GPU MATLAB can use)\n');
+        return;
+    end
+    sz = [70 45 33];
+    specs = {'uint8', 'int8', 'uint16', 'int16', 'uint32', 'int32', 'uint64', 'int64', 'single', 'double', 'logical', ...
+             'csingle', 'cdouble'};
+    cnames = {'zstd', 'lz4', 'blosclz', 'gzip'};
+    n = 0;
+    for k = 1:numel(specs)
+        cls = specs{k};
+        if strcmp(cls, 'logical')
+            data = rand(sz) > 0.5;
+        elseif cls(1) == 'c'
+            cls = cls(2:end);
+            data = complex(cast((rand(sz) - 0.5) * 1000, cls), cast((rand(sz) - 0.5) * 1000, cls));
+        else
+            data = cast(randi([0 100], sz), cls);
+        end
+        data(1:16, 1:16, 1:8) = 0;
+        part = data(30:67, 5:30, 2:20);
+        for c = 1:numel(cnames)
+            for layout = 1:3
+                args = {'cname', cnames{c}, 'chunks', [16 16 8]};
+                if layout == 2
+                    args = [args, {'zarr_format', 3}]; %#ok<AGROW>
+                elseif layout == 3
+                    args = {'cname', cnames{c}, 'zarr_format', 3, 'chunks', [32 32 16], 'chunk_shape', [16 16 8]};
+                end
+                fc = fullfile(tmp, sprintf('gw_%d_%s_%d_cpu.zarr', k, cnames{c}, layout));
+                fg = fullfile(tmp, sprintf('gw_%d_%s_%d_gpu.zarr', k, cnames{c}, layout));
+                parallelWriteZarr(fc, data, args{:});
+                parallelWriteZarrGPU(fg, gpuArray(data), args{:});
+                checkSameArrays(fc, fg);
+                bbox = [11 12 4 48 37 22];
+                parallelWriteZarr(fc, part, 'bbox', bbox);
+                parallelWriteZarrGPU(fg, gpuArray(part), 'bbox', bbox);
+                checkSameArrays(fc, fg);
+                n = n + 2;
+            end
+        end
+    end
+    % data converted to the array's data type: a region of doubles written into a uint16 array, and
+    % singles into float16 and bfloat16 arrays
+    data = uint16(randi([0 1000], sz));
+    fc = fullfile(tmp, 'gw_conv_cpu.zarr');
+    fg = fullfile(tmp, 'gw_conv_gpu.zarr');
+    parallelWriteZarr(fc, data, 'chunks', [16 16 8]);
+    parallelWriteZarrGPU(fg, gpuArray(data), 'chunks', [16 16 8]);
+    part = (rand(20, 20, 10) - 0.2) * 70000;
+    parallelWriteZarr(fc, part, 'bbox', [5 5 5 24 24 14]);
+    parallelWriteZarrGPU(fg, gpuArray(part), 'bbox', [5 5 5 24 24 14]);
+    checkSameArrays(fc, fg);
+    n = n + 1;
+    for dt = {'float16', 'bfloat16'}
+        data = single(randi([-100 100], sz));
+        fc = fullfile(tmp, sprintf('gw_%s_cpu.zarr', dt{1}));
+        fg = fullfile(tmp, sprintf('gw_%s_gpu.zarr', dt{1}));
+        parallelWriteZarr(fc, data, 'dtype', dt{1}, 'zarr_format', 3);
+        parallelWriteZarrGPU(fg, gpuArray(data), 'dtype', dt{1}, 'zarr_format', 3);
+        checkSameArrays(fc, fg);
+        n = n + 1;
+    end
+    % refused: data that is not a gpuArray
+    try
+        parallelWriteZarrGPU(fullfile(tmp, 'gw_refused.zarr'), uint8(ones(4, 4)));
+        refused = false;
+    catch
+        refused = true;
+    end
+    assert(refused, 'parallelWriteZarrGPU wrote an array that is not a gpuArray');
+    fprintf('PASS  GPU writes (%d)\n', n);
+end
+
+function checkSameArrays(fc, fg)
+% The arrays parallelWriteZarr (fc) and parallelWriteZarrGPU (fg) wrote read the same and hold the
+% same chunk files (their bytes may differ: the GPU compresses differently)
+    a = parallelReadZarr(fc);
+    b = parallelReadZarr(fg);
+    assert(strcmp(class(a), class(b)) && isreal(a) == isreal(b) && isequal(size(a), size(b)) && isequaln(a, b), ...
+           'GPU write %s reads differently from the CPU write', fg);
+    la = dir(fullfile(fc, '**', '*'));
+    lb = dir(fullfile(fg, '**', '*'));
+    la = la(~[la.isdir] & ~ismember({la.name}, {'.zarray', 'zarr.json', '.zattrs'}));
+    lb = lb(~[lb.isdir] & ~ismember({lb.name}, {'.zarray', 'zarr.json', '.zattrs'}));
+    ra = sort(cellfun(@(p, q) strrep(fullfile(p, q), fc, ''), {la.folder}, {la.name}, 'UniformOutput', false));
+    rb = sort(cellfun(@(p, q) strrep(fullfile(p, q), fg, ''), {lb.folder}, {lb.name}, 'UniformOutput', false));
+    assert(isequal(ra, rb), 'GPU write %s holds other chunk files than the CPU write', fg);
 end
 
 function checkTestArrays(v3dir, tmp)

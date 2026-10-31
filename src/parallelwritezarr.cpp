@@ -24,6 +24,7 @@
 #include "parallelwritezarr.h"
 #include "helperfunctions.h"
 #include "parallelwork.h"
+#include "storedchunks.h"
 #include "zarr.h"
 #include "zlib.h"
 #include "zstd.h"
@@ -53,21 +54,6 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     for(uint64_t d = 0; d < writeShape.size(); d++){ inStrides[d] = acc; acc *= writeShape[d]; }
     return parallelWriteZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, inStrides, bits, useUuid, crop, sparse);
 }
-
-// What one chunk becomes when it is stored: nothing (a sharded array's inner chunk
-// past the array's edge, an all-zero chunk of a sparse write, or an inner chunk a
-// crop write leaves alone that its shard does not hold), or its bytes, with the
-// CRC32C to put after them when the array has one
-struct StoredChunk {
-    bool empty = true;
-    bool zero = false;          // all zero in a sparse write (any file it had is removed)
-    const uint8_t* data = nullptr;
-    uint64_t n = 0;
-    bool hasCrc = false;
-    uint32_t crc = 0;
-    // (or, for a chunk file, its n bytes in pieces of memory, in order)
-    const std::vector<std::pair<const uint8_t*, uint64_t>>* pieces = nullptr;
-};
 
 // A shard being written. Its inner chunks are prepared by any of the threads, in any
 // order, and added to its file in index order (one that is ready early waits in
@@ -239,18 +225,20 @@ int writePieces(const std::string &path, const std::vector<std::pair<const uint8
 #endif
 }
 
-uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
-                          const std::vector<uint64_t> &startCoords,
-                          const std::vector<uint64_t> &endCoords,
-                          const std::vector<uint64_t> &writeShape,
-                          const std::vector<uint64_t> &inStrides,
-                          const uint64_t bits, const bool useUuid,
-                          const bool crop, const bool sparse){
+// The write of the chunks of the region [startCoords, endCoords), or with prepared (GPU writes),
+// of its chunks [prepared->first, prepared->last), whose stored bytes prepared gives
+static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
+                         const std::vector<uint64_t> &startCoords,
+                         const std::vector<uint64_t> &endCoords,
+                         const std::vector<uint64_t> &writeShape,
+                         const std::vector<uint64_t> &inStrides,
+                         const uint64_t bits, const bool useUuid,
+                         const bool crop, const bool sparse, const PreparedChunks* prepared){
     // (in a child made by fork(), on the thread that forked: see ForkSafety)
     if(ForkSafety::get().needRegionThread()){
         uint8_t r = 1;
         ForkSafety::get().onRegionThread([&]{
-            r = parallelWriteZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, inStrides, bits, useUuid, crop, sparse);
+            r = writeZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, inStrides, bits, useUuid, crop, sparse, prepared);
         });
         return r;
     }
@@ -373,7 +361,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     // Sparse writes leave all-zero chunks unwritten, when that is how a missing
     // chunk reads back (a fill value whose bytes are all zero)
     void* zeroChunkUnc = NULL;
-    if(sparse && fillValueIsZero(Zarr.get_fill_value(), Zarr.get_dtype())){
+    if(sparse && !prepared && fillValueIsZero(Zarr.get_fill_value(), Zarr.get_dtype())){
         zeroChunkUnc = calloc(s,bytes);
     }
 
@@ -391,6 +379,9 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     // of each shard's inner chunks are past the array's edge (not stored), or keep the
     // bytes they have (crop writes).
     const int64_t numChunks = (int64_t)Zarr.get_numChunks();
+    // (the chunks [firstChunk, lastChunk) of the list: all of them, or prepared's)
+    const int64_t firstChunk = prepared ? std::max<int64_t>(0, prepared->first) : 0;
+    const int64_t lastChunk = prepared ? std::min<int64_t>(numChunks, prepared->last) : numChunks;
     // (0: untouched, 1: touched, 2: past the array's edge)
     std::vector<uint8_t> touched;
     std::vector<int64_t> toPrepare;
@@ -412,7 +403,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
             nPer *= innerCount[d];
         }
         const bool regular = nOuter*nPer == (uint64_t)numChunks;
-        for(int64_t f = 0; f < numChunks && !err; f++){
+        for(int64_t f = firstChunk; f < lastChunk && !err; f++){
             try{
                 if(regular){
                     uint64_t o = (uint64_t)f/nPer, c = (uint64_t)f%nPer;
@@ -438,9 +429,9 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                 reportError(std::string("Write error: ")+e.what()+"\n");
             }
         }
-        for(int64_t f = 0; f < numChunks; f++) if(touched[f] == 1) toPrepare.push_back(f);
+        for(int64_t f = firstChunk; f < lastChunk; f++) if(touched[f] == 1) toPrepare.push_back(f);
     }
-    const int64_t numWork = sharded ? (int64_t)toPrepare.size() : numChunks;
+    const int64_t numWork = sharded ? (int64_t)toPrepare.size() : lastChunk-firstChunk;
 
     // No more threads than chunks to prepare. With fewer chunks than threads, blosc
     // compresses each chunk's blocks with the threads left over (for a sharded array,
@@ -464,10 +455,10 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
     // its shard has added to its file, which bounds the memory of the ones that wait:
     // about two per thread, or 64 MB of small ones (a window of 16 small inner chunks
     // kept threads waiting while a shard's unchanged inner chunks were copied).
-    const int64_t numShards = sharded ? numChunks/perShard : 0;
+    const int64_t numShards = sharded ? (lastChunk-firstChunk)/perShard : 0;
     std::unique_ptr<ShardOut[]> shards(sharded ? new ShardOut[numShards] : nullptr);
     for(int64_t k = 0; k < (int64_t)toPrepare.size(); k++){
-        ShardOut &sh = shards[toPrepare[k]/perShard];
+        ShardOut &sh = shards[(toPrepare[k]-firstChunk)/perShard];
         if(sh.prepEnd == 0) sh.prepNext.store(k);
         sh.prepEnd = k+1;
     }
@@ -747,7 +738,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         appendReady(sh, buf);
     };
 
-    WorkRanges work(team, sharded ? 0 : numChunks);
+    WorkRanges work(team, sharded ? 0 : lastChunk-firstChunk);
     // (in a region of all of the threads, those past the team doing nothing: OpenMP ends
     // the threads a smaller region leaves out, and starts them again for the next bigger
     // one, every call here, after the region of all of them above)
@@ -767,21 +758,33 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         std::vector<uint64_t> blockAt;
         std::vector<uint8_t> orderedHeader;
         std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
+        // (prepared chunks need no chunk buffers)
+        bool haveBuffers = false;
         try{
             scratch = writeScratchPool.take(w);
-            scratch->buffers(sB, chunkCCap);
-            chunkUnC = scratch->unc.get();
-            chunkC = scratch->comp.get();
-            if(compressor == "zstd"){
-                if(!scratch->zctx) scratch->zctx = ZSTD_createCCtx();
-                zctx = scratch->zctx;
+            if(!prepared){
+                scratch->buffers(sB, chunkCCap);
+                chunkUnC = scratch->unc.get();
+                chunkC = scratch->comp.get();
+                if(compressor == "zstd"){
+                    if(!scratch->zctx) scratch->zctx = ZSTD_createCCtx();
+                    zctx = scratch->zctx;
+                }
             }
             stored.swap(scratch->stored);
             copyBuf.swap(scratch->copyBuf);
+            haveBuffers = true;
         }
         catch(const std::exception &e){
             reportError("Not enough memory for a chunk of "+std::to_string(sB)+" bytes\n");
         }
+        // A prepared chunk's stored bytes
+        auto getPrepared = [&](const int64_t f, StoredChunk &out) -> bool {
+            std::string why;
+            if(prepared->get(f, out, why)) return true;
+            reportError(why+"\n");
+            return false;
+        };
         std::vector<uint64_t> cAV;
         std::vector<uint64_t> boxLo(nDims), boxHi(nDims), boxExt(nDims), inArray(nDims);
         const std::vector<uint64_t> zeros(nDims, 0);
@@ -971,9 +974,14 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         try{
             if(!sharded){
                 // Chunk files: contiguous blocks of chunks with work stealing
-                for(int64_t f = (err || !chunkUnC) ? -1 : work.next(w); f >= 0; f = err ? -1 : work.next(w)){
+                for(int64_t i = (err || !haveBuffers) ? -1 : work.next(w); i >= 0; i = err ? -1 : work.next(w)){
+                    const int64_t f = firstChunk+i;
                     StoredChunk c;
-                    if(!prepare(f, nullptr, 0, c)) break;
+                    if(prepared){
+                        cAV = Zarr.get_chunkAxisVals(Zarr.get_chunkNames(f));
+                        if(!getPrepared(f, c)) break;
+                    }
+                    else if(!prepare(f, nullptr, 0, c)) break;
                     const std::string &name = Zarr.get_chunkNames(f);
                     const std::string fileName(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(cAV)+"/"+Zarr.chunkKey(name));
                     // An all-zero chunk is not written, and any earlier copy of it removed
@@ -1016,7 +1024,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                     }
                 }
             }
-            else if(chunkUnC){
+            else if(haveBuffers){
                 // A shard nobody has started, else the one with the most inner chunks
                 // left to take (of those with as many, the first from this thread's
                 // place on, so helpers spread out); then its inner chunks, one at a time
@@ -1048,7 +1056,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
                             std::this_thread::sleep_for(std::chrono::microseconds(us));
                         }
                         StoredChunk c;
-                        if(!prepare(f, &sh, pos, c)) break;
+                        if(!(prepared ? getPrepared(f, c) : prepare(f, &sh, pos, c))) break;
                         if(c.zero) c = StoredChunk();
                         depositInShard(sh, pos, c, copyBuf);
                     }
@@ -1086,4 +1094,23 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
         return 1;
     }
     else return 0;
+}
+
+uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
+                          const std::vector<uint64_t> &startCoords,
+                          const std::vector<uint64_t> &endCoords,
+                          const std::vector<uint64_t> &writeShape,
+                          const std::vector<uint64_t> &inStrides,
+                          const uint64_t bits, const bool useUuid,
+                          const bool crop, const bool sparse){
+    return writeZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, inStrides, bits, useUuid, crop, sparse, nullptr);
+}
+
+uint8_t parallelWriteZarrPrepared(zarr &Zarr, const std::vector<uint64_t> &startCoords,
+                                  const std::vector<uint64_t> &endCoords, const std::vector<uint64_t> &writeShape,
+                                  const uint64_t bits, const bool useUuid, const bool crop, const bool sparse,
+                                  const PreparedChunks &prepared){
+    // (no input: each chunk's stored bytes come from prepared)
+    const std::vector<uint64_t> inStrides(writeShape.size(), 0);
+    return writeZarr(Zarr, nullptr, startCoords, endCoords, writeShape, inStrides, bits, useUuid, crop, sparse, &prepared);
 }

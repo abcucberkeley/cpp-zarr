@@ -6,6 +6,45 @@
 #include "../src/parallelreadzarr.h"
 #include "../src/zarr.h"
 #include "zarrmexhelpers.h"
+#ifdef CPPZARR_MEX_GPU
+// (parallelWriteZarrGPU: this file built with CPPZARR_MEX_GPU, see parallelwritezarrgpumex.cpp)
+#include "gpu/mxGPUArray.h"
+#include "../src/gpuwritezarr.h"
+
+// A gpuArray to write: its dimensions, data type (as mexClassDtype names a class) and GPU memory
+struct MexGpuData {
+    const mxGPUArray* g = nullptr;
+    std::vector<uint64_t> dims;
+    std::string dtype;
+    uint64_t elems = 0;
+    explicit MexGpuData(const mxArray* a){
+        g = mxGPUCreateFromMxArray(a);
+        const mwSize n = mxGPUGetNumberOfDimensions(g);
+        const mwSize* d = mxGPUGetDimensions(g);
+        dims.assign(d, d+n);
+        mxFree((void*)d);
+        elems = (uint64_t)mxGPUGetNumberOfElements(g);
+        const bool cplx = mxGPUGetComplexity(g) == mxCOMPLEX;
+        switch(mxGPUGetClassID(g)){
+            case mxLOGICAL_CLASS: dtype = "|b1"; break;
+            case mxUINT8_CLASS:  dtype = cplx ? "" : "<u1"; break;
+            case mxINT8_CLASS:   dtype = cplx ? "" : "<i1"; break;
+            case mxUINT16_CLASS: dtype = cplx ? "" : "<u2"; break;
+            case mxINT16_CLASS:  dtype = cplx ? "" : "<i2"; break;
+            case mxUINT32_CLASS: dtype = cplx ? "" : "<u4"; break;
+            case mxINT32_CLASS:  dtype = cplx ? "" : "<i4"; break;
+            case mxUINT64_CLASS: dtype = cplx ? "" : "<u8"; break;
+            case mxINT64_CLASS:  dtype = cplx ? "" : "<i8"; break;
+            case mxSINGLE_CLASS: dtype = cplx ? "<c8" : "<f4"; break;
+            case mxDOUBLE_CLASS: dtype = cplx ? "<c16" : "<f8"; break;
+            default: break;
+        }
+    }
+    ~MexGpuData(){ if(g) mxGPUDestroyGPUArray(g); }
+    MexGpuData(const MexGpuData&) = delete;
+    MexGpuData& operator=(const MexGpuData&) = delete;
+};
+#endif
 
 //compile
 //mex -v COPTIMFLAGS="-DNDEBUG -O3" CFLAGS='$CFLAGS -fopenmp -O3' LDFLAGS='$LDFLAGS -fopenmp -O3' '-I/global/home/groups/software/sl-7.x86_64/modules/cBlosc/2.0.4/include/' '-I/global/home/groups/software/sl-7.x86_64/modules/cBlosc/zarr/include/' '-I/global/home/groups/software/sl-7.x86_64/modules/cJSON/1.7.15/include/' '-L/global/home/groups/software/sl-7.x86_64/modules/cBlosc/zarr/lib' -lblosc '-L/global/home/groups/software/sl-7.x86_64/modules/cBlosc/2.0.4/lib64' -lblosc2 '-L/global/home/groups/software/sl-7.x86_64/modules/cJSON/1.7.15/lib64' -lcjson -luuid parallelWriteZarr.c helperFunctions.c parallelReadZarr.c
@@ -30,7 +69,19 @@ void mexFunction(int nlhs, mxArray *plhs[],
 #endif
     if(nrhs < 2) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 2 arguments");
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
+#ifdef CPPZARR_MEX_GPU
+    // (the data: a gpuArray, whose chunks are put together and compressed on the GPU)
+    if(!mxIsGPUArray(prhs[1])) mexErrMsgIdAndTxt("zarr:inputError","parallelWriteZarrGPU writes gpuArrays: write other arrays with parallelWriteZarr");
+    if(mxInitGPU() != MX_GPU_SUCCESS) mexErrMsgIdAndTxt("zarr:gpuError","No GPU MATLAB can use (mxInitGPU failed)");
+    {
+        std::string why;
+        if(!gpuWriteAvailable(why)) mexErrMsgIdAndTxt("zarr:gpuError","GPU writes are not available: %s",why.c_str());
+    }
+    const MexGpuData gpuData(prhs[1]);
+    if(!gpuData.elems) mexErrMsgIdAndTxt("zarr:inputError","All input data axes must be of at least size 1");
+#else
     if(mxIsEmpty(prhs[1])) mexErrMsgIdAndTxt("zarr:inputError","All input data axes must be of at least size 1");
+#endif
 
     std::vector<uint64_t> startCoords;
     std::vector<uint64_t> endCoords;
@@ -49,9 +100,14 @@ void mexFunction(int nlhs, mxArray *plhs[],
     std::string dtypeOption;
 
     // Input data dimensions (MATLAB arrays have at least 2)
+#ifdef CPPZARR_MEX_GPU
+    const std::vector<uint64_t> dataDims = gpuData.dims;
+    const uint64_t nDataDims = dataDims.size();
+#else
     const uint64_t nDataDims = (uint64_t)mxGetNumberOfDimensions(prhs[1]);
     const mwSize* dataDimsT = mxGetDimensions(prhs[1]);
     const std::vector<uint64_t> dataDims(dataDimsT, dataDimsT+nDataDims);
+#endif
 
     std::string folderName(mxArrayToString(prhs[0]));
     // Handle the tilde character in filenames on Linux/Mac
@@ -203,7 +259,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     // The data's own type (logical is bool, complex single and double are complex64
     // and complex128), which a new array gets unless the dtype option says otherwise
+#ifdef CPPZARR_MEX_GPU
+    const std::string dataDtype = gpuData.dtype;
+#else
     const std::string dataDtype = mexClassDtype(prhs[1]);
+#endif
     if(dataDtype.empty()) mexErrMsgIdAndTxt("zarr:dataTypeError","The input data type is not supported");
     const bool cropExisting = crop && metadataExists;
     if(!cropExisting) Zarr.set_dtype(dtypeOption.empty() ? dataDtype : dtypeOption);
@@ -280,13 +340,24 @@ void mexFunction(int nlhs, mxArray *plhs[],
                               Zarr.get_dtype().c_str());
         }
         bool convert = out.kind != in.kind || out.bytes != in.bytes || out.bfloat16 != in.bfloat16;
-#if !(MX_HAS_INTERLEAVED_COMPLEX)
+#if !(MX_HAS_INTERLEAVED_COMPLEX) && !defined(CPPZARR_MEX_GPU)
         convert = convert || in.kind == 'c';
 #endif
         if(convert && out.kind){
             uint64_t size = 1;
             for(uint64_t d = 0; d < nDims; d++) size *= iDims[d];
+#ifdef CPPZARR_MEX_GPU
+            // (converted as parallelWriteZarr converts data, in host memory, and written from there:
+            // data cast on the GPU to the array's class is written from the GPU)
+            mxArray* gathered = nullptr;
+            mxArray* gin = const_cast<mxArray*>(prhs[1]);
+            if(mexCallMATLAB(1, &gathered, 1, &gin, "gather") || !gathered)
+                mexErrMsgIdAndTxt("zarr:dataTypeError","Cannot copy the input data to host memory");
+            zarrC = mexConvertToDtype(gathered, Zarr.get_dtype(), size);
+            mxDestroyArray(gathered);
+#else
             zarrC = mexConvertToDtype(prhs[1], Zarr.get_dtype(), size);
+#endif
             if(!zarrC) mexErrMsgIdAndTxt("zarr:dataTypeError","Cannot convert the input data to the data type \"%s\"",Zarr.get_dtype().c_str());
         }
     }
@@ -312,8 +383,20 @@ void mexFunction(int nlhs, mxArray *plhs[],
         free(zarrC);
         mexErrMsgIdAndTxt("zarr:dataTypeError","Data type \"%s\" is not supported",dtypeOut.c_str());
     }
+#ifdef CPPZARR_MEX_GPU
+    if(zarrC) err = parallelWriteZarr(Zarr, zarrC, startCoords, endCoords, writeShape, outBytes*8, useUuid, crop, sparse);
+    else{
+        // (F order, MATLAB's; on MATLAB's current stream's device, the default stream)
+        std::vector<uint64_t> inStrides(nDims);
+        uint64_t acc = 1;
+        for(uint64_t d = 0; d < nDims; d++){ inStrides[d] = acc; acc *= iDims[d]; }
+        err = gpuWriteZarr(Zarr, mxGPUGetDataReadOnly(gpuData.g), startCoords, endCoords, writeShape, inStrides, outBytes*8, useUuid, crop,
+                           sparse, nullptr);
+    }
+#else
     void* zarrArr = zarrC ? zarrC : mxGetData(prhs[1]);
     err = parallelWriteZarr(Zarr, zarrArr, startCoords, endCoords, writeShape, outBytes*8, useUuid, crop, sparse);
+#endif
 
     // zarrC is either a copy for data conversion or NULL
     free(zarrC);

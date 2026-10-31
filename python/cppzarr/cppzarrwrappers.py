@@ -5,7 +5,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11_gpu_available, pybind11_gpu_set_cufile, pybind11_gpu_set_nvcomp,
-                      pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_region_info, pybind11_write_zarr)
+                      pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_region_info, pybind11_write_zarr, pybind11_write_zarr_gpu)
 
 
 def _default_chunks(ndim):
@@ -130,6 +130,85 @@ def _cuda_array(a):
     if cai.get('readonly', False) or (len(cai['data']) > 1 and cai['data'][1]):
         raise Exception('out must be writeable')
     return int(cai['data'][0]), typestr, shape, c, f
+
+
+def _cuda_data(a):
+    # (device pointer, data type as cpp-zarr names it, shape, element strides) of GPU data to write (a
+    # PyTorch tensor on a CUDA device, or anything with __cuda_array_interface__, such as a CuPy
+    # array), or None when a is not GPU memory
+    if type(a).__module__.split('.')[0] == 'torch' and getattr(a, 'is_cuda', False):
+        name = str(a.dtype).replace('torch.', '')
+        if name not in _TORCH_TYPES:
+            raise Exception(f'The data has the data type {a.dtype}, which cpp-zarr does not write')
+        return int(a.data_ptr()), _TORCH_TYPES[name], tuple(int(v) for v in a.shape), tuple(int(v) for v in a.stride())
+    cai = getattr(a, '__cuda_array_interface__', None)
+    if cai is None:
+        return None
+    shape = tuple(int(v) for v in cai['shape'])
+    typestr = cai['typestr']
+    if typestr[1] not in 'iufcb':
+        raise Exception(f'The data has the data type {typestr}, which cpp-zarr does not write from GPU memory')
+    dt = np.dtype(typestr)
+    if not dt.isnative:
+        raise Exception('The GPU data is not in this machine\'s byte order')
+    strides = cai.get('strides')
+    if strides is None:
+        strides, acc = [0] * len(shape), 1
+        for d in range(len(shape) - 1, -1, -1):
+            strides[d] = acc
+            acc *= shape[d]
+    else:
+        if any(st % dt.itemsize for st in strides):
+            raise Exception('Unsupported memory layout: strides must be multiples of the element size')
+        strides = [st // dt.itemsize for st in strides]
+    return int(cai['data'][0]), dt.str if dt.itemsize > 1 else '|' + dt.str[1:], shape, tuple(strides)
+
+
+def _gpu_dtype_name(a):
+    # The NumPy name of GPU data's data type (bfloat16 for PyTorch's)
+    if type(a).__module__.split('.')[0] == 'torch':
+        return str(a.dtype).replace('torch.', '')
+    return np.dtype(a.dtype).name
+
+
+def _gpu_astype(a, dtype):
+    # GPU data converted on the GPU to the NumPy data type dtype (PyTorch tensors and CuPy arrays)
+    if type(a).__module__.split('.')[0] == 'torch':
+        import torch
+        return a.to(getattr(torch, dtype.name))
+    if hasattr(a, 'astype'):
+        return a.astype(dtype)
+    raise Exception(f'The GPU data is {_gpu_dtype_name(a)}, not the array\'s {dtype.name}: convert it first')
+
+
+def _gpu_ready(a):
+    # GPU data the writer takes: in this machine's byte order, with positive strides (others are
+    # copied on the GPU first: reversed or repeated axes)
+    if type(a).__module__.split('.')[0] != 'torch' and hasattr(a, 'dtype') and not np.dtype(a.dtype).isnative:
+        a = a.astype(np.dtype(a.dtype).newbyteorder('='))
+    _, _, shape, strides = _cuda_data(a)
+    if any(n > 1 and s <= 0 for s, n in zip(strides, shape)):
+        if type(a).__module__.split('.')[0] == 'torch':
+            a = a.contiguous()
+        elif type(a).__module__.split('.')[0] == 'cupy':
+            import cupy
+            a = cupy.ascontiguousarray(a)
+        else:
+            raise Exception('Unsupported memory layout: GPU data with reversed or repeated axes (strides of 0 or less)')
+    return a
+
+
+def _current_stream(a):
+    # The current stream of GPU data's library (PyTorch's on the tensor's device, or CuPy's), which
+    # the work that made the data most likely went on; None (the default stream) for other data
+    module = type(a).__module__.split('.')[0]
+    if module == 'torch':
+        import torch
+        return torch.cuda.current_stream(a.device)
+    if module == 'cupy':
+        import cupy
+        return cupy.cuda.get_current_stream()
+    return None
 
 
 def _stream_handle(stream):
@@ -430,7 +509,7 @@ def _existing_format(file_name):
 
 
 def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd', clevel=1, order=None, chunks=None,
-               dimension_separator=None, zarr_format=None, shards=None, num_threads=None):
+               dimension_separator=None, zarr_format=None, shards=None, num_threads=None, stream=None):
     # zarr_format: 2 or 3. By default the format of the array already at file_name,
     # or 2 for a new one. Zarr v3 arrays default to C order and chunk files named
     # c/0/0/0 (order='C', dimension_separator='/'), v2 ones to F order and chunk
@@ -439,6 +518,16 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
     # shards (Zarr v3 only) is the shard shape: chunks then sets the inner chunks.
     # num_threads: the threads this call uses, as for read_zarr (the GIL is released
     # while writing).
+    # data in GPU memory (a CuPy array, a PyTorch tensor on a CUDA device, or another array with
+    # __cuda_array_interface__): the chunks are put together and compressed on the GPU (nvCOMP:
+    # pip install nvidia-libnvcomp-cu12) and their files written here, with the GPU work on stream
+    # (a PyTorch or CuPy stream, or a CUDA stream handle; by default the data's library's current
+    # stream, where the work that made the data most likely went), done when this returns. The GPU compresses blosc's zstd and lz4 and the zstd codec at nvCOMP's one level
+    # of each, whatever clevel says (the chunks decode the same, and are about as small as at clevel
+    # 1); arrays of other compressors are written from a copy of the data in host memory.
+    gpu = _cuda_data(data) is not None
+    if gpu:
+        _find_nvcomp()
     crop = start_coords is not None or end_coords is not None
     existing = _existing_format(file_name)
     if zarr_format not in (None, 2, 3):
@@ -463,10 +552,15 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
             meta = json.load(f)
         ndim = len(meta['shape'])
         dtype = _metadata_dtype(meta)
-        if dtype is not None and data.dtype != dtype:
+        if gpu:
+            if dtype is not None and _gpu_dtype_name(data) != dtype.name:
+                data = _gpu_astype(data, dtype)
+        elif dtype is not None and data.dtype != dtype:
             data = np.asarray(data).astype(dtype)
     # (the writer takes data in this machine's byte order)
-    if not data.dtype.isnative:
+    if gpu:
+        data = _gpu_ready(data)
+    elif not data.dtype.isnative:
         data = data.astype(data.dtype.newbyteorder('='))
     if data.ndim > ndim:
         raise Exception(f'The data has {data.ndim} dimensions but the array has {ndim}')
@@ -494,7 +588,13 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
     if any(e - s <= 0 for s, e in zip(start_coords, end_coords)):
         raise Exception(f'Invalid start_coords or end_coords!')
     if [e - s for s, e in zip(start_coords, end_coords)] != data_shape:
-        raise Exception(f'The region from start_coords to end_coords does not match the data shape {data.shape}')
+        raise Exception(f'The region from start_coords to end_coords does not match the data shape {tuple(data.shape)}')
+    if gpu:
+        ptr, typestr, shape, strides = _cuda_data(data)
+        pybind11_write_zarr_gpu(file_name, ptr, typestr, list(shape), list(strides), start_coords, end_coords, cname, clevel, order,
+                                chunks, dimension_separator, crop, zarr_format, shards or [], _threads(num_threads),
+                                _stream_handle(stream if stream is not None else _current_stream(data)))
+        return
     # The writer reads the array in place in any memory layout (C or F order, or a
     # strided view), so it is not converted. Only reversed or repeated axes
     # (negative or zero strides) and misaligned data need a copy first.

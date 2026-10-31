@@ -36,8 +36,8 @@ Windows: Windows 10 or newer is required
 pip install cpp-zarr
 ````
 
-#### With GPU reads
-Reading straight into GPU memory needs Linux, an NVIDIA GPU (Volta or newer) and its driver. The gpu extra also installs nvCOMP, which decompresses on the GPU and which cppzarr finds by itself (see "Read straight into GPU memory" below).
+#### With GPU reads and writes
+Reading straight into GPU memory and writing from it need Linux, an NVIDIA GPU (Volta or newer) and its driver. The gpu extra also installs nvCOMP, which decompresses and compresses on the GPU and which cppzarr finds by itself (see "Read straight into GPU memory" and "Write from GPU memory" below).
 ````
 pip install "cpp-zarr[gpu]"
 
@@ -202,6 +202,34 @@ crc32c codec) are checked on the CPU before anything goes to the GPU. For GPU re
 sets the threads that prepare the chunks; the files are read with at least 32 threads at once
 (CPPZARR_GPU_READS), since reading mostly waits on the storage.
 
+#### Write from GPU memory
+Data in GPU memory (a CuPy array, a PyTorch CUDA tensor, or anything with
+`__cuda_array_interface__`, in any memory layout) is written from there, on Linux as GPU reads
+are: the chunks are put together and compressed on the GPU with nvCOMP, and only the compressed
+chunks come back to host memory, where the call's threads write their files as for data in host
+memory (shards, writes into existing arrays, all-zero chunks left out). For data on the GPU anyway,
+that is much faster than copying it to host memory and writing it from there, and takes less of
+the CPU.
+````
+import cupy
+import cppzarr
+
+im = cupy.random.randint(0, 1000, (512, 512, 512), dtype=cupy.uint16)
+cppzarr.write_zarr('filename.zarr', im, zarr_format=3, chunks=[64, 64, 64], shards=[256, 256, 256])
+
+# The GPU work goes on a stream (a PyTorch or CuPy stream, or a CUDA stream handle; by default the
+# data's library's current stream, where the work that made the data most likely went), after what
+# is already on it; the call returns once the files are written
+cppzarr.write_zarr('filename.zarr', im, stream=cupy.cuda.Stream.null)
+````
+The GPU compresses blosc's zstd and lz4 streams (byte shuffle or none) and Zarr's zstd codec, at
+nvCOMP's one level of each whatever clevel says (clevel still sets blosc's block size): the chunks
+decode to the same values as the CPU writer's, with other bytes. Arrays of other compressors
+(blosclz, zlib, gzip, bitshuffle) are written from a copy of the data in host memory. Several
+writes from as many threads at once overlap: the files of one are written while the GPU compresses
+another's. CPPZARR_GPU_WRITE_PART_MB (256) sets the most of a write the GPU works on at once (a
+bigger write goes in parts, the files of one written while the GPU works on the next).
+
 #### Write a region to an existing Zarr file
 ````
 import cppzarr
@@ -257,6 +285,20 @@ if(gpuReadZarr(regions, true /* C order */, stream /* or nullptr */, 0 /* thread
     printf("%s\n", err.c_str());
 ````
 
+### Writing from GPU memory
+gpuwritezarr.h writes a region of an array from GPU memory, compressing on the GPU (see the Python
+section; Linux only for now), as parallelWriteZarr writes one from host memory.
+````
+#include "gpuwritezarr.h"
+// (the array's metadata written, or an existing one opened for a crop write, as for parallelWriteZarr)
+zarr z("filename.zarr");
+z.set_chunkInfo({0, 0, 0}, {128, 128, 128});
+// data: device memory holding 128x128x128 uint16s in F order (element strides 1, 128, 128*128)
+if(gpuWriteZarr(z, data, {0, 0, 0}, {128, 128, 128}, {128, 128, 128}, {1, 128, 128*128}, 16, true /* uuid */,
+                false /* crop */, true /* sparse */, stream /* or nullptr */))
+    printf("%s\n", z.get_errString().c_str());
+````
+
 ## MATLAB
 
 ### Prerequisites
@@ -288,8 +330,8 @@ im = parallelReadZarr('path/to/file.zarr');
 im = parallelReadZarr('path/to/file.zarr', 'bbox', [1 1 1 100 100 50]);
 
 % Read with 4 threads. By default a call uses OpenMP's thread count for MATLAB, which on Linux
-% follows maxNumCompThreads (OMP_NUM_THREADS has no effect there). parallelWriteZarr and
-% parallelReadZarrGPU take 'threads' too.
+% follows maxNumCompThreads (OMP_NUM_THREADS has no effect there). parallelWriteZarr,
+% parallelReadZarrGPU and parallelWriteZarrGPU take 'threads' too.
 im = parallelReadZarr('path/to/file.zarr', 'threads', 4);
 ````
 
@@ -334,6 +376,16 @@ parallelWriteZarr('path/to/file.zarr',im,'uuid',false);
 % NVIDIA GPU and nvCOMP: setenv('CPPZARR_NVCOMP_LIBRARY', 'path/to/libnvcomp.so.6') before the first
 % read, or put it next to libcppZarr.so)
 im = parallelReadZarrGPU('path/to/file.zarr', 'bbox', [1 1 1 100 100 50]);
+````
+
+#### parallelWriteZarrGPU - Write a gpuArray out as a Zarr image
+````
+% As parallelWriteZarr, with the same options, compressing on the GPU (Linux; needs the Parallel
+% Computing Toolbox, an NVIDIA GPU and nvCOMP, as parallelReadZarrGPU). Data of another class than
+% the array's data type is converted on the host and written from there: cast it on the GPU first,
+% as uint16(im), to keep the write on the GPU.
+im = gpuArray(uint16(randi(1000, 512, 512, 512)));
+parallelWriteZarrGPU('path/to/file.zarr', im, 'cname', 'zstd', 'clevel', 1, 'zarr_format', 3);
 ````
 
 #### convertZarrToV3 - Convert a Zarr v2 file to Zarr v3

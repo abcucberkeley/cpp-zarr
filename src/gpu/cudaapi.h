@@ -1,5 +1,6 @@
-// The CUDA driver API and nvCOMP, loaded when a GPU read first needs them (internal to the
-// library, not installed). cpp-zarr builds and runs without either: only GPU reads need them.
+// The CUDA driver API and nvCOMP, loaded when a GPU read or write first needs them (internal to
+// the library, not installed). cpp-zarr builds and runs without either: only GPU reads and writes
+// need them.
 // (The driver API works in whatever context the caller's GPU memory belongs to, the one CUDA
 // runtime users such as PyTorch, CuPy and MATLAB share, whatever CUDA version they use.)
 #ifndef CPPZARR_CUDAAPI_H
@@ -19,7 +20,8 @@ typedef void* CUstream;
 typedef void* CUevent;
 typedef unsigned long long CUdeviceptr;
 
-// nvCOMP's decompression options for each of its codecs: 64 bytes, all zeros the defaults
+// nvCOMP's decompression and compression options for each of its codecs: 64 bytes, all zeros the
+// defaults (but gzip compression's first field, its algorithm, which is 1 by default)
 struct NvcompOpts { int backend; int a; int b; char reserved[52]; };
 static_assert(sizeof(NvcompOpts) == 64, "nvCOMP's options are 64 bytes");
 struct NvcompAlignments { size_t input, output, temp; };
@@ -70,6 +72,14 @@ struct Api {
     int (*tempSize6[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t, void*);
     int (*tempSize5[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t);
     int (*alignments[NCodecs])(NvcompOpts, NvcompAlignments*);
+    // nvCOMP's compression (GPU writes), per codec (null for one the loaded nvCOMP does not compress)
+    int (*compressAsync[NCodecs])(const void* const*, const size_t*, size_t, size_t, void*, size_t, void* const*, size_t*,
+                                  NvcompOpts, int*, void*);
+    // (nvCOMP 6: ...CompressGetTempSize, which takes a stream; nvCOMP 5: ...CompressGetTempSizeAsync)
+    int (*compTempSize6[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t, void*);
+    int (*compTempSize5[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t);
+    int (*compMaxOutput[NCodecs])(size_t, NvcompOpts, size_t*);
+    int (*compAlignments[NCodecs])(NvcompOpts, NvcompAlignments*);
     int nvcompMajor = 0;
     std::string nvcompPath;
 };

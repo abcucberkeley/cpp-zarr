@@ -14,7 +14,7 @@
 #include <thread>
 #include <tuple>
 #include "gpu/cudaapi.h"
-#include "gpu/kernels_ptx.h"
+#include "gpu/gpucommon.h"
 #include "helperfunctions.h"
 #include "parallelreadzarr.h"
 #ifdef _WIN32
@@ -36,95 +36,6 @@
 using namespace czcuda;
 
 namespace {
-
-// ---------------------------------------------------------------- host threads
-// A pool of threads that persist between calls (so that small reads do not start threads), on
-// which a call runs fn(i) for i in [0, n) with up to `width` threads, the calling one among
-// them. Several calls can use it at once.
-class Pool {
-    struct Job {
-        const std::function<void(int64_t)>* fn = nullptr;
-        int64_t n = 0;
-        std::atomic<int64_t> next{0}, done{0};
-        int want = 0, joined = 0;
-        std::mutex dm;
-        std::condition_variable dcv;
-        std::string error;
-    };
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::shared_ptr<Job>> jobs;
-    std::vector<std::thread> threads;
-
-    static void work(Job &j){
-        while(true){
-            const int64_t i = j.next.fetch_add(1);
-            if(i >= j.n) return;
-            try{
-                (*j.fn)(i);
-            }
-            catch(const std::exception &e){
-                std::lock_guard<std::mutex> g(j.dm);
-                if(j.error.empty()) j.error = e.what();
-            }
-            catch(const std::string &e){
-                std::lock_guard<std::mutex> g(j.dm);
-                if(j.error.empty()) j.error = e;
-            }
-            if(j.done.fetch_add(1)+1 == j.n){
-                std::lock_guard<std::mutex> g(j.dm);
-                j.dcv.notify_all();
-            }
-        }
-    }
-    void worker(){
-        while(true){
-            std::shared_ptr<Job> j;
-            {
-                std::unique_lock<std::mutex> lk(m);
-                cv.wait(lk, [&]{ return !jobs.empty(); });
-                j = jobs.front();
-                if(++j->joined >= j->want) jobs.pop_front();
-            }
-            work(*j);
-        }
-    }
-public:
-    ~Pool(){ for(auto &t : threads) t.detach(); }
-    // Runs fn for every i; returns the first error an fn threw, or ""
-    std::string run(const int64_t n, int width, const std::function<void(int64_t)> &fn){
-        if(n <= 0) return "";
-        width = (int)std::max<int64_t>(1, std::min<int64_t>(width, n));
-        auto j = std::make_shared<Job>();
-        j->fn = &fn;
-        j->n = n;
-        j->want = width-1;
-        if(width > 1){
-            std::lock_guard<std::mutex> g(m);
-            while((int)threads.size() < std::min(width-1, 512)) threads.emplace_back([this]{ worker(); });
-            jobs.push_back(j);
-            // (as many threads as join it: woken all for every job, the threads of a wide pool
-            // cost small reads more than they gave)
-            for(int k = 0; k < j->want; k++) cv.notify_one();
-        }
-        work(*j);
-        {
-            std::unique_lock<std::mutex> lk(j->dm);
-            j->dcv.wait(lk, [&]{ return j->done.load() >= j->n; });
-        }
-        if(width > 1){
-            // (a job not every thread took yet leaves the queue: its items are all done)
-            std::lock_guard<std::mutex> g(m);
-            auto it = std::find(jobs.begin(), jobs.end(), j);
-            if(it != jobs.end()) jobs.erase(it);
-        }
-        return j->error;
-    }
-};
-Pool& pool(){
-    static Pool* p = new Pool();   // (never destroyed: its threads may outlive static destruction)
-    return *p;
-}
 
 // ---------------------------------------------------------------- files
 // A file read at offsets (pread; positioned ReadFile on Windows)
@@ -192,87 +103,7 @@ public:
     }
 };
 
-// ---------------------------------------------------------------- GPU state
-// The kernels and reusable buffers of one CUDA context
-struct Slot {
-    bool busy = false;
-    bool lost = false;               // (its GPU work never finished: its buffers are never reused)
-    uint8_t* host = nullptr;         // pinned staging: stored bytes, chunks decoded on the host, tables
-    size_t hostBytes = 0;
-    uint8_t* small = nullptr;        // pinned: the decompression checks' results
-    CUdeviceptr comp = 0, dec = 0, work = 0, temp = 0;
-    size_t compBytes = 0, decBytes = 0, workBytes = 0, tempBytes = 0;
-    bool compRegistered = false;     // (comp registered with cuFile, which then reads into it directly)
-};
-struct Ctx {
-    CUcontext ctx = nullptr;
-    CUmodule mod = nullptr;
-    CUfunction scatter32 = nullptr, scatter64 = nullptr, resolve = nullptr, fill = nullptr, check = nullptr;
-    int sms = 1;
-    NvcompAlignments align[NCodecs];
-    CUstream copyStream = nullptr;   // (GDS reads: the stored bytes' copies to the host, on their own)
-    std::mutex m;
-    std::vector<std::unique_ptr<Slot>> slots;
-};
-std::mutex ctxMutex;
-std::vector<std::unique_ptr<Ctx>> ctxs;
-
-struct Fail : std::runtime_error { using std::runtime_error::runtime_error; };
-
-void ck(const Api* a, CUresult r, const char* what){
-    if(r) throw Fail(std::string(what)+": "+errorText(a, r));
-}
-
-Ctx& context(const Api* a, CUcontext c){
-    std::lock_guard<std::mutex> g(ctxMutex);
-    for(auto &x : ctxs) if(x->ctx == c) return *x;
-    auto x = std::unique_ptr<Ctx>(new Ctx());
-    x->ctx = c;
-    std::string ptx;
-    for(const char* p : cppzarrKernelsPtx) ptx += p;
-    char log[4096] = {0};
-    int opts[2] = {5 /* CU_JIT_ERROR_LOG_BUFFER */, 6 /* CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES */};
-    void* vals[2] = {log, (void*)(uintptr_t)sizeof(log)};
-    const CUresult r = a->cuModuleLoadDataEx(&x->mod, ptx.c_str(), 2, opts, vals);
-    if(r) throw Fail("The GPU kernels could not be loaded ("+errorText(a, r)+(log[0] ? ": "+std::string(log) : "")+
-                     "): the NVIDIA driver may be too old");
-    ck(a, a->cuModuleGetFunction(&x->scatter32, x->mod, "cz_scatter32"), "cuModuleGetFunction");
-    ck(a, a->cuModuleGetFunction(&x->scatter64, x->mod, "cz_scatter64"), "cuModuleGetFunction");
-    ck(a, a->cuModuleGetFunction(&x->resolve, x->mod, "cz_resolve"), "cuModuleGetFunction");
-    ck(a, a->cuModuleGetFunction(&x->fill, x->mod, "cz_fill"), "cuModuleGetFunction");
-    ck(a, a->cuModuleGetFunction(&x->check, x->mod, "cz_check"), "cuModuleGetFunction");
-    CUdevice dev = 0;
-    ck(a, a->cuCtxGetDevice(&dev), "cuCtxGetDevice");
-    a->cuDeviceGetAttribute(&x->sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, dev);
-    for(int k = 0; k < NCodecs; k++){
-        x->align[k] = {1, 1, 1};
-        if(a->alignments[k]){
-            NvcompOpts o{};
-            if(a->alignments[k](o, &x->align[k])) x->align[k] = {1, 1, 1};
-        }
-    }
-    ctxs.push_back(std::move(x));
-    return *ctxs.back();
-}
-
-Slot& takeSlot(Ctx &c){
-    std::lock_guard<std::mutex> g(c.m);
-    for(auto &s : c.slots) if(!s->busy && !s->lost){ s->busy = true; return *s; }
-    c.slots.emplace_back(new Slot());
-    c.slots.back()->busy = true;
-    return *c.slots.back();
-}
-
-void growDevice(const Api* a, CUdeviceptr &p, size_t &have, const size_t need){
-    if(need <= have) return;
-    if(p) a->cuMemFree(p);
-    p = 0;
-    have = 0;
-    const size_t n = std::max<size_t>(need+need/4, 1 << 20);
-    ck(a, a->cuMemAlloc(&p, n), "Could not allocate GPU memory (cuMemAlloc)");
-    have = n;
-}
-
+// ---------------------------------------------------------------- GPU buffers
 // A slot's buffer for stored bytes of at least need bytes, keeping its first keep bytes (copied on
 // stream s, which then finishes); registered with cuFile when cf is given, so that GDS reads go
 // straight into it
@@ -691,9 +522,6 @@ struct Plan {
     std::vector<Chunk> chunks;
 };
 
-// 16-byte aligned
-uint64_t al16(uint64_t n){ return (n+15) & ~uint64_t(15); }
-
 void planRegions(std::vector<GpuRegion> &in, const bool cOrder, const bool widen16, Plan &P){
     for(auto &g : in){
         Region r;
@@ -855,30 +683,6 @@ void findChunks(FileJob &f, const Region &r){
     }
 }
 
-// The CUDA context GPU memory belongs to: the one it was allocated in, or for memory that belongs to
-// none (allocated through CUDA's virtual memory API or a stream-ordered memory pool, as PyTorch's
-// expandable segments and CuPy's async pool are) its device's primary context, the one the CUDA
-// runtime uses
-CUcontext memoryContext(const Api* a, const void* p){
-    CUcontext c = nullptr;
-    ck(a, a->cuPointerGetAttribute(&c, 1 /* CU_POINTER_ATTRIBUTE_CONTEXT */, (CUdeviceptr)(uintptr_t)p), "cuPointerGetAttribute");
-    if(c) return c;
-    int ordinal = -1;
-    ck(a, a->cuPointerGetAttribute(&ordinal, 9 /* CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL */, (CUdeviceptr)(uintptr_t)p),
-       "cuPointerGetAttribute (device)");
-    // (each device's primary context retained once: the runtime keeps it anyway)
-    static std::mutex m;
-    static std::map<int, CUcontext> primary;
-    std::lock_guard<std::mutex> g(m);
-    auto it = primary.find(ordinal);
-    if(it != primary.end()) return it->second;
-    CUdevice dev = 0;
-    ck(a, a->cuDeviceGet(&dev, ordinal), "cuDeviceGet");
-    ck(a, a->cuDevicePrimaryCtxRetain(&c, dev), "cuDevicePrimaryCtxRetain");
-    primary[ordinal] = c;
-    return c;
-}
-
 // A part of a read whose GPU work is under way: its slot, the event its work ends with, and what
 // the check of its decompression needs (the chunk of each codec's streams)
 struct Pending {
@@ -893,18 +697,6 @@ struct Pending {
 // and a piece of a run that one thread reads
 struct Run { const std::string* path; uint64_t off, bytes, at; };
 struct Piece { size_t run; uint64_t off, bytes; };
-
-// A thread with ctx current for a cuFile call, and its own context current again after it (cuFile's
-// compatibility mode can leave another one, or none, current: the copies after the reads then
-// failed with an invalid context)
-struct CtxFor {
-    const Api* a;
-    CUcontext was = nullptr;
-    CtxFor(const Api* api, CUcontext c) : a(api){ a->cuCtxGetCurrent(&was); a->cuCtxSetCurrent(c); }
-    ~CtxFor(){ a->cuCtxSetCurrent(was); }
-    CtxFor(const CtxFor&) = delete;
-    CtxFor& operator=(const CtxFor&) = delete;
-};
 
 // A part's reads with cuFile (GPUDirect Storage, or its compatibility mode): each run's whole
 // 4 KiB blocks (pieces from the block its first byte is in) into the slot's GPU buffer, then the

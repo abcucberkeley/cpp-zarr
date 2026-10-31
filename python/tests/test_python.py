@@ -592,8 +592,10 @@ def main():
             pass
     if not gpu_ok or not libs:
         print(f"reading into GPU memory  skipped ({why or 'no CuPy or PyTorch'})")
+        print(f"writing from GPU memory  skipped ({why or 'no CuPy or PyTorch'})")
     else:
         ok = ok and test_gpu(tmp, rng, libs)
+        ok = ok and test_gpu_write(tmp, rng, libs)
 
     if not ok:
         sys.exit("cppzarr Python round-trip test FAILED")
@@ -762,6 +764,131 @@ def test_gpu(tmp, rng, libs):
         except Exception:
             pass
     print(f"reading into GPU memory ({' and '.join(libs)}, {tried} reads)  {'OK' if good else 'FAIL'}")
+    return good
+
+
+def test_gpu_write(tmp, rng, libs):
+    """GPU writes against host writes: every data type (bfloat16 from PyTorch), compressors the GPU
+    compresses (blosc's zstd and lz4, none) and ones written through host memory (blosclz, gzip),
+    both formats, sharded or not, CuPy arrays and PyTorch tensors in C order, F order and strided,
+    then regions of other data written into the arrays (converted to their data type on the GPU),
+    and a write on a PyTorch stream: the arrays must read the same and hold the same chunk files"""
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if 'torch' not in libs:
+        torch = None
+    cupy = None
+    if 'cupy' in libs:
+        import cupy
+
+    def chunk_files(p):
+        return sorted(os.path.relpath(os.path.join(d, f), p) for d, _, fs in os.walk(p) for f in fs
+                      if f not in ('.zarray', 'zarr.json', '.zattrs'))
+
+    def to_gpu(lib, a, layout):
+        # a host array on the GPU, C-contiguous (layout 0), F-contiguous (1) or a strided view (2)
+        if lib == 'cupy':
+            if layout == 2:
+                big = cupy.zeros(a.shape[:-1] + (2 * a.shape[-1],), dtype=a.dtype)
+                big[..., ::2] = cupy.asarray(a)
+                return big[..., ::2]
+            return cupy.asarray(np.asarray(a, order='F' if layout == 1 else 'C'))
+        tdt = getattr(torch, 'bfloat16' if is_bfloat16(a.dtype) else np.dtype(a.dtype).name)
+        src = torch.from_numpy(np.ascontiguousarray(a).view(np.int16) if is_bfloat16(a.dtype) else np.ascontiguousarray(a))
+        if is_bfloat16(a.dtype):
+            src = src.view(torch.bfloat16)
+        t = src.to('cuda')
+        assert t.dtype == tdt
+        if layout == 1:
+            return t.permute(*range(t.ndim - 1, -1, -1)).contiguous().permute(*range(t.ndim - 1, -1, -1))
+        if layout == 2:
+            big = torch.zeros(t.shape[:-1] + (2 * t.shape[-1],), dtype=t.dtype, device='cuda')
+            big[..., ::2] = t
+            return big[..., ::2]
+        return t
+
+    good, n = True, 0
+    shape = (45, 33, 26)
+    dtypes = [np.uint8, np.int8, np.uint16, np.int16, np.uint32, np.int32, np.uint64, np.int64, np.float16, np.float32,
+              np.float64, np.complex64, np.complex128, np.bool_]
+    try:
+        import ml_dtypes
+        if torch is not None:
+            dtypes.append(ml_dtypes.bfloat16)
+    except ImportError:
+        pass
+    configs = [('zstd', 2, None), ('lz4', 2, None), ('zstd', 3, None), ('zstd', 3, [32, 32, 26]), ('lz4', 3, [32, 32, 26]),
+               ('blosclz', 2, None), ('gzip', 3, None), ('none', 3, [32, 32, 26])]
+    for k, dt in enumerate(dtypes):
+        if np.dtype(dt) == np.bool_:
+            data = rng.random(shape) > 0.5
+        elif np.dtype(dt).kind == 'c':
+            data = (rng.integers(0, 200, shape) + 1j * rng.integers(0, 50, shape)).astype(dt)
+        else:
+            data = rng.integers(0, 100, shape).astype(dt)
+        data[:16, :16, :16] = 0
+        part = data[3:40, 5:30, 2:20][::-1].copy()
+        for c, (cname, zf, shards) in enumerate(configs):
+            lib = libs[(k + c) % len(libs)]
+            if is_bfloat16(dt) and lib != 'torch':
+                continue
+            layout = (k + c) % 3
+            pc = os.path.join(tmp, f"gw_{np.dtype(dt).name}_{cname}_{zf}_{bool(shards)}_cpu.zarr")
+            pg = os.path.join(tmp, f"gw_{np.dtype(dt).name}_{cname}_{zf}_{bool(shards)}_gpu.zarr")
+            args = dict(cname=cname, zarr_format=zf, chunks=[16, 16, 13], shards=shards)
+            try:
+                cppzarr.write_zarr(pc, data, **args)
+                cppzarr.write_zarr(pg, to_gpu(lib, data, layout), num_threads=4, **args)
+                cppzarr.write_zarr(pc, part, [5, 3, 1], [42, 28, 19])
+                cppzarr.write_zarr(pg, to_gpu(lib, part, (layout + 1) % 3), [5, 3, 1], [42, 28, 19])
+            except Exception as ex:
+                good = False
+                print('  GPU write failed:', lib, pg, ex)
+                continue
+            n += 2
+            a, b = cppzarr.read_zarr(pc), cppzarr.read_zarr(pg)
+            if a.dtype != b.dtype or a.tobytes() != b.tobytes() or chunk_files(pc) != chunk_files(pg):
+                good = False
+                print('  GPU write differs from the host write:', lib, pg)
+    # regions of other data converted to the array's data type on the GPU (floats into uint16)
+    for lib in libs:
+        pc, pg = os.path.join(tmp, f'gw_conv_{lib}_cpu.zarr'), os.path.join(tmp, f'gw_conv_{lib}_gpu.zarr')
+        data = rng.integers(0, 1000, shape).astype(np.uint16)
+        part = (rng.random((20, 20, 10)) * 999).astype(np.float32)
+        cppzarr.write_zarr(pc, data, zarr_format=3)
+        cppzarr.write_zarr(pg, to_gpu(lib, data, 0), zarr_format=3)
+        cppzarr.write_zarr(pc, part, [5, 5, 5], [25, 25, 15])
+        cppzarr.write_zarr(pg, to_gpu(lib, part, 0), [5, 5, 5], [25, 25, 15])
+        n += 1
+        if cppzarr.read_zarr(pc).tobytes() != cppzarr.read_zarr(pg).tobytes():
+            good = False
+            print('  GPU write of data converted to the array\'s data type differs:', lib)
+    # on a PyTorch stream, data made on it
+    if torch is not None:
+        st = torch.cuda.Stream()
+        with torch.cuda.stream(st):
+            t = torch.arange(45 * 33 * 26, device='cuda', dtype=torch.int32).reshape(shape) % 1000
+            p = os.path.join(tmp, 'gw_stream.zarr')
+            cppzarr.write_zarr(p, t, zarr_format=3, stream=st)
+        n += 1
+        if not np.array_equal(cppzarr.read_zarr(p), (np.arange(45 * 33 * 26, dtype=np.int32).reshape(shape) % 1000)):
+            good = False
+            print('  GPU write on a PyTorch stream differs')
+        # (no stream given: the current one, where the data was made, after the GPU spends a while
+        # on it: a write on another stream would find zeros)
+        with torch.cuda.stream(st):
+            t = torch.zeros(shape, device='cuda', dtype=torch.int16)
+            torch.cuda._sleep(100_000_000)
+            t.fill_(3)
+            p = os.path.join(tmp, 'gw_current_stream.zarr')
+            cppzarr.write_zarr(p, t, zarr_format=3)
+        n += 1
+        if not np.array_equal(cppzarr.read_zarr(p), np.full(shape, 3, np.int16)):
+            good = False
+            print('  GPU write of data made on the current PyTorch stream differs')
+    print(f"writing from GPU memory ({' and '.join(libs)}, {n} writes)  {'OK' if good else 'FAIL'}")
     return good
 
 

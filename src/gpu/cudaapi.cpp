@@ -132,6 +132,20 @@ bool loadNvcomp(Api &a, std::string &why){
         why = "the nvCOMP found ("+a.nvcompPath+") is older than version 5, which cpp-zarr needs";
         return false;
     }
+    // (compression, for GPU writes: each codec's temporary memory size as this nvCOMP version asks
+    // for it, since nvCOMP 4's ...CompressGetTempSize has the name of nvCOMP 6's and other arguments)
+    for(int c = 0; c < NCodecs; c++){
+        const std::string n = std::string("nvcompBatched")+codecNames[c]+"Compress";
+        bool ok = get(lib, a.compressAsync[c], (n+"Async").c_str()) && get(lib, a.compMaxOutput[c], (n+"GetMaxOutputChunkSize").c_str()) &&
+                  get(lib, a.compAlignments[c], (n+"GetRequiredAlignments").c_str());
+        if(a.nvcompMajor >= 6) ok = ok && get(lib, a.compTempSize6[c], (n+"GetTempSize").c_str());
+        else ok = ok && get(lib, a.compTempSize5[c], (n+"GetTempSizeAsync").c_str());
+        if(!ok){
+            a.compressAsync[c] = nullptr;
+            a.compTempSize6[c] = nullptr;
+            a.compTempSize5[c] = nullptr;
+        }
+    }
     return true;
 }
 
