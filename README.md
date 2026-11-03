@@ -240,6 +240,11 @@ cppzarr.write_zarr('filename.zarr', im)
 
 # Write to a specified region with different data (the file keeps its Zarr version)
 cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0,0,0], end_coords=[100,100,100])
+
+# Writes keep the buffers of chunks over 1 MB for later writes, up to CPPZARR_WRITE_KEEP_MB
+# (1024) MB in all (0: none), so that a big array written a chunk or a few at a time does not
+# allocate them again every call; with fewer chunks of 4 MB or more than threads, every thread
+# helps put the chunks together
 ````
 
 #### Convert a Zarr v2 file to Zarr v3

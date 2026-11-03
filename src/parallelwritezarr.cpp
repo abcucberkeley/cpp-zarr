@@ -84,22 +84,62 @@ struct ShardOut {
     std::vector<uint64_t> oldIndex;
 };
 
+// Chunks of this many bytes or more, fewer than the threads, are put together by several
+// threads each (a test build sets it lower, to take that way with small arrays)
+#ifndef CPPZARR_WRITE_HELP_MIN
+#define CPPZARR_WRITE_HELP_MIN (4 << 20)
+#endif
+
 namespace {
+const uint64_t helpMin = CPPZARR_WRITE_HELP_MIN;
+
+// The bytes of chunk buffers over 1 MB the writer threads' pool keeps between calls (see
+// WriteScratch), and the most it may: CPPZARR_WRITE_KEEP_MB (1024) MB
+std::atomic<uint64_t> keptWriteBytes{0};
+uint64_t writeKeepCap(){
+    static const uint64_t cap = [](){
+        const char* e = std::getenv("CPPZARR_WRITE_KEEP_MB");
+        return (uint64_t)(std::max(0.0, e && *e ? std::atof(e) : 1024.0)*(1 << 20));
+    }();
+    return cap;
+}
+
 // A writer thread's buffers and zstd encoder, kept in a pool between calls (see
-// ScratchPool). Buffers for chunks over 1 MB, and an encoder over 8 MB, are not kept.
+// ScratchPool). An encoder over 8 MB is not kept, nor buffers for chunks over 1 MB once
+// the pool's add up to writeKeepCap(): a write of a big chunk at a time (one 512x512x270
+// uint16 chunk a call, as PetaKit5D's resaving writes them) otherwise faulted in two new
+// buffers of its size every call. With them kept, 16 such calls wrote their file in 0.74-0.88
+// of the time with one thread, and in 0.35-0.54 with 12 and 24 (without the help below).
 struct WriteScratch {
     std::unique_ptr<uint8_t[]> unc, comp;
     uint64_t uncCap = 0, compCap = 0;
+    // (the bytes of unc and comp counted in keptWriteBytes)
+    uint64_t kept = 0;
     std::vector<uint8_t> stored, copyBuf;
     ZSTD_CCtx* zctx = nullptr;
     WriteScratch(){}
     WriteScratch(const WriteScratch&) = delete;
     WriteScratch& operator=(const WriteScratch&) = delete;
     ~WriteScratch(){
+        if(kept) keptWriteBytes.fetch_sub(kept);
         if(zctx) ZSTD_freeCCtx(zctx);
     }
-    // A chunk's uncompressed (n) and compressed (nc) buffers
+    // Its buffers for a chunk over 1 MB given up, and their bytes no longer counted as kept
+    void dropBig(){
+        if(uncCap <= (1 << 20)) return;
+        if(kept) keptWriteBytes.fetch_sub(kept);
+        kept = 0;
+        unc.reset();
+        comp.reset();
+        uncCap = compCap = 0;
+    }
+    // A chunk's uncompressed (n) and compressed (nc) buffers. (Not a kept big chunk's for
+    // chunks of up to 1 MB: those get buffers their own size, as before, since the pages of a
+    // big chunk's, put together by several threads, may be on another NUMA node: writes of a
+    // 512 KB chunk at a time on a 48-core node took up to 2.2 times as long after a write of
+    // 4 MB chunks had left its buffers.)
     void buffers(const uint64_t n, const uint64_t nc){
+        if(n <= (1 << 20)) dropBig();
         if(uncCap < n){
             unc.reset();
             unc.reset(new uint8_t[n]);
@@ -114,9 +154,19 @@ struct WriteScratch {
     void shrink(){
         const uint64_t keep = 1 << 20;
         if(uncCap > keep){
-            unc.reset();
-            comp.reset();
-            uncCap = compCap = 0;
+            // (counted in keptWriteBytes if the pool's kept buffers stay within the cap)
+            const uint64_t mine = uncCap+compCap;
+            uint64_t total = keptWriteBytes.load();
+            bool fits = total-kept+mine <= writeKeepCap();
+            while(fits && !keptWriteBytes.compare_exchange_weak(total, total-kept+mine)) fits = total-kept+mine <= writeKeepCap();
+            if(fits) kept = mine;
+            else{
+                if(kept) keptWriteBytes.fetch_sub(kept);
+                kept = 0;
+                unc.reset();
+                comp.reset();
+                uncCap = compCap = 0;
+            }
         }
         if(stored.capacity() > keep) std::vector<uint8_t>().swap(stored);
         if(copyBuf.capacity() > keep) std::vector<uint8_t>().swap(copyBuf);
@@ -360,10 +410,7 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
 
     // Sparse writes leave all-zero chunks unwritten, when that is how a missing
     // chunk reads back (a fill value whose bytes are all zero)
-    void* zeroChunkUnc = NULL;
-    if(sparse && !prepared && fillValueIsZero(Zarr.get_fill_value(), Zarr.get_dtype())){
-        zeroChunkUnc = calloc(s,bytes);
-    }
+    const bool checkZero = sparse && !prepared && fillValueIsZero(Zarr.get_fill_value(), Zarr.get_dtype());
 
     std::atomic<int> err{0};
     std::string errString;
@@ -738,13 +785,71 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
         appendReady(sh, buf);
     };
 
+    // Fewer chunk files than threads, of at least 4 MB: the threads past the team help the
+    // team's threads put their chunks together, thread w with chunk w%team, each copying a
+    // part of the chunk along its slowest stored axis (and checking it for zeros), while blosc
+    // compresses with the threads left over as before. With the help and the kept buffers, 16
+    // calls of a 512x512x270 uint16 chunk (PetaKit5D's resaving) wrote their file in 0.30-0.71
+    // of the time with 12 to 48 threads (on 24- and 48-core nodes, into RAM, a local disk and
+    // VAST), calls of 2 to 4 of them in 0.52-0.91 and all-zero ones in 0.16-0.34; the help alone
+    // 0.51-0.61. (A part of at least 2 MB a thread: with all of a chunk's threads, 4 MB chunks
+    // took up to 1.5 times as long.)
+    const bool helping = !sharded && !prepared && numWork < numWorkers && sB >= helpMin;
+    // A chunk being put together by its thread and helpers: what its thread set up for them
+    // before go (the input's box and where it goes in the chunk, the axis that splits it into
+    // parts, one a thread), how many parts are done, whether any had a byte that is not zero,
+    // and whether its thread is done with the chunk (helpers wait for that before leaving the
+    // region, sleeping, so as not to spin at its end while blosc's threads compress)
+    struct ChunkCopy {
+        std::atomic<int> go{0}, done{0}, nonzero{0}, finished{0};
+        const uint8_t* src = nullptr;
+        uint8_t* dst = nullptr;
+        std::vector<uint64_t> ext;
+        uint64_t axis = 0;
+        int parts = 1;
+        bool zeroCheck = false;
+    };
+    std::unique_ptr<ChunkCopy[]> copies(helping ? new ChunkCopy[team] : nullptr);
+    // Copy part p of a chunk's box, and check it for zeros: its bytes from its first element to
+    // its last (the box's other axes are the chunk's faster ones, so the parts do not overlap,
+    // and the elements between theirs, outside the box, hold the fill value, zero)
+    auto copyPart = [&](ChunkCopy &c, const int p){
+        try{
+            const uint64_t n = c.ext[c.axis], lo = n*(uint64_t)p/(uint64_t)c.parts, hi = n*(uint64_t)(p+1)/(uint64_t)c.parts;
+            if(hi > lo){
+                std::vector<uint64_t> e = c.ext;
+                e[c.axis] = hi-lo;
+                uint8_t* dst = c.dst+lo*chunkStrides[c.axis]*bytes;
+                copyBoxND(bytes, c.src+lo*inStrides[c.axis]*bytes, dst, e, inStrides, chunkStrides);
+                if(c.zeroCheck){
+                    uint64_t last = 0;
+                    for(uint64_t d = 0; d < nDims; d++) last += (e[d]-1)*chunkStrides[d];
+                    if(!allZeroBytes(dst, (last+1)*bytes)) c.nonzero.store(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        catch(const std::exception &e){
+            reportError(std::string("Write error: ")+e.what()+"\n");
+        }
+        c.done.fetch_add(1, std::memory_order_acq_rel);
+    };
+
     WorkRanges work(team, sharded ? 0 : lastChunk-firstChunk);
-    // (in a region of all of the threads, those past the team doing nothing: OpenMP ends
-    // the threads a smaller region leaves out, and starts them again for the next bigger
+    // (in a region of all of the threads, those past the team doing nothing but help: OpenMP
+    // ends the threads a smaller region leaves out, and starts them again for the next bigger
     // one, every call here, after the region of all of them above)
     #pragma omp parallel num_threads(numWorkers)
+    {
+    // (the helpers' chunks, only with all of the threads asked for: one a thread had not
+    // been would never be written)
+    const bool helpNow = helping && omp_get_num_threads() == numWorkers;
     if(omp_get_thread_num() < team)
     {
+        // (the helpers of this thread's chunk wait for this as it leaves, see ChunkCopy)
+        struct Finished {
+            ChunkCopy* c;
+            ~Finished(){ if(c) c->finished.store(1, std::memory_order_release); }
+        } finished{helpNow ? &copies[omp_get_thread_num()] : nullptr};
         const LocalMemoryPolicy memoryPolicy;
         const int w = omp_get_thread_num();
         // This thread's buffers and zstd encoder, from the pool
@@ -864,10 +969,38 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
                 dstOff += boxLo[d]*chunkStrides[d];
             }
             if(!fullChunk && !existing) fillOutsideBoxND(bytes, chunkUnC, chunkDims, chunkStrides, boxLo, boxHi, fillElem);
-            copyBoxND(bytes, (const uint8_t*)zarrArr+srcOff*bytes, chunkUnC+dstOff*bytes, boxExt, inStrides, chunkStrides);
+            bool zero = false;
+            if(helpNow){
+                // (with this chunk's helpers, a part each, split along the box's axis with the
+                // biggest stride in the chunk; this thread waits for all of them, whatever
+                // happens elsewhere, before it uses or gives back the chunk's buffer)
+                ChunkCopy &c = copies[w];
+                c.src = (const uint8_t*)zarrArr+srcOff*bytes;
+                c.dst = chunkUnC+dstOff*bytes;
+                c.ext = boxExt;
+                uint64_t best = 0;
+                for(uint64_t d = 0; d < nDims; d++){
+                    if(boxExt[d] > 1 && chunkStrides[d] >= best){
+                        best = chunkStrides[d];
+                        c.axis = d;
+                    }
+                }
+                // (a part a thread of its group, of at least 2 MB)
+                c.parts = (int)std::min<uint64_t>((uint64_t)((numWorkers-1-w)/team+1), std::max<uint64_t>(1, sB >> 21));
+                c.zeroCheck = checkZero && !existing;
+                c.go.store(1, std::memory_order_release);
+                copyPart(c, 0);
+                waitFor([&]{ return c.done.load(std::memory_order_acquire) == c.parts; }, []{ return false; });
+                if(err) return false;
+                zero = checkZero && (existing ? allZeroBytes(chunkUnC, sB) : c.nonzero.load(std::memory_order_relaxed) == 0);
+            }
+            else{
+                copyBoxND(bytes, (const uint8_t*)zarrArr+srcOff*bytes, chunkUnC+dstOff*bytes, boxExt, inStrides, chunkStrides);
+                zero = checkZero && allZeroBytes(chunkUnC, sB);
+            }
 
             // An all-zero chunk is left unwritten (it reads back as zeros)
-            if(zeroChunkUnc && !memcmp(zeroChunkUnc,chunkUnC,sB)){
+            if(zero){
                 out.zero = true;
                 return true;
             }
@@ -973,8 +1106,9 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
 
         try{
             if(!sharded){
-                // Chunk files: contiguous blocks of chunks with work stealing
-                for(int64_t i = (err || !haveBuffers) ? -1 : work.next(w); i >= 0; i = err ? -1 : work.next(w)){
+                // Chunk files: contiguous blocks of chunks with work stealing (with helpers,
+                // chunk w, which they help with)
+                for(int64_t i = (err || !haveBuffers) ? -1 : (helpNow ? w : work.next(w)); i >= 0; i = (err || helpNow) ? -1 : work.next(w)){
                     const int64_t f = firstChunk+i;
                     StoredChunk c;
                     if(prepared){
@@ -1075,7 +1209,20 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
         }
         catch(const std::exception&){}
     }
-    free(zeroChunkUnc);
+    else if(helpNow){
+        // A helper: its part of chunk w%team once that chunk's thread has set it up (or
+        // nothing, if that thread is done without it), then it waits for that thread to be
+        // done with the chunk
+        const LocalMemoryPolicy memoryPolicy;
+        const int w = omp_get_thread_num();
+        ChunkCopy &c = copies[w%team];
+        waitFor([&]{ return c.go.load(std::memory_order_acquire) || c.finished.load(std::memory_order_acquire); }, []{ return false; });
+        if(c.go.load(std::memory_order_acquire)){
+            if(w/team < c.parts) copyPart(c, w/team);
+            waitFor([&]{ return c.finished.load(std::memory_order_acquire) != 0; }, []{ return false; });
+        }
+    }
+    }
 
     // After an error, a shard that was not finished is not moved into place (its
     // temporary file is removed)

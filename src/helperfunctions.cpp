@@ -661,6 +661,24 @@ static void fillTyped(void* dst, const uint64_t n, const void* elem){
     std::fill_n((T*)dst, n, v);
 }
 
+bool allZeroBytes(const void* p, const uint64_t n){
+    const uint8_t* b = (const uint8_t*)p;
+    uint64_t i = 0;
+    // (to an 8-byte boundary, then 256 bytes at a time, then the rest)
+    for(; i < n && ((uintptr_t)(b+i) & 7); i++) if(b[i]) return false;
+    for(; i+256 <= n; i += 256){
+        uint64_t acc = 0;
+        for(int k = 0; k < 32; k++){
+            uint64_t v;
+            memcpy(&v, b+i+8*k, 8);
+            acc |= v;
+        }
+        if(acc) return false;
+    }
+    for(; i < n; i++) if(b[i]) return false;
+    return true;
+}
+
 void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void* elem){
     // Elements whose bytes are all equal (e.g. 0) are a plain memset
     const uint8_t* e = (const uint8_t*)elem;

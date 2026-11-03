@@ -98,6 +98,9 @@ void copyBoxTransposed(const uint64_t bytes, const void* src, void* dst,
 // Set n elements of size `bytes` to the element whose bytes are at `elem`.
 void fillElements(const uint64_t bytes, void* dst, const uint64_t n, const void* elem);
 
+// Whether the n bytes at p are all zero (stops at the first 256 bytes that are not)
+bool allZeroBytes(const void* p, const uint64_t n);
+
 // CRC32C (Castagnoli) checksum, as Zarr v3 uses for shard indexes.
 uint32_t crc32c(const uint8_t* data, size_t length);
 

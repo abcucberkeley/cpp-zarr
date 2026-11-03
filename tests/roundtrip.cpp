@@ -1669,6 +1669,113 @@ int main(int argc, char** argv){
             return ok;
         });
 
+        check("writes of fewer chunks of 4 MB or more than threads (each put together by several threads): the same bytes and data with 1, 3, 8 and 16 threads, C and F order, v2 and v3, 1, 2 and 8 bytes an element, edge chunks, crop writes into them, all-zero chunks left out, a fill value of 7, written again with their buffers kept", [&](){
+            auto files = [&](const std::string& path){
+                std::vector<std::pair<std::string, std::string>> out;
+                for (const auto& e : std::filesystem::recursive_directory_iterator(path)){
+                    if (!e.is_regular_file()) continue;
+                    std::ifstream f(e.path(), std::ios::binary);
+                    out.push_back({std::filesystem::relative(e.path(), path).string(), std::string(std::istreambuf_iterator<char>(f), {})});
+                }
+                std::sort(out.begin(), out.end());
+                return out;
+            };
+            struct Spec { const char* name; int fmt; const char* order; const char* dtype; uint64_t bytes; const char* comp; const char* fill; V shape, chunks; };
+            // (chunks of 4.6 to 5.2 MB; the arrays' edges cut the last ones)
+            const std::vector<Spec> specs = {
+                {"help_u2_F", 2, "F", "<u2", 2, "zstd", "0", {300, 260, 70}, {256, 128, 70}},
+                {"help_u2_C", 2, "C", "<u2", 2, "lz4", "0", {300, 260, 70}, {256, 128, 70}},
+                {"help_u1_v3", 3, "C", "|u1", 1, "zstd", "0", {300, 260, 70}, {256, 260, 70}},
+                {"help_f8_F", 2, "F", "<f8", 8, "gzip", "0", {200, 130, 40}, {128, 128, 40}},
+                {"help_fill7", 2, "F", "<u2", 2, "zstd", "7", {300, 260, 70}, {256, 128, 70}},
+            };
+            // Bytes of n elements of b bytes: smooth values, all zero in the first chunk, and
+            // in the chunk at the far corner zero but for its last element (in its last part)
+            auto makeData = [&](const Spec& sp, int seed){
+                const V& s = sp.shape;
+                std::vector<uint8_t> d(s[0]*s[1]*s[2]*sp.bytes);
+                // (the far corner's chunk starts at f)
+                V f(3);
+                for (int k = 0; k < 3; k++) f[k] = ((s[k]-1)/sp.chunks[k])*sp.chunks[k];
+                for (uint64_t z = 0; z < s[2]; z++) for (uint64_t y = 0; y < s[1]; y++) for (uint64_t x = 0; x < s[0]; x++){
+                    const uint64_t i = x + s[0]*(y + s[1]*z);
+                    bool zero = x < sp.chunks[0] && y < sp.chunks[1] && z < sp.chunks[2];
+                    zero = zero || (x >= f[0] && y >= f[1] && z >= f[2] && !(x == s[0]-1 && y == s[1]-1 && z == s[2]-1));
+                    for (uint64_t b = 0; b < sp.bytes; b++)
+                        d[i*sp.bytes+b] = zero ? 0 : (uint8_t)((x + 3*y + 7*z + 11*b + seed) % 251 + 1);
+                }
+                return d;
+            };
+            auto newArr = [&](const Spec& sp, const std::string& path){
+                std::error_code ec;
+                std::filesystem::remove_all(path, ec);
+                zarr Z;
+                Z.set_fileName(path);
+                if (sp.fmt == 3) Z.set_zarr_format(3);
+                Z.set_cname(sp.comp); Z.set_clevel(1); Z.set_order(sp.order); Z.set_chunks(sp.chunks);
+                Z.set_dtype(sp.dtype); Z.set_shape(sp.shape); Z.set_fill_value(sp.fill);
+                Z.write_zarray();
+            };
+            auto writeBox = [&](const Spec& sp, const std::string& path, const std::vector<uint8_t>& d, const V& s, const V& e, bool crop){
+                zarr W(path);
+                W.set_chunkInfo(s, e);
+                const V ws = {e[0]-s[0], e[1]-s[1], e[2]-s[2]};
+                if (parallelWriteZarr(W, const_cast<uint8_t*>(d.data()), s, e, ws, 8*sp.bytes, true, crop))
+                    throw std::string("write: ") + W.get_errString();
+            };
+            bool ok = true;
+            for (const Spec& sp : specs){
+                const std::string path = dir + "/rt_" + sp.name + ".zarr";
+                const std::vector<uint8_t> d1 = makeData(sp, 0);
+                // (a crop write's box, cutting every chunk, and its data)
+                const V cs = {10, 20, 5}, ce = {sp.shape[0]-10, sp.shape[1]-10, sp.shape[2]-5};
+                Spec box = sp;
+                box.shape = {ce[0]-cs[0], ce[1]-cs[1], ce[2]-cs[2]};
+                const std::vector<uint8_t> d2 = makeData(box, 5);
+                std::vector<uint8_t> want = d1;
+                for (uint64_t z = cs[2]; z < ce[2]; z++) for (uint64_t y = cs[1]; y < ce[1]; y++) for (uint64_t x = cs[0]; x < ce[0]; x++)
+                    memcpy(&want[(x + sp.shape[0]*(y + sp.shape[1]*z))*sp.bytes],
+                           &d2[((x-cs[0]) + box.shape[0]*((y-cs[1]) + box.shape[1]*(z-cs[2])))*sp.bytes], sp.bytes);
+                auto readOk = [&](const std::vector<uint8_t>& expect){
+                    std::vector<uint8_t> got(expect.size());
+                    zarr Z(path);
+                    Z.set_chunkInfo({0, 0, 0}, sp.shape);
+                    return !parallelReadZarr(Z, got.data(), {0, 0, 0}, sp.shape, sp.shape, 8*sp.bytes, true, false, false) && got == expect;
+                };
+                std::vector<std::pair<std::string, std::string>> firstWhole, firstCrop;
+                for (int threads : {1, 3, 8, 16}){
+                    omp_set_num_threads(threads);
+                    newArr(sp, path);
+                    writeBox(sp, path, d1, {0, 0, 0}, sp.shape, false);
+                    const auto whole = files(path);
+                    if (firstWhole.empty()) firstWhole = whole;
+                    const bool sameWhole = whole == firstWhole && readOk(d1);
+                    // (again, with the buffers the pool kept from the write before)
+                    writeBox(sp, path, d1, {0, 0, 0}, sp.shape, false);
+                    const bool sameAgain = files(path) == firstWhole && readOk(d1);
+                    writeBox(sp, path, d2, cs, ce, true);
+                    const auto cropped = files(path);
+                    if (firstCrop.empty()) firstCrop = cropped;
+                    const bool sameCrop = cropped == firstCrop && readOk(want);
+                    // (the metadata and every chunk file but the all-zero first chunk's where the
+                    // fill value is zero; the far corner's chunk, zero but for its last element, is
+                    // written)
+                    uint64_t nChunks = 1;
+                    for (int d = 0; d < 3; d++) nChunks *= (sp.shape[d]+sp.chunks[d]-1)/sp.chunks[d];
+                    const bool zeroOut = whole.size() == (std::string(sp.fill) == "0" ? nChunks : nChunks+1);
+                    if (!(sameWhole && sameAgain && sameCrop && zeroOut)){
+                        std::fprintf(stderr, "    %s with %d threads:%s%s%s%s (%d files of %d chunks)\n", sp.name, threads, sameWhole ? "" : " whole write",
+                                     sameAgain ? "" : " written again", sameCrop ? "" : " crop write", zeroOut ? "" : " all-zero chunk",
+                                     (int)whole.size(), (int)nChunks);
+                        for (const auto& f : whole) std::fprintf(stderr, "      %s\n", f.first.c_str());
+                        ok = false;
+                    }
+                }
+            }
+            omp_set_num_threads(maxThreads);
+            return ok;
+        });
+
         check("reads of big chunks of the zstd codec itself (decoded a part at a time), regions in F and C order, 1, 8 and 16 threads", [&](){
             // A chunk's zstd frame rewritten: without its content size in its header (with a
             // window as big as its data instead, which a single-segment frame does not state),
