@@ -166,6 +166,10 @@ struct WriteScratch {
                 comp.reset();
                 uncCap = compCap = 0;
             }
+            else{
+                freeLazily(unc.get(), uncCap);
+                freeLazily(comp.get(), compCap);
+            }
         }
         if(stored.capacity() > keep) std::vector<uint8_t>().swap(stored);
         if(copyBuf.capacity() > keep) std::vector<uint8_t>().swap(copyBuf);

@@ -79,6 +79,21 @@ static bool onNetworkStorage(const std::string& dir){
 #endif
 }
 
+// The process's memory given back lazily (MADV_FREE) and not yet taken back, in bytes, from
+// /proc/self/smaps_rollup (Linux 4.14); -1 where that cannot be found
+static int64_t lazyFreeBytes(){
+#ifdef __linux__
+    std::ifstream f("/proc/self/smaps_rollup");
+    std::string key;
+    int64_t kb = 0;
+    while (f >> key){
+        if (key == "LazyFree:" && (f >> kb)) return kb * 1024;
+        f.ignore(1 << 20, '\n');
+    }
+#endif
+    return -1;
+}
+
 static void step(const char* name, const char* comp, const char* order, const char* what){
     std::fprintf(stderr, "  [%s/%s/%s] %s\n", name, comp, order, what);
     std::fflush(stderr);
@@ -1602,6 +1617,12 @@ int main(int argc, char** argv){
             const bool keeps = want >= (uint64_t(64) << 20);
             Made a = make("kept_release", 3, {1024, 1024, 8}, {1024, 1024, 4}, {}, "F", "zstd", "/", "<u2");
             const uint64_t kept = keptBufferBytes();
+            // (idle, they are given back lazily, on Linux: 8 MB or more of their 16 MB a chunk,
+            // unless the system has taken them back already)
+            const int64_t lazy = lazyFreeBytes();
+            std::printf("    (writes kept %.1f MB, %s)\n", kept/1048576.0,
+                        lazy < 0 ? "lazily freed memory not known" : (std::to_string(lazy >> 20) + " MB of the process's memory lazily freed").c_str());
+            ok = ok && (!keeps || lazy < 0 || lazy >= (int64_t(8) << 20));
             ok = ok && (!keeps || kept > 0) && kept <= want && readsBack(a);
             releaseBuffers();
             const uint64_t after = keptBufferBytes();

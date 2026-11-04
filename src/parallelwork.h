@@ -19,9 +19,32 @@
 #include <pthread.h>
 #endif
 #ifdef __linux__
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+// (Linux 4.5; older headers lack it, and an older kernel refuses it, which leaves the memory as it was)
+#ifndef MADV_FREE
+#define MADV_FREE 8
 #endif
+#endif
+
+// A buffer kept for later calls given back to the system lazily while it is idle (Linux's
+// MADV_FREE, on the whole pages of its first n bytes): it stays the process's, and is reused
+// without page faults, unless the system or the job's memory limit needs the memory, which
+// then takes it instead of the job running out (its contents are lost then; a buffer kept is
+// always written before it is read). Kept buffers up to the cap pushed jobs sized close to
+// what they need over their limit: a 4-CPU PetaKit5D task that runs in a job of 2000 MB was
+// killed in one of 2050 MB.
+inline void freeLazily(void* p, const uint64_t n){
+#ifdef __linux__
+    static const uintptr_t page = (uintptr_t)std::max(4096L, sysconf(_SC_PAGESIZE));
+    const uintptr_t a = ((uintptr_t)p+page-1) & ~(page-1), b = ((uintptr_t)p+n) & ~(page-1);
+    if(p && b > a) madvise(reinterpret_cast<void*>(a), b-a, MADV_FREE);
+#else
+    (void)p;
+    (void)n;
+#endif
+}
 
 // fork() and the library. A child made by fork() has only the thread that forked, and the rest
 // of the library's state as it was then:

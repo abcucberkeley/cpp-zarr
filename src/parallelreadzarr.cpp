@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <limits>
@@ -25,6 +26,7 @@
 #ifdef __linux__
 #include <dirent.h>
 #include <mutex>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
@@ -275,6 +277,13 @@ bool readFully(const int fd, void* buf, uint64_t n, uint64_t off){
     }
     return true;
 }
+
+// The calling thread's voluntary context switches so far: a read that waited for its data (from a
+// server or a disk) made some, a read the page cache served made none
+long threadWaits(){
+    struct rusage ru;
+    return getrusage(RUSAGE_THREAD, &ru) == 0 ? (long)ru.ru_nvcsw : 0;
+}
 #endif
 
 // A run of a reader thread's chunk files read ahead by the read pool (see readFilesAhead): the
@@ -296,6 +305,13 @@ struct FileRun {
     std::vector<int64_t> len;
     std::atomic<int> left[most];
     std::atomic<bool> good[most];
+    // Whether a read of item k waited for its data; and a run whose files the pool only opens, each
+    // one's descriptor, for the thread to read it itself (see readFilesAhead)
+    std::atomic<bool> waited[most];
+    bool openOnly = false;
+#ifdef __linux__
+    std::vector<std::shared_ptr<FdCloser>> fds;
+#endif
     std::mutex m;
     std::condition_variable cv;
     Pending pend;
@@ -304,6 +320,7 @@ struct FileRun {
             taken[k].store(false, std::memory_order_relaxed);
             left[k].store(0, std::memory_order_relaxed);
             good[k].store(true, std::memory_order_relaxed);
+            waited[k].store(false, std::memory_order_relaxed);
         }
     }
     // Whether the caller is the first to start item k's reading (and so reads it)
@@ -336,6 +353,9 @@ struct FileRun {
             name.push_back(nullptr);
             path.emplace_back();
             len.push_back(-1);
+#ifdef __linux__
+            fds.emplace_back();
+#endif
         }
         if((int64_t)buf.size() <= k){
             buf.emplace_back();
@@ -363,6 +383,10 @@ struct FileRun {
         uint64_t b = 0;
         for(size_t k = 0; k < buf.size(); k++) if(cap[k] > least) b += std::min(cap[k], filled[k]+(2 << 20));
         return b;
+    }
+    // Its buffers over least, kept, given back lazily while idle (see freeLazily)
+    void freeBigLazily(const uint64_t least){
+        for(size_t k = 0; k < buf.size(); k++) if(cap[k] > least) freeLazily(buf[k].get(), filled[k]);
     }
     // Its buffers over least freed
     void dropBig(const uint64_t least){
@@ -395,6 +419,11 @@ struct ReadScratch {
     ZSTD_DCtx* zctx = nullptr;
     // The run of chunk files being decoded and the one after it, read ahead
     FileRun ahead[2];
+    // The buffer the thread reads the files the pool only opens into, one after another, and whether
+    // its next run is read so (see readFilesAhead)
+    std::unique_ptr<uint8_t[]> own;
+    uint64_t ownCap = 0, ownFilled = 0;
+    bool readOwn = false;
     // (the bytes of the runs' buffers over 1 MB counted as kept: see keepBuffers)
     uint64_t kept = 0;
     ReadScratch(){}
@@ -409,6 +438,22 @@ struct ReadScratch {
     void dropBigRuns(){
         unkeepBuffers(kept, true);
         for(FileRun &r : ahead) r.dropBig(1 << 20);
+        if(ownCap > (1 << 20)){
+            own.reset();
+            ownCap = ownFilled = 0;
+        }
+    }
+    // Room for a file of n bytes the thread reads itself; when it has to grow it takes least at once
+    uint8_t* ownBuffer(const uint64_t n, const uint64_t least){
+        if(ownCap < n || !own){
+            const uint64_t cap = std::max<uint64_t>(std::max(n, least), 1);
+            own.reset();
+            own.reset(new uint8_t[cap]);
+            ownCap = cap;
+            ownFilled = 0;
+        }
+        ownFilled = std::max(ownFilled, n);
+        return own.get();
     }
     // Room for at least n bytes; when it has to grow it takes least at once (as much as
     // any chunk of the array can need): a buffer that grows from call to call is mapped
@@ -461,8 +506,11 @@ struct ReadScratch {
         // pages faulted in again every call: warm reads of 27-36 chunk files of 256^3 a call with
         // 4 threads from NFS took 1.02-1.04 times as long as when the read pool's threads made
         // them (and kept them, in their malloc arenas).
-        uint64_t mine = 0;
+        uint64_t mine = ownCap > keep ? std::min(ownCap, ownFilled+(2 << 20)) : 0;
         for(FileRun &r : ahead){
+#ifdef __linux__
+            for(auto &f : r.fds) f.reset();
+#endif
             if(r.buf.size() > (size_t)FileRun::most){
                 r.buf.resize(FileRun::most);
                 r.cap.resize(FileRun::most);
@@ -471,6 +519,10 @@ struct ReadScratch {
             mine += r.bigBytes(keep);
         }
         if(!keepBuffers(kept, mine, true)) dropBigRuns();
+        else{
+            for(FileRun &r : ahead) r.freeBigLazily(keep);
+            if(ownCap > keep) freeLazily(own.get(), ownFilled);
+        }
     }
 };
 ScratchPool<ReadScratch> readScratchPool;
@@ -1469,6 +1521,16 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         // within a cap (see ReadScratch). (A file bigger than that, not one a Zarr writer makes,
         // still gets a buffer its size from whichever thread reads it.)
         const uint64_t fileRoom = sB+sB/128+4096;
+        // A thread whose files come from the page cache (none of its last run's reads waited for
+        // its data) reads its next ones itself, one after another into one buffer, while the
+        // process's reads have no CPU to spare (as many threads as the CPUs it may use): the pool
+        // only opens them (which on NFS asks the server). Copied ahead by the pool, on the CPUs
+        // that decode, the copies took longer, and the files had left the CPU's caches by the time
+        // they were decoded: warm reads of 256^3 chunk files from NFS with one thread on one CPU
+        // took 1.05 times as long as without reading ahead, where on two CPUs they took 0.85
+        // times as long. A read that waits for its data has the thread read ahead again.
+        static const int64_t allowedCpus = std::max<int64_t>(1, std::llround(processCpuShare()*std::max(1u, std::thread::hardware_concurrency())));
+        auto spare = [&]{ return activeReadThreads.load(std::memory_order_relaxed) < allowedCpus; };
         auto claim = [&](FileRun &r, const int w) -> bool {
             r.count = 0;
             int64_t it = work.next(w);
@@ -1483,7 +1545,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 r.name[k] = &name;
                 r.path[k] = Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(r.cav[k])+"/"+Zarr.chunkKey(name);
                 r.len[k] = -1;
-                r.reserve(k, fileRoom);
+                r.fds[k].reset();
+                r.waited[k].store(false, std::memory_order_relaxed);
                 r.count++;
                 bytes += std::max<uint64_t>(sB, 4096);
                 if(bytes >= aheadBytes || r.count >= FileRun::most) break;
@@ -1496,7 +1559,9 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         // in pieces at once, closed after the last); a file that cannot be opened was never written
         // (as in the other reads). A file whose reading the thread started first (see useRun) is
         // left to it.
-        auto start = [&](FileRun &r){
+        auto start = [&](FileRun &r, const bool openOnly){
+            r.openOnly = openOnly;
+            if(!openOnly) for(int64_t k = 0; k < r.count; k++) r.reserve(k, fileRoom);
             for(int64_t k = 0; k < r.count; k++){
                 r.taken[k].store(false, std::memory_order_relaxed);
                 r.good[k].store(true, std::memory_order_relaxed);
@@ -1510,7 +1575,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 const int threads = readThreads;
                 // (each read ends twice: for the item, and for the run)
                 rp->pend.add(1);
-                auto job = [rp, pend, k, path, pc, threads]{
+                auto job = [rp, pend, k, path, pc, threads, openOnly]{
                     if(!rp->take(k)){
                         pend->done(true);
                         return;
@@ -1522,27 +1587,34 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                         if(f->fd < 0) ok = true;
                         else if(fstat(f->fd, &st) == 0){
                             const uint64_t n = st.st_size > 0 ? (uint64_t)st.st_size : 0;
-                            uint8_t* const dst = rp->room(k, n);
                             rp->len[k] = (int64_t)n;
                             ok = true;
-                            for(uint64_t p = pc; p < n && ok; p += pc){
-                                const uint64_t m = std::min(pc, n-p);
-                                rp->left[k].fetch_add(1, std::memory_order_relaxed);
-                                pend->add(1);
-                                try{
-                                    ioPool().run(threads, [f, dst, p, m, pend, rp, k]{
-                                        const bool good = readFully(f->fd, dst+p, m, p);
-                                        rp->ended(k, good);
-                                        pend->done(good);
-                                    });
+                            if(openOnly) rp->fds[k] = f;
+                            else{
+                                uint8_t* const dst = rp->room(k, n);
+                                for(uint64_t p = pc; p < n && ok; p += pc){
+                                    const uint64_t m = std::min(pc, n-p);
+                                    rp->left[k].fetch_add(1, std::memory_order_relaxed);
+                                    pend->add(1);
+                                    try{
+                                        ioPool().run(threads, [f, dst, p, m, pend, rp, k]{
+                                            const long w0 = threadWaits();
+                                            const bool good = readFully(f->fd, dst+p, m, p);
+                                            if(threadWaits() != w0) rp->waited[k].store(true, std::memory_order_relaxed);
+                                            rp->ended(k, good);
+                                            pend->done(good);
+                                        });
+                                    }
+                                    catch(...){
+                                        rp->ended(k, false);
+                                        pend->done(false);
+                                        ok = false;
+                                    }
                                 }
-                                catch(...){
-                                    rp->ended(k, false);
-                                    pend->done(false);
-                                    ok = false;
-                                }
+                                const long w0 = threadWaits();
+                                ok = readFully(f->fd, dst, std::min(pc, n), 0) && ok;
+                                if(threadWaits() != w0) rp->waited[k].store(true, std::memory_order_relaxed);
                             }
-                            ok = readFully(f->fd, dst, std::min(pc, n), 0) && ok;
                         }
                     }
                     catch(...){
@@ -1560,16 +1632,24 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
             }
         };
-        // A file of a run read by the thread itself, whole; false if it could not be read
-        auto readHere = [&](FileRun &r, const int64_t k) -> bool {
-            const FdCloser f(::open(r.path[k].c_str(), O_RDONLY | O_CLOEXEC));
-            if(f.fd < 0) return true;
-            struct stat st;
-            if(fstat(f.fd, &st) != 0) return false;
-            const uint64_t n = st.st_size > 0 ? (uint64_t)st.st_size : 0;
-            uint8_t* const dst = r.room(k, n);
+        // A file of a run read by the thread itself, whole (into its own buffer, for a run whose files
+        // the pool only opens: fd, the descriptor the pool opened, or -1); false if it could not be read
+        auto readHere = [&](FileRun &r, ReadScratch &sc, const int64_t k, const int fd) -> bool {
+            const FdCloser f(fd >= 0 ? -1 : ::open(r.path[k].c_str(), O_RDONLY | O_CLOEXEC));
+            const int d = fd >= 0 ? fd : f.fd;
+            if(d < 0) return true;
+            uint64_t n = (uint64_t)std::max<int64_t>(0, r.len[k]);
+            if(fd < 0){
+                struct stat st;
+                if(fstat(d, &st) != 0) return false;
+                n = st.st_size > 0 ? (uint64_t)st.st_size : 0;
+            }
+            uint8_t* const dst = r.openOnly ? sc.ownBuffer(n, fileRoom) : r.room(k, n);
             r.len[k] = (int64_t)n;
-            return readFully(f.fd, dst, n, 0);
+            const long w0 = threadWaits();
+            const bool ok = readFully(d, dst, n, 0);
+            if(threadWaits() != w0) r.waited[k].store(true, std::memory_order_relaxed);
+            return ok;
         };
         // A run's chunks decoded and copied in turn, each once its file has been read, as the other
         // reads do (see below): a file the pool has not started reading by then the thread reads
@@ -1578,8 +1658,13 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         // after an error
         auto useRun = [&](FileRun &r, ReadScratch &sc, uint8_t* &decoded, std::vector<uint64_t> &boxExt) -> bool {
             for(int64_t k = 0; k < r.count && !err; k++){
-                if(r.take(k)) r.ended(k, readHere(r, k));
+                if(r.take(k)) r.ended(k, readHere(r, sc, k, -1));
                 r.await(k);
+                // (a file the pool only opened)
+                if(r.fds[k]){
+                    const std::shared_ptr<FdCloser> f = std::move(r.fds[k]);
+                    if(r.good[k].load(std::memory_order_relaxed) && !readHere(r, sc, k, f->fd)) r.good[k].store(false, std::memory_order_relaxed);
+                }
                 if(!r.good[k].load(std::memory_order_relaxed)){
                     fail("The chunk file "+r.path[k]+" could not be read (it may be damaged, or not match the array's metadata)\n");
                     return false;
@@ -1591,7 +1676,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 }
                 const std::string &name = *r.name[k];
                 const std::string subfolderName = Zarr.get_subfoldersString(cAV);
-                const uint8_t* stored = r.buf[k].get();
+                const uint8_t* stored = r.openOnly ? sc.own.get() : r.buf[k].get();
                 int64_t fileLen = r.len[k];
                 // A crc32c codec's checksum follows the chunk's bytes
                 if(chunkChecksum){
@@ -1655,13 +1740,16 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                     FileRun* next = &scratch->ahead[1];
                     try{
                         bool have = !err && claim(*cur, w);
-                        if(have) start(*cur);
+                        if(have) start(*cur, scratch->readOwn && !spare());
                         while(have && !err){
                             const bool more = !err && claim(*next, w);
-                            if(more) start(*next);
+                            if(more) start(*next, scratch->readOwn && !spare());
                             if(!useRun(*cur, *scratch, decoded, boxExt)) break;
                             // (its buffers are used again once every read of it has ended)
                             waitFor([&]{ return cur->pend.idle(); }, []{ return false; });
+                            bool waited = false;
+                            for(int64_t k = 0; k < cur->count; k++) waited = waited || cur->waited[k].load(std::memory_order_relaxed);
+                            scratch->readOwn = !waited && !spare();
                             std::swap(cur, next);
                             have = more;
                         }

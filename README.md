@@ -153,7 +153,9 @@ cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_th
 # On network storage (NFS and the like), reads keep more reads of the storage in flight than
 # they have threads (Linux): in calls of 2 to 5 threads, once a thread finds its shard's
 # chunks come from the server, it asks for its next ones ahead, and in calls of up to 8 threads
-# a pool of threads opens and reads the next chunk files of arrays without shards.
+# a pool of threads opens and reads the next chunk files of arrays without shards (while the
+# process has no CPU to spare for the pool, a thread whose files come from the page cache reads
+# them itself, the pool only opening them).
 # CPPZARR_READ_AHEAD_MB (4) sets how far a thread reads ahead (0: not at all; in shards half as
 # far while the process's reads have more than 16 threads), CPPZARR_READS the most threads the
 # pool uses: by default 64 for a process that may use all of its machine's CPUs, and fewer for
@@ -252,9 +254,10 @@ cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0
 # over 1 MB they read ahead from network storage, up to CPPZARR_KEEP_MB MB in all (0: none; by
 # default 1024, or an eighth of the memory the process may use if that is less: its job's memory
 # limit, its address-space limit or the machine's memory; writes' first), so that a big array
-# written or read a few chunks at a time does not allocate them again every call; with fewer
-# chunks of 4 MB or more than threads, every thread helps put the chunks together. A long-lived
-# process that is done reading and writing for a while can free them:
+# written or read a few chunks at a time does not allocate them again every call. On Linux the
+# system may take them back while they are idle, when it or the job runs short of memory. With
+# fewer chunks of 4 MB or more than threads, every thread helps put the chunks together. A
+# long-lived process that is done reading and writing for a while can free them:
 cppzarr.release_buffers()
 ````
 
