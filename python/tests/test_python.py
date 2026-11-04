@@ -572,6 +572,30 @@ def main():
     print(f"batches of reads, and the GIL released while reading  {'OK' if good else 'FAIL'}")
     ok = ok and good
 
+    # The buffers kept between calls: a write of two chunks of 8 MB keeps their buffers (up to
+    # CPPZARR_WRITE_KEEP_MB, by default 1 GiB or an eighth of the memory the process may use),
+    # release_buffers() frees them, and reads and writes after it give the same data
+    from cppzarr.cppzarr import pybind11_kept_write_bytes
+    keep = os.path.join(tmp, "kept_release.zarr")
+    kv = rng.integers(0, 60000, size=(8, 1024, 1024), dtype=np.uint16)
+    cppzarr.write_zarr(keep, kv, chunks=(4, 1024, 1024), cname='zstd', zarr_format=3)
+    kept, cap = pybind11_kept_write_bytes()
+    keeps = cap >= 64 << 20
+    good = (not keeps or kept > 0) and kept <= cap and same(cppzarr.read_zarr(keep), kv)
+    cppzarr.release_buffers()
+    after, _ = pybind11_kept_write_bytes()
+    good = good and after == 0 and same(cppzarr.read_zarr(keep), kv)
+    kv = kv[::-1].copy()
+    shutil.rmtree(keep, ignore_errors=True)
+    cppzarr.write_zarr(keep, kv, chunks=(4, 1024, 1024), cname="lz4", zarr_format=3)
+    again, _ = pybind11_kept_write_bytes()
+    good = good and (not keeps or again > 0) and same(cppzarr.read_zarr(keep), kv)
+    cppzarr.release_buffers()
+    shutil.rmtree(keep, ignore_errors=True)
+    print(f"buffers kept between calls, and release_buffers  {'OK' if good else 'FAIL'}"
+          f"{'' if good else f' (kept {kept} of {cap}, after {after}, again {again})'}")
+    ok = ok and good
+
     # Reading into GPU memory (with an NVIDIA GPU, nvCOMP, and CuPy or PyTorch): the same
     # values as reading into host memory, for every data type and codec, sharded or not,
     # regions that cut chunks, missing chunks, both orders, CuPy arrays and PyTorch tensors,

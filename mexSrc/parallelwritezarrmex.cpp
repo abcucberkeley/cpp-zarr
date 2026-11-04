@@ -67,6 +67,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         mexLock();
     }
 #endif
+    mexReleaseBuffersAtClear();
     if(nrhs < 2) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 2 arguments");
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
 #ifdef CPPZARR_MEX_GPU

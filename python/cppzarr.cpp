@@ -520,6 +520,14 @@ PYBIND11_MODULE(cppzarr, m) {
 	m.def("pybind11_convert_to_v3", &pybind11_convert_to_v3, pybind11::arg("fileName"),
 	      "Convert a Zarr v2 array to Zarr v3 in place (metadata only)");
 
+	m.def("pybind11_release_buffers", []() {
+	          pybind11::gil_scoped_release nogil;
+	          releaseBuffers();
+	      }, "Free the buffers reads and writes keep between calls");
+
+	m.def("pybind11_kept_write_bytes", []() { return std::make_pair(keptWriteBytesNow(), keptWriteBytesCap()); },
+	      "The bytes of write buffers kept between calls, and the most kept");
+
 	m.def("pybind11_read_zarr_gpu", &pybind11_read_zarr_gpu, pybind11::arg("requests"), pybind11::arg("order"),
 	      pybind11::arg("numThreads") = 0, pybind11::arg("stream") = 0, "Read regions of zarr files into GPU memory");
 

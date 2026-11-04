@@ -490,6 +490,22 @@ function test_matlab(mexDir)
     assert(strcmp(caught, 'zarr:zarrayError'), 'writing into incomplete metadata raised "%s", not zarr:zarrayError', caught);
     fprintf('PASS  errors\n');
 
+    % clear mex frees the buffers reads and writes keep between calls (writes keep those of
+    % chunks over 1 MB; on Linux the library itself stays loaded): reads and writes after it
+    % give the same data
+    fk = fullfile(tmp, 'kept_release.zarr');
+    kv = uint16(randi(60000, 1024, 1024, 8));
+    parallelWriteZarr(fk, kv, 'chunks', [1024 1024 4]);
+    clear mex
+    assert(isequal(parallelReadZarr(fk), kv), 'a read after clear mex differs');
+    kv = flip(kv, 3);
+    rmdir(fk, 's');
+    parallelWriteZarr(fk, kv, 'chunks', [1024 1024 4], 'cname', 'lz4');
+    assert(isequal(parallelReadZarr(fk), kv), 'a write after clear mex differs');
+    clear mex
+    rmdir(fk, 's');
+    fprintf('PASS  clear mex, and reads and writes after it\n');
+
     % Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
     % arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
     % Full and region reads match what zarr-python reads, arrays cpp-zarr cannot read

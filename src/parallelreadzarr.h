@@ -58,4 +58,7 @@ void* readZarrParallelHelper(const char* folderName,
 							 uint64_t startX, uint64_t startY, uint64_t startZ,
 							 uint64_t endX, uint64_t endY, uint64_t endZ,
 							 uint8_t imageJIm);
+
+// Frees the buffers the readers keep between calls (see releaseBuffers in parallelwritezarr.h)
+void releaseReadBuffers();
 #endif

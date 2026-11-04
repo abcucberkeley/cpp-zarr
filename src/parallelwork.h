@@ -292,6 +292,17 @@ public:
         }
         idle.push_back(std::move(s));
     }
+    // Every scratch the pool holds freed (those calls are using are not in it, and come back)
+    void clear(){
+        std::vector<std::unique_ptr<T>> gone;
+        {
+            std::lock_guard<std::mutex> g(m);
+            for(auto &b : byPlace) if(b) gone.push_back(std::move(b));
+            for(auto &s : idle) gone.push_back(std::move(s));
+            byPlace.clear();
+            idle.clear();
+        }
+    }
 };
 
 // Wait until done() is true (and return true), or until stop() is (and return false).
@@ -341,8 +352,9 @@ public:
 // threads are started as calls ask for more (up to the most any asked for) and then kept,
 // blocked while there is nothing to read (not spinning, which would take the CPU from
 // other threads and processes). They end, once the jobs given are done, when the pool does:
-// when the library is unloaded (MATLAB's clear mex) or the process ends, as their code goes
-// with it.
+// when the process ends, or when the library is unloaded, as their code goes with it. (On
+// Linux glibc does not unload the library MATLAB's mex files load: the unique symbols of its
+// static C++ runtime keep it loaded, so clear mex unloads the mex files only.)
 class IoPool {
     std::mutex m;
     std::condition_variable cv;

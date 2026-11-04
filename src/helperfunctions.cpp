@@ -958,3 +958,150 @@ bool renameReplace(const std::string &src, const std::string &dst){
     return rename(src.c_str(), dst.c_str()) == 0;
 #endif
 }
+
+#ifdef __linux__
+#include <fstream>
+#include <sched.h>
+#include <strings.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
+#ifdef __linux__
+namespace {
+// The folders of the process's cgroup and of its parents, innermost first: cgroup v2's, or
+// for v1 those of the given controller's hierarchy
+std::vector<std::string> cgroupFolders(const std::string &controller){
+    std::vector<std::string> out;
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    while(std::getline(f, line)){
+        // (hierarchy:controllers:path; v2's controllers are empty)
+        const size_t a = line.find(':');
+        const size_t b = a == std::string::npos ? a : line.find(':', a+1);
+        if(b == std::string::npos) continue;
+        const std::string ctl = line.substr(a+1, b-a-1);
+        std::string base;
+        if(ctl.empty()) base = "/sys/fs/cgroup";
+        else if((","+ctl+",").find(","+controller+",") != std::string::npos) base = "/sys/fs/cgroup/"+controller;
+        else continue;
+        for(std::string path = line.substr(b+1); ; ){
+            out.push_back(base+path);
+            if(path.empty() || path == "/") break;
+            const size_t s = path.find_last_of('/');
+            path = s == 0 || s == std::string::npos ? "/" : path.substr(0, s);
+        }
+    }
+    return out;
+}
+
+// The first number of a file; false if it has none (no file, or "max": no limit)
+bool firstNumber(const std::string &file, double &v){
+    std::ifstream f(file);
+    std::string s;
+    if(!(f >> s) || s == "max") return false;
+    char* end = nullptr;
+    v = std::strtod(s.c_str(), &end);
+    return end != s.c_str();
+}
+
+// The number of CPUs in a list such as "0-3,8,10-11" (cpuset files); 0 for none
+int cpuListCount(const std::string &list){
+    int n = 0;
+    size_t i = 0;
+    while(i < list.size()){
+        char* end = nullptr;
+        const long a = std::strtol(list.c_str()+i, &end, 10);
+        if(end == list.c_str()+i) break;
+        long b = a;
+        i = end-list.c_str();
+        if(i < list.size() && list[i] == '-'){
+            b = std::strtol(list.c_str()+i+1, &end, 10);
+            i = end-list.c_str();
+        }
+        if(b >= a) n += (int)(b-a+1);
+        while(i < list.size() && (list[i] == ',' || list[i] == '\n' || list[i] == ' ')) i++;
+    }
+    return n;
+}
+
+// The CPUs the process was bound to when the library loaded (later the calling thread may be
+// bound to fewer: OpenMP binds its threads to places with OMP_PROC_BIND). 0 if OpenMP's
+// settings bind threads: GCC's OpenMP then binds the thread that loads it to the first place
+// before this library's own start runs.
+const int cpusAtLoad = [](){
+    const char* bind = std::getenv("OMP_PROC_BIND");
+    if((bind && *bind && strcasecmp(bind, "false") != 0) || std::getenv("OMP_PLACES") || std::getenv("GOMP_CPU_AFFINITY")) return 0;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    return sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
+}();
+}
+#endif
+
+double processCpuShare(){
+#ifdef __linux__
+    static const double share = [](){
+        const long online = sysconf(_SC_NPROCESSORS_ONLN);
+        if(online <= 0) return 1.0;
+        double cpus = cpusAtLoad > 0 ? cpusAtLoad : (double)online;
+        // (the CPUs of the process's cgroup: Slurm puts a job's on its cgroup, cgroup v2's
+        // cpuset.cpus.effective or v1's cpuset.effective_cpus; the innermost has the fewest)
+        for(const std::string &d : cgroupFolders("cpuset")){
+            std::ifstream f(d+"/cpuset.cpus.effective"), g(d+"/cpuset.effective_cpus");
+            std::string list;
+            if((std::getline(f, list) || std::getline(g, list)) && cpuListCount(list) > 0){
+                cpus = std::min(cpus, (double)cpuListCount(list));
+                break;
+            }
+        }
+        // (and its CPU time quota: cgroup v2's cpu.max is "quota period", "max period" for
+        // none; v1's cpu.cfs_quota_us is -1 for none)
+        for(const std::string &d : cgroupFolders("cpu")){
+            std::ifstream f(d+"/cpu.max");
+            std::string q, p;
+            if(f >> q >> p && q != "max"){
+                const double c = std::atof(q.c_str())/std::max(1.0, std::atof(p.c_str()));
+                if(c > 0) cpus = std::min(cpus, c);
+            }
+            double quota, period;
+            if(firstNumber(d+"/cpu.cfs_quota_us", quota) && quota > 0 && firstNumber(d+"/cpu.cfs_period_us", period) && period > 0)
+                cpus = std::min(cpus, quota/period);
+        }
+        return std::min(1.0, std::max(cpus, 1.0)/(double)online);
+    }();
+    return share;
+#else
+    return 1.0;
+#endif
+}
+
+uint64_t processMemoryBudget(){
+    static const uint64_t budget = [](){
+        uint64_t b = std::numeric_limits<uint64_t>::max();
+#ifdef __linux__
+        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+        if(pages > 0 && page > 0) b = (uint64_t)pages*(uint64_t)page;
+        double v;
+        for(const std::string &d : cgroupFolders("memory")){
+            // (v2's memory.max; v1's memory.limit_in_bytes, a huge number for no limit)
+            if(firstNumber(d+"/memory.max", v) && v > 0) b = std::min(b, (uint64_t)v);
+            if(firstNumber(d+"/memory.limit_in_bytes", v) && v > 0 && v < 1e18) b = std::min(b, (uint64_t)v);
+        }
+        struct rlimit r;
+        if(getrlimit(RLIMIT_AS, &r) == 0 && r.rlim_cur != RLIM_INFINITY) b = std::min(b, (uint64_t)r.rlim_cur);
+#elif defined(__APPLE__)
+        uint64_t mem = 0;
+        size_t len = sizeof(mem);
+        if(sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 && mem > 0) b = mem;
+#elif defined(_WIN32)
+        MEMORYSTATUSEX st;
+        st.dwLength = sizeof(st);
+        if(GlobalMemoryStatusEx(&st)) b = (uint64_t)st.ullTotalPhys;
+#endif
+        return b;
+    }();
+    return budget;
+}

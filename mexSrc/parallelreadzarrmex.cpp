@@ -15,6 +15,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         mexLock();
     }
 #endif
+    mexReleaseBuffersAtClear();
     if(!nrhs) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 1 argument");
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");  
 

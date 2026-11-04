@@ -40,6 +40,16 @@ bool isLittleEndian();
 int callThreads();
 void setCallThreads(int n);
 
+// The share of its node's CPUs (0 to 1) this process may use: of the CPUs online, those it
+// was bound to when the library loaded (Slurm and other schedulers bind a job's processes to
+// its CPUs) or its cgroup's CPU quota, whichever is fewer. 1 where neither is known (macOS,
+// Windows).
+double processCpuShare();
+// The memory this process may use, in bytes: the least of its cgroup's memory limit (the
+// least of its cgroup's and their parents': Slurm sets a job's on a parent), its
+// address-space limit (ulimit -v) and the machine's physical memory, of those it can find
+uint64_t processMemoryBudget();
+
 // A data type as cpp-zarr keeps it: the dtype string of a Zarr v2 .zarray ("<u2",
 // "|b1", "<f2", "<c16", ...), or "bfloat16", the name Zarr metadata gives that type
 // (">bfloat16" for a Zarr v3 array stored big-endian)

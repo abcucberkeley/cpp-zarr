@@ -19,6 +19,9 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 #include "blosc.h"
 #include "parallelreadzarr.h"
 #include "parallelwritezarr.h"
@@ -94,12 +97,15 @@ namespace {
 const uint64_t helpMin = CPPZARR_WRITE_HELP_MIN;
 
 // The bytes of chunk buffers over 1 MB the writer threads' pool keeps between calls (see
-// WriteScratch), and the most it may: CPPZARR_WRITE_KEEP_MB (1024) MB
+// WriteScratch), and the most it may: CPPZARR_WRITE_KEEP_MB MB, by default 1024 MB or an
+// eighth of the memory the process may use (its job's limit: see processMemoryBudget),
+// whichever is less, so that a job sized close to what it needs is not pushed over its limit
 std::atomic<uint64_t> keptWriteBytes{0};
 uint64_t writeKeepCap(){
     static const uint64_t cap = [](){
         const char* e = std::getenv("CPPZARR_WRITE_KEEP_MB");
-        return (uint64_t)(std::max(0.0, e && *e ? std::atof(e) : 1024.0)*(1 << 20));
+        if(e && *e) return (uint64_t)(std::max(0.0, std::atof(e))*(1 << 20));
+        return std::min<uint64_t>(uint64_t(1024) << 20, processMemoryBudget()/8);
     }();
     return cap;
 }
@@ -110,6 +116,7 @@ uint64_t writeKeepCap(){
 // uint16 chunk a call, as PetaKit5D's resaving writes them) otherwise faulted in two new
 // buffers of its size every call. With them kept, 16 such calls wrote their file in 0.74-0.88
 // of the time with one thread, and in 0.35-0.54 with 12 and 24 (without the help below).
+// releaseBuffers frees them (Python's release_buffers, MATLAB's clear mex).
 struct WriteScratch {
     std::unique_ptr<uint8_t[]> unc, comp;
     uint64_t uncCap = 0, compCap = 0;
@@ -272,6 +279,19 @@ int writePieces(const std::string &path, const std::vector<std::pair<const uint8
     if(close(fd) != 0) ok = false;
     return ok ? 0 : 2;
 }
+#endif
+}
+
+uint64_t keptWriteBytesNow(){ return keptWriteBytes.load(); }
+uint64_t keptWriteBytesCap(){ return writeKeepCap(); }
+
+void releaseBuffers(){
+    writeScratchPool.clear();
+    releaseReadBuffers();
+#if defined(__GLIBC__)
+    // (glibc keeps memory freed into each thread's arena for that arena's later allocations;
+    // malloc_trim hands the free pages of every arena back)
+    malloc_trim(0);
 #endif
 }
 

@@ -156,7 +156,10 @@ cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_th
 # a pool of threads opens and reads the next chunk files of arrays without shards.
 # CPPZARR_READ_AHEAD_MB (4) sets how far a thread reads ahead (0: not at all; in shards half as
 # far while the process's reads have more than 16 threads), CPPZARR_READS the most threads the
-# pool uses (64). Neither reads ahead while the process's reads have more than
+# pool uses: by default 64 for a process that may use all of its machine's CPUs, and fewer for
+# one that may use fewer (its share of 64, as its CPU binding and cgroup limit it, as a job of a
+# few of a node's CPUs is; at least two for each of the call's threads), since processes that
+# share a node share its storage too. Neither reads ahead while the process's reads have more than
 # CPPZARR_READ_AHEAD_THREADS (64) threads in all, where reading ahead slowed reads down.
 ````
 
@@ -245,10 +248,13 @@ cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0
 # and blocksize included (v2 arrays get byte shuffle and blosc's own block size, as cpp-zarr has
 # always written them)
 
-# Writes keep the buffers of chunks over 1 MB for later writes, up to CPPZARR_WRITE_KEEP_MB
-# (1024) MB in all (0: none), so that a big array written a chunk or a few at a time does not
-# allocate them again every call; with fewer chunks of 4 MB or more than threads, every thread
-# helps put the chunks together
+# Writes keep the buffers of chunks over 1 MB for later writes, up to CPPZARR_WRITE_KEEP_MB MB in
+# all (0: none; by default 1024, or an eighth of the memory the process may use if that is less:
+# its job's memory limit, its address-space limit or the machine's memory), so that a big array
+# written a chunk or a few at a time does not allocate them again every call; with fewer chunks
+# of 4 MB or more than threads, every thread helps put the chunks together. A long-lived process
+# that is done writing for a while can free them (and the buffers reads keep):
+cppzarr.release_buffers()
 ````
 
 #### Convert a Zarr v2 file to Zarr v3
@@ -377,6 +383,11 @@ parallelWriteZarr('path/to/file.zarr',im,'dimension_separator','.');
 % nothing reads until the write is done (for example one written under a temporary name and renamed
 % after), as long as no two writers write the same chunk.
 parallelWriteZarr('path/to/file.zarr',im,'uuid',false);
+
+% Writes keep the buffers of chunks over 1 MB for later writes (up to CPPZARR_WRITE_KEEP_MB MB in all:
+% by default 1024, or an eighth of the memory the job may use if that is less). clear mex frees them,
+% and the buffers reads keep.
+clear mex
 ````
 
 #### parallelReadZarrGPU - Read a Zarr image into a gpuArray

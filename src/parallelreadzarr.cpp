@@ -448,6 +448,8 @@ ForkSafetyOwner forkSafetyOwner;
 const uint64_t bigChunk = CPPZARR_BIG_CHUNK;
 }
 
+void releaseReadBuffers(){ readScratchPool.clear(); }
+
 // zarrArr should be initialized to all zeros if you have empty chunks
 uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const std::vector<uint64_t> &startCoords, 
@@ -1358,9 +1360,15 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     // - Chunk files (unsharded arrays, in calls of up to 8 threads with at least 8 chunks a thread,
     //   see readFilesAhead): the read pool opens and reads a thread's next files, in
     //   pieces of up to CPPZARR_READ_PIECE_MB (1) MB, while the thread decodes the ones before:
-    //   up to CPPZARR_READS (64) of the process's reads at once (0: none read ahead). With more
-    //   threads, calls already kept enough reads going: reading ahead made them up to 1.4 times
-    //   as slow.
+    //   up to CPPZARR_READS of the process's reads at once (0: none read ahead). By default 64
+    //   for a process that may use all of its node's CPUs, and its share of 64 for one that may
+    //   use fewer (see processCpuShare), but at least two for each of the call's threads:
+    //   processes that share a node share its storage too. 48 one-CPU PetaKit5D tasks reading
+    //   from one NFS server with 64 reads each wrote 1.12 times as slow as with 1.7.3 (with 2
+    //   reads each 1.04 times) and read as fast either way; and a process with 1 to 8 of a
+    //   24-core node's CPUs read arrays of chunk files from VAST and two other NFS servers as fast
+    //   with its share (3 to 21 reads) as with 64. With more threads, calls already kept enough
+    //   reads going: reading ahead made them up to 1.4 times as slow.
     // Batches of 32 and 128 random Cell Observatory hypercubes (1024 inner chunks of 128 KiB in a
     // shard each) read cold from VAST on a B200's 16 cores, 2 threads a read (read_zarr_batch),
     // took 1.6-2.1 times less time than without reading ahead (17-22 GiB/s, more than at 64
@@ -1393,10 +1401,11 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         return (uint64_t)std::max(0.0, (e && *e ? std::atof(e) : 4.0)*(1 << 20));
     }();
     if(!Zarr.get_shard() && numWorkers <= 8 && nItems >= 8*(int64_t)numWorkers && readAheadBytes > 0 && fewReadThreads()){
-        static const int wanted = [](){
+        static const int asked = [](){
             const char* e = std::getenv("CPPZARR_READS");
-            return e && *e ? std::max(0, std::atoi(e)) : 64;
+            return e && *e ? std::max(0, std::atoi(e)) : -1;
         }();
+        const int wanted = asked >= 0 ? asked : std::min(64, std::max(2*(int)numWorkers, (int)std::lround(64.0*processCpuShare())));
         if(wanted > 0 && arrayOnNetwork(Zarr.get_fileName())) readThreads = wanted;
     }
     if(fewThreads && numWorkers >= 2 && sB < (1 << 20) && readAheadBytes > 0 && arrayOnNetwork(Zarr.get_fileName()))
@@ -1410,7 +1419,15 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
             return (uint64_t)std::max(4096.0, (e && *e ? std::atof(e) : 1.0)*(1 << 20));
         }();
         // A thread's next run: its next item and those after it in its block, up to aheadBytes
-        // (as counted) or 16 files. False when it has no items left.
+        // (as counted) or 16 files. False when it has no items left. Each item's buffer is made
+        // here, on the reading thread, as big as a chunk file of the array can be (as storedRoom),
+        // so that the pool's threads only read into it: glibc gives each thread its own malloc
+        // arena, and the arenas kept the buffers the pool's threads had made and freed. A process
+        // of 8 threads that read an array of 256^3 chunk files 20 times from VAST or two other NFS
+        // servers then peaked at 4.1-4.3 GB, against 1.7 GB with 1.7.3 (now 1.8 GB), and a 4-CPU
+        // PetaKit5D task at 2.9-3.0 GB instead of 2.3 GB. (A file bigger than that, not one a Zarr
+        // writer makes, still gets a buffer its size from whichever thread reads it.)
+        const uint64_t fileRoom = sB+sB/128+4096;
         auto claim = [&](FileRun &r, const int w) -> bool {
             r.count = 0;
             int64_t it = work.next(w);
@@ -1425,6 +1442,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 r.name[k] = &name;
                 r.path[k] = Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(r.cav[k])+"/"+Zarr.chunkKey(name);
                 r.len[k] = -1;
+                r.room(k, fileRoom);
                 r.count++;
                 bytes += std::max<uint64_t>(sB, 4096);
                 if(bytes >= aheadBytes || r.count >= FileRun::most) break;

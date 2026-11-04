@@ -1566,6 +1566,35 @@ int main(int argc, char** argv){
             std::filesystem::remove_all(dir + "/rt_mkdir_p", ec);
             return ok;
         });
+
+        check("the buffers kept between calls: writes keep those of chunks over 1 MB, up to CPPZARR_WRITE_KEEP_MB (by default 1 GiB or an eighth of the memory the process may use), and releaseBuffers frees them and the readers', reads and writes after it giving the same data; the process's share of its node's CPUs is more than 0 and at most 1", [&](){
+            const char* e = std::getenv("CPPZARR_WRITE_KEEP_MB");
+            const uint64_t want = e && *e ? (uint64_t)(std::max(0.0, std::atof(e))*(1 << 20))
+                                          : std::min<uint64_t>(uint64_t(1024) << 20, processMemoryBudget()/8);
+            const double share = processCpuShare();
+            bool ok = keptWriteBytesCap() == want && processMemoryBudget() > (uint64_t(64) << 20) && share > 0 && share <= 1;
+            std::printf("    (writes keep up to %.0f MB; the process may use %.0f MB and %.3f of its node's CPUs)\n",
+                        keptWriteBytesCap()/1048576.0, processMemoryBudget()/1048576.0, share);
+            if (!ok) std::fprintf(stderr, "    cap %llu (wanted %llu), budget %llu, CPU share %g\n", (unsigned long long)keptWriteBytesCap(),
+                                  (unsigned long long)want, (unsigned long long)processMemoryBudget(), share);
+            // (two chunks of 8 MB: their buffers are kept, as the cap allows)
+            const bool keeps = want >= (uint64_t(64) << 20);
+            Made a = make("kept_release", 3, {1024, 1024, 8}, {1024, 1024, 4}, {}, "F", "zstd", "/", "<u2");
+            const uint64_t kept = keptWriteBytesNow();
+            ok = ok && (!keeps || kept > 0) && kept <= want && readsBack(a);
+            releaseBuffers();
+            const uint64_t after = keptWriteBytesNow();
+            ok = ok && after == 0 && readsBack(a);
+            Made b = make("kept_release", 3, {1024, 1024, 8}, {1024, 1024, 4}, {}, "C", "lz4", "/", "<u2");
+            const uint64_t again = keptWriteBytesNow();
+            ok = ok && (!keeps || again > 0) && readsBack(b);
+            releaseBuffers();
+            if (!ok) std::fprintf(stderr, "    kept %llu, after releaseBuffers %llu, written again %llu\n", (unsigned long long)kept,
+                                  (unsigned long long)after, (unsigned long long)again);
+            std::error_code ec;
+            std::filesystem::remove_all(b.path, ec);
+            return ok;
+        });
     }
 
     // How the reader hands out and decodes chunks, and how the writer adds inner chunks
