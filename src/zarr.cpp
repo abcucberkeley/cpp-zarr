@@ -580,6 +580,10 @@ uint64_t zarr::get_shuffle() const{
     return shuffle;
 }
 
+uint64_t zarr::get_blocksize() const{
+    return blocksize;
+}
+
 void zarr::convert_to_v3(){
     if(zarr_format != 2 || !fileExists(fileName+"/.zarray")){
         throw std::string("v3Unsupported:"+fileName+" is not a Zarr v2 array");

@@ -223,12 +223,12 @@ cppzarr.write_zarr('filename.zarr', im, zarr_format=3, chunks=[64, 64, 64], shar
 cppzarr.write_zarr('filename.zarr', im, stream=cupy.cuda.Stream.null)
 ````
 The GPU compresses blosc's zstd and lz4 streams (byte shuffle or none) and Zarr's zstd codec, at
-nvCOMP's one level of each whatever clevel says (clevel still sets blosc's block size): the chunks
-decode to the same values as the CPU writer's, with other bytes. Arrays of other compressors
-(blosclz, zlib, gzip, bitshuffle) are written from a copy of the data in host memory. Several
-writes from as many threads at once overlap: the files of one are written while the GPU compresses
-another's. CPPZARR_GPU_WRITE_PART_MB (256) sets the most of a write the GPU works on at once (a
-bigger write goes in parts, the files of one written while the GPU works on the next).
+nvCOMP's one level of each whatever clevel says (blosc's block size still follows clevel, or a Zarr
+v3 array's blocksize): the chunks decode to the same values as the CPU writer's, with other bytes.
+Arrays of other compressors (blosclz, zlib, gzip, bitshuffle) are written from a copy of the data in
+host memory. Several writes from as many threads at once overlap: the files of one are written while
+the GPU compresses another's. CPPZARR_GPU_WRITE_PART_MB (256) sets the most of a write the GPU works
+on at once (a bigger write goes in parts, the files of one written while the GPU works on the next).
 
 #### Write a region to an existing Zarr file
 ````
@@ -240,6 +240,10 @@ cppzarr.write_zarr('filename.zarr', im)
 
 # Write to a specified region with different data (the file keeps its Zarr version)
 cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0,0,0], end_coords=[100,100,100])
+
+# A write into an existing array compresses as its metadata says: a Zarr v3 array's blosc shuffle
+# and blocksize included (v2 arrays get byte shuffle and blosc's own block size, as cpp-zarr has
+# always written them)
 
 # Writes keep the buffers of chunks over 1 MB for later writes, up to CPPZARR_WRITE_KEEP_MB
 # (1024) MB in all (0: none), so that a big array written a chunk or a few at a time does not

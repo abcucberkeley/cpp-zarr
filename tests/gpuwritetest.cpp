@@ -3,11 +3,11 @@
 // incompressible data), the zstd codec and no compressor on the GPU, and blosclz, zlib, bitshuffle
 // and gzip through host memory; both orders, both formats, sharding; whole arrays, then crop
 // writes into them that cut chunks and that leave a chunk all zero; inputs in F order, C order and
-// strided; sparse all-zero chunks and a nonzero fill value; writes in many parts; and crop writes
-// into arrays other Zarr writers made (tests/test_arrays: checksums, transposed chunks, shard
-// indexes at the start). Each pair of arrays must hold the same files, each chunk decoding to the
-// same bytes (padding included), and read the same. Exits 0 with a message without an NVIDIA GPU,
-// driver or nvCOMP. Usage: gpuWriteTest <scratch folder>
+// strided; sparse all-zero chunks and a nonzero fill value; writes in many parts; blosc block sizes
+// a Zarr v3 array asks for; and crop writes into arrays other Zarr writers made (tests/test_arrays:
+// checksums, transposed chunks, shard indexes at the start). Each pair of arrays must hold the same
+// files, each chunk decoding to the same bytes (padding included), and read the same. Exits 0 with
+// a message without an NVIDIA GPU, driver or nvCOMP. Usage: gpuWriteTest <scratch folder>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +65,31 @@ static std::vector<std::string> chunkFiles(const std::string &path){
 static std::vector<uint8_t> readFile(const std::string &path){
     std::ifstream f(path, std::ios::binary);
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// The blosc header of an array's first stored chunk (in a sharded array, of its first stored inner
+// chunk)
+static bool firstHeader(const std::string &path, uint8_t h[16]){
+    zarr Z(path);
+    const uint64_t empty = ~uint64_t(0);
+    for(const auto &f : chunkFiles(path)){
+        const auto b = readFile(path+"/"+f);
+        uint64_t at = 0;
+        if(Z.get_shard()){
+            uint64_t per = 1;
+            for(uint64_t d = 0; d < Z.get_ndims(); d++) per *= (Z.get_chunks(d)+Z.get_chunk_shape(d)-1)/Z.get_chunk_shape(d);
+            const uint64_t ib = 16*per+(Z.get_shardIndexChecksum() ? 4 : 0);
+            if(b.size() < ib) continue;
+            const uint64_t base = Z.get_shardIndexAtStart() ? 0 : b.size()-ib;
+            at = empty;
+            for(uint64_t i = 0; i < per && at == empty; i++) memcpy(&at, b.data()+base+16*i, 8);
+            if(at == empty) continue;
+        }
+        if(b.size() < at+16) continue;
+        memcpy(h, b.data()+at, 16);
+        return true;
+    }
+    return false;
 }
 
 // Whether two stored chunks decode to the same bytes (both must decode)
@@ -218,12 +243,12 @@ static bool writeBoth(const std::string &a, const std::string &b, const std::vec
 static bool makeArrays(const std::string &a, const std::string &b, const std::vector<uint64_t> &shape, const std::vector<uint64_t> &chunks,
                        const std::vector<uint64_t> &inner, const bool sharded, const int clevel, const std::string &cname,
                        const std::string &id, const int shuffle, const std::string &dtype, const int fmt, const std::string &order,
-                       const std::string &fill){
+                       const std::string &fill, const uint64_t blocksize = 0){
     for(const std::string &p : {a, b}){
         std::error_code ec;
         fs::remove_all(p, ec);
         try{
-            zarr Z(p, chunks, 0, (uint64_t)clevel, cname, id, (uint64_t)shuffle, fmt == 3 ? "/" : ".", dtype, fill, {}, order, shape, 2,
+            zarr Z(p, chunks, blocksize, (uint64_t)clevel, cname, id, (uint64_t)shuffle, fmt == 3 ? "/" : ".", dtype, fill, {}, order, shape, 2,
                    std::vector<uint64_t>(shape.size(), 0), sharded, sharded ? inner : std::vector<uint64_t>(shape.size(), 1));
             if(fmt == 3) Z.set_zarr_format(3);
             Z.set_order(order);
@@ -368,6 +393,51 @@ int main(int argc, char** argv){
             if(parts) setEnv("CPPZARR_GPU_WRITE_PART_MB", "");
         }
         printf("%d of %d checks of bigger arrays matched\n", (total-before)-(failures-failedBefore), total-before);
+    }
+
+    // blosc block sizes a Zarr v3 array asks for, which both writers use: a small one, one of more
+    // than 4 MiB (blosc's own blocks are at most 1 MiB), one bigger than nvCOMP compresses (written
+    // through host memory), lz4's (blosc caps the blocks of codecs it splits), and a v2 array's (not
+    // used)
+    {
+        const int before = total, failedBefore = failures;
+        struct Bs { const char* name; std::vector<uint64_t> shape, chunks, inner; bool sharded; const char* cname; int clevel;
+                    uint64_t blocksize; int fmt; uint32_t expect; };
+        const Bs sizes[] = {
+            {"bs16k", {128, 64, 64}, {64, 64, 32}, {}, false, "zstd", 1, 16384, 3, 16384},
+            {"bs6m_sh", {256, 256, 128}, {256, 256, 128}, {128, 256, 128}, true, "zstd", 1, 6 << 20, 3, 6 << 20},
+            {"bs24m", {256, 256, 300}, {256, 256, 256}, {}, false, "zstd", 1, 24 << 20, 3, 24 << 20},
+            {"bs_lz4", {256, 128, 128}, {128, 128, 128}, {}, false, "lz4", 5, 2 << 20, 3, 512 << 10},
+            {"bs_v2", {128, 64, 64}, {64, 64, 32}, {}, false, "zstd", 1, 16384, 2, 32768},
+        };
+        for(const Bs &g : sizes){
+            const std::string a = dir+"/w_"+g.name+"_cpu.zarr", b = dir+"/w_"+g.name+"_gpu.zarr";
+            if(!makeArrays(a, b, g.shape, g.chunks, g.inner, g.sharded, g.clevel, g.cname, "blosc", 1, "<u2", g.fmt, "C", "0", g.blocksize))
+                continue;
+            // (data that compresses in every chunk, so that no chunk is stored as it is)
+            uint64_t elems = 1;
+            for(auto v : g.shape) elems *= v;
+            std::vector<uint8_t> data(elems*2);
+            for(uint64_t i = 0; i < elems; i++){
+                const uint16_t v = (uint16_t)(1+(i/3) % 2000);
+                memcpy(&data[2*i], &v, 2);
+            }
+            const std::vector<uint64_t> zero(g.shape.size(), 0);
+            if(!writeBoth(a, b, data, zero, g.shape, false, 1, stream, std::string(g.name)) || !sameArrays(a, b, std::string(g.name))) continue;
+            total++;
+            uint8_t ha[16], hb[16];
+            if(!firstHeader(a, ha) || !firstHeader(b, hb)){
+                fail(g.name, "no stored chunk");
+                continue;
+            }
+            uint32_t bsa, bsb;
+            memcpy(&bsa, ha+8, 4);
+            memcpy(&bsb, hb+8, 4);
+            if(bsa != g.expect || bsb != g.expect || ha[2] != hb[2] || ha[3] != hb[3])
+                fail(g.name, "blosc blocks of "+std::to_string(bsa)+" bytes (CPU) and "+std::to_string(bsb)+" (GPU), flags "+
+                             std::to_string(ha[2])+" and "+std::to_string(hb[2])+"; "+std::to_string(g.expect)+" expected");
+        }
+        printf("%d of %d checks of blosc block sizes matched\n", (total-before)-(failures-failedBefore), total-before);
     }
 
     // through host memory on purpose (CPPZARR_GPU_WRITE_HOST), for a codec the GPU compresses

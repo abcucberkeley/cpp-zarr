@@ -68,6 +68,8 @@ public:
     void set_zarr_format(const uint64_t zarr_format);
     // Blosc shuffle: 0 none, 1 byte, 2 bit
     uint64_t get_shuffle() const;
+    // Blosc block size in bytes (0: blosc's own choice)
+    uint64_t get_blocksize() const;
     // Turn the v2 array this object was opened from into a Zarr v3 array by
     // writing a zarr.json that describes its existing chunk files (no data is
     // rewritten) and removing its .zarray. Throws "v3Unsupported:why" for what

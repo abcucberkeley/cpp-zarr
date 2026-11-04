@@ -403,10 +403,12 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
     const uint64_t indexBytes = 2*perShard*sizeof(uint64_t)+(indexChecksum ? sizeof(uint32_t) : 0);
 
     const uint8_t* const typedFill = fillElem;
-    // Blosc's shuffle: as a Zarr v3 array's codec says, and always byte shuffle in
-    // v2 arrays, as cpp-zarr has always written them
+    // Blosc's shuffle and block size: as a Zarr v3 array's codec says, and in v2 arrays
+    // as cpp-zarr has always written them (byte shuffle, blosc's own block size). The
+    // block size is at most the chunk's (blosc takes it as an int, and uses no more)
     const uint64_t shuffle = Zarr.get_shuffle();
     const int bloscShuffle = Zarr.get_zarr_format() != 3 || shuffle > 2 ? BLOSC_SHUFFLE : (int)shuffle;
+    const size_t bloscBlocksize = Zarr.get_zarr_format() == 3 ? (size_t)std::min<uint64_t>(Zarr.get_blocksize(), sB) : 0;
 
     // Sparse writes leave all-zero chunks unwritten, when that is how a missing
     // chunk reads back (a fill value whose bytes are all zero)
@@ -1014,7 +1016,7 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
                 csize = sB;
             }
             else if(compressor == "blosc"){
-                csize = blosc_compress_ctx(Zarr.get_clevel(), bloscShuffle, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),0,nBloscThreads);
+                csize = blosc_compress_ctx(Zarr.get_clevel(), bloscShuffle, bytes, sB, chunkUnC, chunkC, sB+BLOSC_MAX_OVERHEAD,Zarr.get_cname().c_str(),bloscBlocksize,nBloscThreads);
                 // A non-positive return means blosc could not compress the chunk
                 // (e.g. it exceeds BLOSC_MAX_BUFFERSIZE). Fail loudly instead of
                 // writing an empty/garbage chunk. (The chunk-size guard above

@@ -41,14 +41,16 @@ uint64_t maxStream(const int codec){
 
 // blosc's header for a write's chunks: what blosc_compress_ctx writes for them (the block size,
 // shuffle, whether blocks are split into their bytes' streams, the codec), found by compressing
-// zeros as long as a chunk (or 4 MiB for bigger chunks, whose blocks blosc sizes the same: at most
-// 1 MiB), with the chunk's size in it. Kept for later writes.
+// zeros as long as a chunk, with the chunk's size in it. Bigger chunks take 4 MiB, whose blocks
+// blosc sizes the same (at most 1 MiB), or as long as the block size asked for (blocksize; 0 for
+// blosc's own); a block bigger than nvCOMP compresses comes out at 32 MiB, still too big. Kept for
+// later writes.
 bool bloscHeader(const std::string &cname, const int clevel, const int shuffle, const uint64_t ts, const uint64_t sB,
-                 uint8_t header[16]){
-    typedef std::tuple<std::string, int, int, uint64_t, uint64_t> Key;
+                 const uint64_t blocksize, uint8_t header[16]){
+    typedef std::tuple<std::string, int, int, uint64_t, uint64_t, uint64_t> Key;
     static std::mutex m;
     static std::map<Key, std::array<uint8_t, 16>> known;
-    const Key key(cname, clevel, shuffle, ts, sB);
+    const Key key(cname, clevel, shuffle, ts, sB, blocksize);
     {
         std::lock_guard<std::mutex> g(m);
         auto it = known.find(key);
@@ -57,10 +59,11 @@ bool bloscHeader(const std::string &cname, const int clevel, const int shuffle, 
             return true;
         }
     }
-    const uint64_t probe = sB <= (uint64_t(4) << 20) ? sB : ((uint64_t(4) << 20)/ts)*ts;
+    const uint64_t most = std::max<uint64_t>(uint64_t(4) << 20, std::min<uint64_t>(blocksize, 2*maxStream(Zstd)));
+    const uint64_t probe = sB <= most ? sB : (most/ts)*ts;
     std::vector<uint8_t> zeros(probe, 0), dest(probe+BLOSC_MAX_OVERHEAD);
     const int n = blosc_compress_ctx(clevel, shuffle, (size_t)ts, (size_t)probe, zeros.data(), dest.data(), dest.size(),
-                                     cname.c_str(), 0, 1);
+                                     cname.c_str(), (size_t)blocksize, 1);
     if(n < BLOSC_MIN_HEADER_LENGTH) return false;
     memcpy(header, dest.data(), 16);
     wr32(header+4, sB);
@@ -125,7 +128,9 @@ bool makeLayout(zarr &Z, const Api* a, const uint64_t ts, const uint64_t celems,
         return false;
     }
     L.kind = 1;
-    if(!bloscHeader(Z.get_cname(), (int)Z.get_clevel(), bloscShuffle, ts, L.sB, L.header)){
+    // (blosc's block size as the CPU writer takes it: a Zarr v3 array's, at most the chunk)
+    const uint64_t asked = Z.get_zarr_format() == 3 ? std::min<uint64_t>(Z.get_blocksize(), L.sB) : 0;
+    if(!bloscHeader(Z.get_cname(), (int)Z.get_clevel(), bloscShuffle, ts, L.sB, asked, L.header)){
         why = "blosc does not compress \""+Z.get_cname()+"\"";
         return false;
     }

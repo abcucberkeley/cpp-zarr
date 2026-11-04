@@ -1266,6 +1266,84 @@ int main(int argc, char** argv){
             return ok;
         });
 
+        check("blosc's shuffle and block size as a Zarr v3 array's codec gives them, byte shuffle and blosc's own blocks in v2 arrays", [&](){
+            // (each case: the format, compressor settings, data type, chunk or shard shape and inner
+            // chunk shape, and what every chunk's blosc header must say: its shuffle flags and block size)
+            struct Case { const char* name; int fmt; uint64_t clevel, shuffle, blocksize; const char* dtype; V chunks, inner;
+                          uint8_t flags; uint32_t expect; };
+            const Case cases[] = {
+                // a block size asked for, used as it is
+                {"zstd_4k", 3, 1, 1, 4096, "<u2", {64, 32, 16}, {}, 0x1, 4096},
+                // bit shuffle and blocks of 2 KiB, in a shard's inner chunks
+                {"bit_2k_sh", 3, 5, 2, 2048, "<u2", {32, 32, 16}, {16, 16, 16}, 0x4, 2048},
+                // no shuffle, and a block size blosc rounds down to whole 4-byte values
+                {"none_1001", 3, 1, 0, 1001, "<f4", {16, 16, 16}, {}, 0x0, 1000},
+                // a block bigger than the chunk: the chunk
+                {"zstd_1m", 3, 1, 1, 1 << 20, "<u2", {64, 32, 16}, {}, 0x1, 65536},
+                // none asked for: blosc's own (32 KiB for zstd at level 1)
+                {"zstd_auto", 3, 1, 1, 0, "<u2", {64, 32, 16}, {}, 0x1, 32768},
+                // v2: the .zarray's shuffle and block size are not used
+                {"v2", 2, 1, 0, 4096, "<u2", {64, 32, 16}, {}, 0x1, 32768},
+            };
+            bool ok = true;
+            for (const Case& c : cases){
+                const bool sharded = !c.inner.empty();
+                const V shape = {100, 70, 40}, zeros(3, 0);
+                const std::string p = dir + "/rt_blosc_" + c.name + ".zarr";
+                std::error_code ec;
+                std::filesystem::remove_all(p, ec);
+                {
+                    zarr Z(p, c.chunks, c.blocksize, c.clevel, "zstd", "blosc", c.shuffle, c.fmt == 3 ? "/" : ".", c.dtype, "0", {}, "C",
+                           shape, 2, zeros, sharded, sharded ? c.inner : V(3, 1));
+                    if (c.fmt == 3) Z.set_zarr_format(3);
+                    Z.set_order("C");
+                    Z.write_zarray();
+                }
+                // data that compresses (blosc would store noise as it is), with no all-zero chunk
+                const uint64_t bytes = dtypeInfo(c.dtype).bytes, count = shape[0]*shape[1]*shape[2];
+                Made m{p, shape, std::vector<uint8_t>(count*bytes), bytes};
+                for (uint64_t i = 0; i < count; i++){
+                    if (bytes == 2){ const uint16_t v = (uint16_t)(1 + (i/5) % 997); std::memcpy(&m.data[2*i], &v, 2); }
+                    else{ const float v = 0.25f*(float)(1 + i % 1000); std::memcpy(&m.data[4*i], &v, 4); }
+                }
+                // (written through the metadata on disk, as every writer reads it)
+                zarr W(p);
+                W.set_chunkInfo(zeros, shape);
+                if (parallelWriteZarr(W, m.data.data(), zeros, shape, shape, bytes*8, true, false, false))
+                    throw std::string("write: ") + W.get_errString();
+                uint64_t seen = 0;
+                for (const auto& f : chunkFiles(p)){
+                    std::vector<uint64_t> starts;
+                    if (sharded){
+                        // (inner chunks through the shard's index at its end: offset, size, then a CRC32C)
+                        uint64_t per = 1;
+                        for (uint64_t d = 0; d < 3; d++) per *= c.chunks[d]/c.inner[d];
+                        const std::string& s = f.second;
+                        if (s.size() < 16*per + 4) return false;
+                        for (uint64_t i = 0; i < per; i++){
+                            uint64_t off;
+                            std::memcpy(&off, s.data() + s.size() - (16*per + 4) + 16*i, 8);
+                            if (off != ~uint64_t(0)) starts.push_back(off);
+                        }
+                    }
+                    else starts.push_back(0);
+                    for (const uint64_t at : starts){
+                        if (f.second.size() < at + 16) return false;
+                        const uint8_t* h = reinterpret_cast<const uint8_t*>(f.second.data()) + at;
+                        uint32_t bs;
+                        std::memcpy(&bs, h + 8, 4);
+                        const bool good = h[3] == bytes && (h[2] & 0x5) == c.flags && !(h[2] & 0x2) && bs == c.expect;
+                        if (!good) std::fprintf(stderr, "    %s %s: flags 0x%02x, type size %u, block size %u\n", c.name, f.first.c_str(), h[2], h[3], bs);
+                        ok = ok && good;
+                        seen++;
+                    }
+                }
+                ok = ok && seen > 0 && readsBack(m);
+                std::filesystem::remove_all(p, ec);
+            }
+            return ok;
+        });
+
         check("shard and inner chunk shapes set before the shape (as the MATLAB and Python writers do) keep every axis", [&](){
             bool ok = true;
             for (const int fmt : {2, 3}) for (const V& shape : {V{8, 12, 16, 20}, V{6, 8, 10, 12, 14}}){
