@@ -292,6 +292,13 @@ public:
         }
         idle.push_back(std::move(s));
     }
+    // f run on every scratch the pool holds (under its lock; those calls are using are not in it)
+    template <typename F>
+    void forEach(const F &f){
+        std::lock_guard<std::mutex> g(m);
+        for(auto &b : byPlace) if(b) f(*b);
+        for(auto &s : idle) if(s) f(*s);
+    }
     // Every scratch the pool holds freed (those calls are using are not in it, and come back)
     void clear(){
         std::vector<std::unique_ptr<T>> gone;

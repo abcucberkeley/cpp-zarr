@@ -15,8 +15,8 @@
 
 // At clear mex (or when MATLAB exits), the buffers reads and writes keep between calls are
 // freed (releaseBuffers): on Linux the library itself stays loaded, as the unique symbols of
-// its static C++ runtime keep it, so that writes' kept buffers (up to CPPZARR_WRITE_KEEP_MB)
-// were never freed. (Not on macOS, where the mex files stay loaded until MATLAB exits.)
+// its static C++ runtime keep it, so that writes' kept buffers (up to CPPZARR_KEEP_MB) were
+// never freed. (Not on macOS, where the mex files stay loaded until MATLAB exits.)
 static inline void mexReleaseBuffersAtClear(){
 #if !defined(__APPLE__)
     static bool registered = false;

@@ -5,7 +5,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11_gpu_available, pybind11_gpu_set_cufile, pybind11_gpu_set_nvcomp,
-                      pybind11_kept_write_bytes, pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_region_info, pybind11_release_buffers,
+                      pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_region_info, pybind11_release_buffers,
                       pybind11_write_zarr, pybind11_write_zarr_gpu)
 
 
@@ -608,11 +608,11 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
 
 
 def release_buffers():
-    # Free the buffers reads and writes keep between calls: writes keep those of chunks over
-    # 1 MB for later calls (up to CPPZARR_WRITE_KEEP_MB MB in all: by default 1024, or an
-    # eighth of the memory the process may use if that is less), and the C library keeps
-    # memory freed by the calls' threads for their later use. For a long-lived process that
-    # is done reading and writing for a while; the next call makes new buffers.
+    # Free the buffers reads and writes keep between calls: those of chunks over 1 MB are kept
+    # for later calls up to CPPZARR_KEEP_MB MB in all (by default 1024, or an eighth of the
+    # memory the process may use if that is less), and the C library keeps memory freed by the
+    # calls' threads for their later use. For a long-lived process that is done reading and
+    # writing for a while; the next call makes new buffers.
     pybind11_release_buffers()
 
 

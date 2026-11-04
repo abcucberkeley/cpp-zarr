@@ -61,4 +61,7 @@ void* readZarrParallelHelper(const char* folderName,
 
 // Frees the buffers the readers keep between calls (see releaseBuffers in parallelwritezarr.h)
 void releaseReadBuffers();
+// Frees the read-ahead's buffers for chunks over 1 MB that the readers keep between calls,
+// to make room for a writer's (see keepBuffers in helperfunctions.h)
+void freeKeptReadBuffers();
 #endif

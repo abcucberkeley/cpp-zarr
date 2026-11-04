@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <omp.h>
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -1104,4 +1105,43 @@ uint64_t processMemoryBudget(){
         return b;
     }();
     return budget;
+}
+
+namespace {
+std::atomic<uint64_t> keptAll{0}, keptReads{0};
+}
+
+uint64_t keptBufferBytes(){ return keptAll.load(); }
+uint64_t keptReadBufferBytes(){ return keptReads.load(); }
+
+uint64_t keptBufferCap(){
+    static const uint64_t cap = [](){
+        const char* e = std::getenv("CPPZARR_KEEP_MB");
+        if(e && *e) return (uint64_t)(std::max(0.0, std::atof(e))*(1 << 20));
+        return std::min<uint64_t>(uint64_t(1024) << 20, processMemoryBudget()/8);
+    }();
+    return cap;
+}
+
+bool keepBuffers(uint64_t &kept, const uint64_t mine, const bool reads){
+    uint64_t total = keptAll.load();
+    while(mine > 0 && total-kept+mine <= keptBufferCap()){
+        if(keptAll.compare_exchange_weak(total, total-kept+mine)){
+            if(reads){
+                keptReads.fetch_add(mine);
+                keptReads.fetch_sub(kept);
+            }
+            kept = mine;
+            return true;
+        }
+    }
+    unkeepBuffers(kept, reads);
+    return mine == 0;
+}
+
+void unkeepBuffers(uint64_t &kept, const bool reads){
+    if(!kept) return;
+    keptAll.fetch_sub(kept);
+    if(reads) keptReads.fetch_sub(kept);
+    kept = 0;
 }

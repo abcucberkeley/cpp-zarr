@@ -96,31 +96,21 @@ struct ShardOut {
 namespace {
 const uint64_t helpMin = CPPZARR_WRITE_HELP_MIN;
 
-// The bytes of chunk buffers over 1 MB the writer threads' pool keeps between calls (see
-// WriteScratch), and the most it may: CPPZARR_WRITE_KEEP_MB MB, by default 1024 MB or an
-// eighth of the memory the process may use (its job's limit: see processMemoryBudget),
-// whichever is less, so that a job sized close to what it needs is not pushed over its limit
-std::atomic<uint64_t> keptWriteBytes{0};
-uint64_t writeKeepCap(){
-    static const uint64_t cap = [](){
-        const char* e = std::getenv("CPPZARR_WRITE_KEEP_MB");
-        if(e && *e) return (uint64_t)(std::max(0.0, std::atof(e))*(1 << 20));
-        return std::min<uint64_t>(uint64_t(1024) << 20, processMemoryBudget()/8);
-    }();
-    return cap;
-}
-
 // A writer thread's buffers and zstd encoder, kept in a pool between calls (see
-// ScratchPool). An encoder over 8 MB is not kept, nor buffers for chunks over 1 MB once
-// the pool's add up to writeKeepCap(): a write of a big chunk at a time (one 512x512x270
-// uint16 chunk a call, as PetaKit5D's resaving writes them) otherwise faulted in two new
-// buffers of its size every call. With them kept, 16 such calls wrote their file in 0.74-0.88
-// of the time with one thread, and in 0.35-0.54 with 12 and 24 (without the help below).
-// releaseBuffers frees them (Python's release_buffers, MATLAB's clear mex).
+// ScratchPool). An encoder over 8 MB is not kept, nor buffers for chunks over 1 MB once all
+// kept buffers would add up to more than keptBufferCap() (an eighth of the memory the process
+// may use, at most 1 GiB, so that a job sized close to what it needs is not pushed over its
+// limit): a write of a big chunk at a time (one 512x512x270 uint16 chunk a call, as
+// PetaKit5D's resaving writes them) otherwise faulted in two new buffers of its size every
+// call. With them kept, 16 such calls wrote their file in 0.74-0.88 of the time with one
+// thread, and in 0.35-0.54 with 12 and 24 (without the help below). They come before the
+// readers' kept buffers, which save less: the read-ahead's buffers the read pool keeps are
+// freed when that makes room for a write's. releaseBuffers frees them all (Python's
+// release_buffers, MATLAB's clear mex).
 struct WriteScratch {
     std::unique_ptr<uint8_t[]> unc, comp;
     uint64_t uncCap = 0, compCap = 0;
-    // (the bytes of unc and comp counted in keptWriteBytes)
+    // (the bytes of unc and comp counted as kept: see keepBuffers)
     uint64_t kept = 0;
     std::vector<uint8_t> stored, copyBuf;
     ZSTD_CCtx* zctx = nullptr;
@@ -128,14 +118,13 @@ struct WriteScratch {
     WriteScratch(const WriteScratch&) = delete;
     WriteScratch& operator=(const WriteScratch&) = delete;
     ~WriteScratch(){
-        if(kept) keptWriteBytes.fetch_sub(kept);
+        unkeepBuffers(kept, false);
         if(zctx) ZSTD_freeCCtx(zctx);
     }
     // Its buffers for a chunk over 1 MB given up, and their bytes no longer counted as kept
     void dropBig(){
         if(uncCap <= (1 << 20)) return;
-        if(kept) keptWriteBytes.fetch_sub(kept);
-        kept = 0;
+        unkeepBuffers(kept, false);
         unc.reset();
         comp.reset();
         uncCap = compCap = 0;
@@ -161,15 +150,18 @@ struct WriteScratch {
     void shrink(){
         const uint64_t keep = 1 << 20;
         if(uncCap > keep){
-            // (counted in keptWriteBytes if the pool's kept buffers stay within the cap)
+            // (kept if all kept buffers stay within the cap, once the readers' kept in the read
+            // pool are freed if that is what it takes)
             const uint64_t mine = uncCap+compCap;
-            uint64_t total = keptWriteBytes.load();
-            bool fits = total-kept+mine <= writeKeepCap();
-            while(fits && !keptWriteBytes.compare_exchange_weak(total, total-kept+mine)) fits = total-kept+mine <= writeKeepCap();
-            if(fits) kept = mine;
-            else{
-                if(kept) keptWriteBytes.fetch_sub(kept);
-                kept = 0;
+            bool fits = keepBuffers(kept, mine, false);
+            if(!fits && keptReadBufferBytes() > 0){
+                const uint64_t all = keptBufferBytes(), reads = std::min(all, keptReadBufferBytes());
+                if(all-reads+mine <= keptBufferCap()){
+                    freeKeptReadBuffers();
+                    fits = keepBuffers(kept, mine, false);
+                }
+            }
+            if(!fits){
                 unc.reset();
                 comp.reset();
                 uncCap = compCap = 0;
@@ -281,9 +273,6 @@ int writePieces(const std::string &path, const std::vector<std::pair<const uint8
 }
 #endif
 }
-
-uint64_t keptWriteBytesNow(){ return keptWriteBytes.load(); }
-uint64_t keptWriteBytesCap(){ return writeKeepCap(); }
 
 void releaseBuffers(){
     writeScratchPool.clear();

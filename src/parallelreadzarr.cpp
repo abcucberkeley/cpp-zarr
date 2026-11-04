@@ -291,7 +291,8 @@ struct FileRun {
     std::vector<const std::string*> name;
     std::vector<std::string> path;
     std::vector<std::unique_ptr<uint8_t[]>> buf;
-    std::vector<uint64_t> cap;
+    // (each buffer's size, and the most bytes read into it since it was made)
+    std::vector<uint64_t> cap, filled;
     std::vector<int64_t> len;
     std::atomic<int> left[most];
     std::atomic<bool> good[most];
@@ -339,21 +340,44 @@ struct FileRun {
         if((int64_t)buf.size() <= k){
             buf.emplace_back();
             cap.push_back(0);
+            filled.push_back(0);
         }
     }
-    // Room for item k's n bytes
-    uint8_t* room(const int64_t k, const uint64_t n){
+    // Room for at least n bytes of item k, made if it has less
+    void reserve(const int64_t k, const uint64_t n){
         if(cap[k] < n || !buf[k]){
             buf[k].reset();
             buf[k].reset(new uint8_t[std::max<uint64_t>(n, 1)]);
             cap[k] = std::max<uint64_t>(n, 1);
+            filled[k] = 0;
         }
+    }
+    // Room for item k's n bytes, which are read into it
+    uint8_t* room(const int64_t k, const uint64_t n){
+        reserve(k, n);
+        filled[k] = std::max(filled[k], n);
         return buf[k].get();
+    }
+    // The bytes of its buffers over least kept between calls, as counted (see ReadScratch)
+    uint64_t bigBytes(const uint64_t least) const {
+        uint64_t b = 0;
+        for(size_t k = 0; k < buf.size(); k++) if(cap[k] > least) b += std::min(cap[k], filled[k]+(2 << 20));
+        return b;
+    }
+    // Its buffers over least freed
+    void dropBig(const uint64_t least){
+        for(size_t k = 0; k < buf.size(); k++){
+            if(cap[k] > least){
+                buf[k].reset();
+                cap[k] = filled[k] = 0;
+            }
+        }
     }
 };
 
 // A reader thread's buffers and decoders, kept in a pool between calls (see
-// ScratchPool). Buffers over 1 MB (and the decoder used with them) are not kept.
+// ScratchPool). Buffers over 1 MB (and the decoder used with them) are not kept, but for the
+// read-ahead's (see shrink).
 struct ReadScratch {
     std::unique_ptr<uint8_t[]> stored, decoded;
     uint64_t storedCap = 0, decodedCap = 0;
@@ -371,12 +395,20 @@ struct ReadScratch {
     ZSTD_DCtx* zctx = nullptr;
     // The run of chunk files being decoded and the one after it, read ahead
     FileRun ahead[2];
+    // (the bytes of the runs' buffers over 1 MB counted as kept: see keepBuffers)
+    uint64_t kept = 0;
     ReadScratch(){}
     ReadScratch(const ReadScratch&) = delete;
     ReadScratch& operator=(const ReadScratch&) = delete;
     ~ReadScratch(){
+        unkeepBuffers(kept, true);
         if(dctx) blosc2_free_ctx(dctx);
         if(zctx) ZSTD_freeDCtx(zctx);
+    }
+    // The runs' buffers over 1 MB freed, and no longer counted as kept
+    void dropBigRuns(){
+        unkeepBuffers(kept, true);
+        for(FileRun &r : ahead) r.dropBig(1 << 20);
     }
     // Room for at least n bytes; when it has to grow it takes least at once (as much as
     // any chunk of the array can need): a buffer that grows from call to call is mapped
@@ -421,19 +453,24 @@ struct ReadScratch {
         }
         largestBlock = 0;
         if(shardIndex.capacity()*sizeof(uint64_t) > keep) std::vector<uint64_t>().swap(shardIndex);
-        // (chunk files read ahead: buffers of up to 1 MB, as many as a run has files)
+        // Chunk files read ahead: buffers of up to 1 MB, as many as a run has files, and bigger
+        // ones while all kept buffers stay within keptBufferCap() (writes' first: see
+        // WriteScratch), each counted as the bytes read into it and 2 MiB more (a huge page the
+        // last of them may be in): they are as big as a chunk file can be (see readFilesAhead),
+        // so that once kept they need not grow. Made new every call, they were mapped and their
+        // pages faulted in again every call: warm reads of 27-36 chunk files of 256^3 a call with
+        // 4 threads from NFS took 1.02-1.04 times as long as when the read pool's threads made
+        // them (and kept them, in their malloc arenas).
+        uint64_t mine = 0;
         for(FileRun &r : ahead){
             if(r.buf.size() > (size_t)FileRun::most){
                 r.buf.resize(FileRun::most);
                 r.cap.resize(FileRun::most);
+                r.filled.resize(FileRun::most);
             }
-            for(size_t k = 0; k < r.buf.size(); k++){
-                if(r.cap[k] > keep){
-                    r.buf[k].reset();
-                    r.cap[k] = 0;
-                }
-            }
+            mine += r.bigBytes(keep);
         }
+        if(!keepBuffers(kept, mine, true)) dropBigRuns();
     }
 };
 ScratchPool<ReadScratch> readScratchPool;
@@ -449,6 +486,9 @@ const uint64_t bigChunk = CPPZARR_BIG_CHUNK;
 }
 
 void releaseReadBuffers(){ readScratchPool.clear(); }
+void freeKeptReadBuffers(){
+    if(keptReadBufferBytes() > 0) readScratchPool.forEach([](ReadScratch &s){ s.dropBigRuns(); });
+}
 
 // zarrArr should be initialized to all zeros if you have empty chunks
 uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
@@ -1425,8 +1465,9 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         // arena, and the arenas kept the buffers the pool's threads had made and freed. A process
         // of 8 threads that read an array of 256^3 chunk files 20 times from VAST or two other NFS
         // servers then peaked at 4.1-4.3 GB, against 1.7 GB with 1.7.3 (now 1.8 GB), and a 4-CPU
-        // PetaKit5D task at 2.9-3.0 GB instead of 2.3 GB. (A file bigger than that, not one a Zarr
-        // writer makes, still gets a buffer its size from whichever thread reads it.)
+        // PetaKit5D task at 2.9-3.0 GB instead of 2.3 GB. The buffers are kept for later calls,
+        // within a cap (see ReadScratch). (A file bigger than that, not one a Zarr writer makes,
+        // still gets a buffer its size from whichever thread reads it.)
         const uint64_t fileRoom = sB+sB/128+4096;
         auto claim = [&](FileRun &r, const int w) -> bool {
             r.count = 0;
@@ -1442,7 +1483,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                 r.name[k] = &name;
                 r.path[k] = Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(r.cav[k])+"/"+Zarr.chunkKey(name);
                 r.len[k] = -1;
-                r.room(k, fileRoom);
+                r.reserve(k, fileRoom);
                 r.count++;
                 bytes += std::max<uint64_t>(sB, 4096);
                 if(bytes >= aheadBytes || r.count >= FileRun::most) break;

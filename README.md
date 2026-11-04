@@ -248,12 +248,13 @@ cppzarr.write_zarr('filename.zarr', im[100:200,100:200,100:200], start_coords=[0
 # and blocksize included (v2 arrays get byte shuffle and blosc's own block size, as cpp-zarr has
 # always written them)
 
-# Writes keep the buffers of chunks over 1 MB for later writes, up to CPPZARR_WRITE_KEEP_MB MB in
-# all (0: none; by default 1024, or an eighth of the memory the process may use if that is less:
-# its job's memory limit, its address-space limit or the machine's memory), so that a big array
-# written a chunk or a few at a time does not allocate them again every call; with fewer chunks
-# of 4 MB or more than threads, every thread helps put the chunks together. A long-lived process
-# that is done writing for a while can free them (and the buffers reads keep):
+# Writes keep the buffers of chunks over 1 MB for later calls, and so do reads for the chunk files
+# over 1 MB they read ahead from network storage, up to CPPZARR_KEEP_MB MB in all (0: none; by
+# default 1024, or an eighth of the memory the process may use if that is less: its job's memory
+# limit, its address-space limit or the machine's memory; writes' first), so that a big array
+# written or read a few chunks at a time does not allocate them again every call; with fewer
+# chunks of 4 MB or more than threads, every thread helps put the chunks together. A long-lived
+# process that is done reading and writing for a while can free them:
 cppzarr.release_buffers()
 ````
 
@@ -384,9 +385,9 @@ parallelWriteZarr('path/to/file.zarr',im,'dimension_separator','.');
 % after), as long as no two writers write the same chunk.
 parallelWriteZarr('path/to/file.zarr',im,'uuid',false);
 
-% Writes keep the buffers of chunks over 1 MB for later writes (up to CPPZARR_WRITE_KEEP_MB MB in all:
-% by default 1024, or an eighth of the memory the job may use if that is less). clear mex frees them,
-% and the buffers reads keep.
+% Writes keep the buffers of chunks over 1 MB for later calls, and so do reads for the chunk files over
+% 1 MB they read ahead from network storage (up to CPPZARR_KEEP_MB MB in all: by default 1024, or an
+% eighth of the memory the job may use if that is less). clear mex frees them.
 clear mex
 ````
 

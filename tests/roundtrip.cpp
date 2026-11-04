@@ -29,6 +29,11 @@
 #include <vector>
 
 #include <omp.h>
+#ifdef __linux__
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/sysmacros.h>
+#endif
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "parallelreadzarr.h"
@@ -56,6 +61,22 @@ static bool sameElement(const uint8_t* a, const uint8_t* b, const DtypeInfo &t){
         if (!(na && nb)) return false;
     }
     return true;
+}
+
+// Whether the reader takes dir to be on network storage: a file system of no device of its own
+// (NFS, FUSE, ...) other than one in memory, overlay, btrfs or ZFS
+static bool onNetworkStorage(const std::string& dir){
+#ifdef __linux__
+    struct stat st;
+    struct statfs fs;
+    if (stat(dir.c_str(), &st) != 0 || statfs(dir.c_str(), &fs) != 0 || major(st.st_dev) != 0) return false;
+    for (const long local : {0x01021994L, 0x858458f6L, 0x958458f6L, 0x794c7630L, 0x73717368L, 0x9123683eL, 0x2fc12fc1L})
+        if ((long)fs.f_type == local) return false;
+    return true;
+#else
+    (void)dir;
+    return false;
+#endif
 }
 
 static void step(const char* name, const char* comp, const char* order, const char* what){
@@ -1567,32 +1588,83 @@ int main(int argc, char** argv){
             return ok;
         });
 
-        check("the buffers kept between calls: writes keep those of chunks over 1 MB, up to CPPZARR_WRITE_KEEP_MB (by default 1 GiB or an eighth of the memory the process may use), and releaseBuffers frees them and the readers', reads and writes after it giving the same data; the process's share of its node's CPUs is more than 0 and at most 1", [&](){
-            const char* e = std::getenv("CPPZARR_WRITE_KEEP_MB");
+        check("the buffers kept between calls: writes keep those of chunks over 1 MB, up to CPPZARR_KEEP_MB with the reads' (by default 1 GiB or an eighth of the memory the process may use), and releaseBuffers frees them and the readers', reads and writes after it giving the same data; the process's share of its node's CPUs is more than 0 and at most 1", [&](){
+            const char* e = std::getenv("CPPZARR_KEEP_MB");
             const uint64_t want = e && *e ? (uint64_t)(std::max(0.0, std::atof(e))*(1 << 20))
                                           : std::min<uint64_t>(uint64_t(1024) << 20, processMemoryBudget()/8);
             const double share = processCpuShare();
-            bool ok = keptWriteBytesCap() == want && processMemoryBudget() > (uint64_t(64) << 20) && share > 0 && share <= 1;
-            std::printf("    (writes keep up to %.0f MB; the process may use %.0f MB and %.3f of its node's CPUs)\n",
-                        keptWriteBytesCap()/1048576.0, processMemoryBudget()/1048576.0, share);
-            if (!ok) std::fprintf(stderr, "    cap %llu (wanted %llu), budget %llu, CPU share %g\n", (unsigned long long)keptWriteBytesCap(),
+            bool ok = keptBufferCap() == want && processMemoryBudget() > (uint64_t(64) << 20) && share > 0 && share <= 1;
+            std::printf("    (reads and writes keep up to %.0f MB; the process may use %.0f MB and %.3f of its node's CPUs)\n",
+                        keptBufferCap()/1048576.0, processMemoryBudget()/1048576.0, share);
+            if (!ok) std::fprintf(stderr, "    cap %llu (wanted %llu), budget %llu, CPU share %g\n", (unsigned long long)keptBufferCap(),
                                   (unsigned long long)want, (unsigned long long)processMemoryBudget(), share);
             // (two chunks of 8 MB: their buffers are kept, as the cap allows)
             const bool keeps = want >= (uint64_t(64) << 20);
             Made a = make("kept_release", 3, {1024, 1024, 8}, {1024, 1024, 4}, {}, "F", "zstd", "/", "<u2");
-            const uint64_t kept = keptWriteBytesNow();
+            const uint64_t kept = keptBufferBytes();
             ok = ok && (!keeps || kept > 0) && kept <= want && readsBack(a);
             releaseBuffers();
-            const uint64_t after = keptWriteBytesNow();
+            const uint64_t after = keptBufferBytes();
             ok = ok && after == 0 && readsBack(a);
             Made b = make("kept_release", 3, {1024, 1024, 8}, {1024, 1024, 4}, {}, "C", "lz4", "/", "<u2");
-            const uint64_t again = keptWriteBytesNow();
+            const uint64_t again = keptBufferBytes();
             ok = ok && (!keeps || again > 0) && readsBack(b);
             releaseBuffers();
             if (!ok) std::fprintf(stderr, "    kept %llu, after releaseBuffers %llu, written again %llu\n", (unsigned long long)kept,
                                   (unsigned long long)after, (unsigned long long)again);
             std::error_code ec;
             std::filesystem::remove_all(b.path, ec);
+            return ok;
+        });
+
+        check("reads keep the read-ahead's buffers for chunk files over 1 MB between calls (network storage, calls of 2 threads), within the cap they share with writes, whose buffers come first: a write that needs the room frees them; reads of another array between give the same data", [&](){
+            releaseBuffers();
+            const int threadsWere = omp_get_max_threads();
+            omp_set_num_threads(2);
+            bool ok = true;
+            uint64_t r1 = 0, r2 = 0, r3 = 0, all2 = 0, all3 = 0, wrote = 0;
+            const uint64_t cap = keptBufferCap(), mb = uint64_t(1) << 20;
+            std::vector<std::string> paths;
+            try{
+                // 64 chunk files of 1 MiB (zstd), then 32 of 2 MiB (lz4), read ahead by reads of 2
+                // threads on network storage; then the first again
+                Made a = make("kept_reads_a", 2, {512, 1024, 64}, {512, 1024, 1}, {}, "F", "zstd", "/", "<u2");
+                Made b = make("kept_reads_b", 3, {1024, 1024, 32}, {1024, 1024, 1}, {}, "C", "lz4", "/", "<u2");
+                paths = {a.path, b.path};
+                ok = readsBack(a);
+                r1 = keptReadBufferBytes();
+                ok = ok && r1 <= keptBufferBytes() && keptBufferBytes() <= cap && readsBack(b) && readsBack(a);
+                r2 = keptReadBufferBytes();
+                all2 = keptBufferBytes();
+                ok = ok && r2 <= all2 && all2 <= cap;
+                // a write of one chunk of 12 MiB, whose buffers (24 MiB and a little) are kept if they
+                // fit with the writes' kept before: the reads' are freed when that makes room
+                Made w = make("kept_reads_w", 3, {2048, 3072, 1}, {2048, 3072, 1}, {}, "C", "zstd", "/", "<u2");
+                paths.push_back(w.path);
+                r3 = keptReadBufferBytes();
+                all3 = keptBufferBytes();
+                wrote = all3 - std::min(all3, r3);
+                ok = ok && r3 <= all3 && all3 <= cap && readsBack(w);
+                if (24*mb + (all2 - r2) <= cap) ok = ok && wrote >= 24*mb;
+                if (r2 > 0 && r2 + wrote > cap) ok = ok && r3 == 0;
+                // (reads ahead: on network storage, read-ahead on, and room for them)
+                auto unsetOr = [](const char* v, double least){ const char* x = std::getenv(v); return !x || !*x || std::atof(x) >= least; };
+                const bool ahead = onNetworkStorage(dir) && unsetOr("CPPZARR_READ_AHEAD_MB", 0.01) && unsetOr("CPPZARR_READ_AHEAD_THREADS", 2) &&
+                                   unsetOr("CPPZARR_READS", 1);
+                if (ahead && cap >= 64*mb) ok = ok && r1 > 0 && r2 > 0;
+                std::printf("    (%s: reads kept %.1f MB, then %.1f MB of %.1f; a write then kept %.1f MB with reads' %.1f; the cap %.0f MB)\n",
+                            ahead ? "read ahead" : "not read ahead", r1/(double)mb, r2/(double)mb, all2/(double)mb, wrote/(double)mb,
+                            r3/(double)mb, cap/(double)mb);
+            }
+            catch (const std::string& m){
+                std::fprintf(stderr, "    %s\n", m.c_str());
+                ok = false;
+            }
+            releaseBuffers();
+            ok = ok && keptBufferBytes() == 0 && keptReadBufferBytes() == 0;
+            omp_set_num_threads(threadsWere);
+            std::error_code ec;
+            for (const std::string& p : paths) std::filesystem::remove_all(p, ec);
             return ok;
         });
     }

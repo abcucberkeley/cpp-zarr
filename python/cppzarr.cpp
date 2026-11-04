@@ -525,8 +525,8 @@ PYBIND11_MODULE(cppzarr, m) {
 	          releaseBuffers();
 	      }, "Free the buffers reads and writes keep between calls");
 
-	m.def("pybind11_kept_write_bytes", []() { return std::make_pair(keptWriteBytesNow(), keptWriteBytesCap()); },
-	      "The bytes of write buffers kept between calls, and the most kept");
+	m.def("pybind11_kept_bytes", []() { return std::make_tuple(keptBufferBytes(), keptReadBufferBytes(), keptBufferCap()); },
+	      "The bytes of the buffers reads and writes keep between calls, those of the reads, and the most kept");
 
 	m.def("pybind11_read_zarr_gpu", &pybind11_read_zarr_gpu, pybind11::arg("requests"), pybind11::arg("order"),
 	      pybind11::arg("numThreads") = 0, pybind11::arg("stream") = 0, "Read regions of zarr files into GPU memory");

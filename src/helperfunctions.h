@@ -50,6 +50,21 @@ double processCpuShare();
 // address-space limit (ulimit -v) and the machine's physical memory, of those it can find
 uint64_t processMemoryBudget();
 
+// The buffers for chunks over 1 MB that reads and writes keep between calls, so that later
+// calls need not map and fault in new ones, counted together: the bytes kept now, those of
+// the readers (their read-ahead's buffers, counted as the bytes read into them), and the most
+// there may be: CPPZARR_KEEP_MB MB (0: none), by default 1024 MB or an eighth of
+// processMemoryBudget(), whichever is less
+uint64_t keptBufferBytes();
+uint64_t keptReadBufferBytes();
+uint64_t keptBufferCap();
+// A scratch's buffers kept between calls, counted as kept bytes so far (reads: a reader's),
+// counted as mine bytes instead if all kept buffers then stay within keptBufferCap() (true);
+// if not, they are no longer counted (kept 0) and the scratch frees them
+bool keepBuffers(uint64_t &kept, uint64_t mine, bool reads);
+// A scratch's kept buffers no longer counted (it frees them)
+void unkeepBuffers(uint64_t &kept, bool reads);
+
 // A data type as cpp-zarr keeps it: the dtype string of a Zarr v2 .zarray ("<u2",
 // "|b1", "<f2", "<c16", ...), or "bfloat16", the name Zarr metadata gives that type
 // (">bfloat16" for a Zarr v3 array stored big-endian)
