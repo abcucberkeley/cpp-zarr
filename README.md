@@ -145,7 +145,13 @@ cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 # the reads overlap and share num_threads threads (by default, as for a call, OMP_NUM_THREADS
 # or every CPU), each read getting more of them the larger it is (a thread per 32M elements,
 # so that a batch of many reads runs many of them at once; with more than
-# CPPZARR_READ_AHEAD_THREADS threads, see below, a thread per 8M)
+# CPPZARR_READ_AHEAD_THREADS threads, see below, a thread per 8M). Each array's metadata is read
+# once for the batch, ahead of its reads. On network storage (Linux), reads of one thread each
+# (single time points and other small regions) wait for the server before their data arrives,
+# so up to CPPZARR_BATCH_READS_PER_THREAD (3) of them run at once for each thread, as many as
+# their measured wait calls for (none more while they wait less than half their CPU time, nor
+# in a batch that has had no data fetched from the storage, as from the page cache), where
+# that has read faster: a process tries it for each batch size, from its third batch of it
 regions = [('filename.zarr', [0, 0, 128*i], [128, 128, 128*(i+1)]) for i in range(8)]
 arrays = cppzarr.read_zarr_batch(regions, num_threads=8)
 cppzarr.read_zarr_batch([r + (batch[i],) for i, r in enumerate(regions)], num_threads=8)
@@ -204,7 +210,7 @@ decoded on the CPU, which reports damage), but damage inside a stream's entropy-
 make nvCOMP fail with a GPU error or never finish (the call then returns an error after
 CPPZARR_GPU_TIMEOUT seconds, 30 plus 1 per 50 MB by default). Arrays with checksums (Zarr v3's
 crc32c codec) are checked on the CPU before anything goes to the GPU. For GPU reads, num_threads
-sets the threads that prepare the chunks; the files are read with at least 32 threads at once
+sets the threads that prepare the chunks; the files are read with at least 128 threads at once
 (CPPZARR_GPU_READS), since reading mostly waits on the storage.
 
 #### Write from GPU memory

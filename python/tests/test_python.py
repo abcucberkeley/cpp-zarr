@@ -552,6 +552,179 @@ def main():
     # whole arrays (no coordinates), and C order asked for
     whole = cppzarr.read_zarr_batch([(p, None, None) for p, _ in arrays], order='C', num_threads=3)
     good = good and all(np.array_equal(w, d) and w.flags['C_CONTIGUOUS'] for w, (_, d) in zip(whole, arrays))
+    # reads of one thread each from network storage (here taken to be, for every setting) run up to
+    # CPPZARR_BATCH_READS_PER_THREAD at once a thread as their I/O wait calls for (here taken to call for
+    # all of them, readers added as reads end): the same values, into outs and new arrays; how many their
+    # CPU time and I/O wait call for; and the setting as it is read
+    many_small = [requests[i % len(requests)] for i in range(40)]
+    want_small = [expected[i % len(requests)] for i in range(40)]
+    saved_rpt, saved_net, saved_wanted = wrappers._READS_PER_THREAD, wrappers.pybind11_on_network, wrappers._readers_wanted
+    saved_share, saved_fetched = wrappers._wait_share[0], wrappers._process_read_bytes
+    saved_allowed, saved_learn, saved_trials = wrappers._extras_allowed, wrappers._extras_learn, dict(wrappers._trials)
+    try:
+        wrappers.pybind11_on_network = lambda folder: True
+        wrappers._readers_wanted = lambda threads, most, cpu, wait: most
+        # (and found to help: see the trials below)
+        wrappers._extras_allowed, wrappers._extras_learn = lambda size: True, lambda size, used, rate: None
+        # (and the batches taken to have data fetched from the storage: more bytes each time it is asked)
+        fetched_bytes = [0]
+
+        def more_fetched():
+            fetched_bytes[0] += 4096
+            return fetched_bytes[0]
+        wrappers._process_read_bytes = more_fetched
+        for rpt in (1, 2, 3):
+            wrappers._READS_PER_THREAD = rpt
+            for threads in (1, 3, 8):
+                got = cppzarr.read_zarr_batch(many_small, num_threads=threads)
+                good = good and all(np.array_equal(g, x) for g, x in zip(got, want_small))
+            outs = np.zeros((40, 30, 25, 20), np.uint16)
+            got = cppzarr.read_zarr_batch([r + (outs[i],) for i, r in enumerate(many_small)], num_threads=4)
+            good = good and np.array_equal(outs, np.stack(want_small))
+        # (a batch that has had no data fetched, served by the page cache, runs one reader a thread and has
+        # the next start with one a thread; one that has data fetched runs more, as one does where the
+        # bytes fetched cannot be read; where reads cannot be timed, one a thread always)
+        timed = wrappers.pybind11_read_times_available()
+        for fetching, more_readers in ((lambda: 12345, False), (more_fetched, True), (lambda: None, True)):
+            wrappers._process_read_bytes = fetching
+            wrappers._wait_share[0] = None
+            got = cppzarr.read_zarr_batch(many_small, num_threads=4)
+            good = good and all(np.array_equal(g, x) for g, x in zip(got, want_small))
+            good = good and (wrappers._last_batch[0] > 4) == (more_readers and timed)
+            good = good and (more_readers or not timed or wrappers._wait_share[0] == 0.0)
+        wrappers._process_read_bytes = more_fetched
+        # (whether more readers help is tried for each batch size: its first batch, which starts the
+        # pools' threads, and the next run one reader a thread, the third more)
+        wrappers._extras_allowed, wrappers._extras_learn = saved_allowed, saved_learn
+        peaks = []
+        for k in range(3):
+            wrappers._wait_share[0] = None
+            got = cppzarr.read_zarr_batch(many_small[:37], num_threads=4)
+            good = good and all(np.array_equal(g, x) for g, x in zip(got, want_small[:37]))
+            peaks.append(wrappers._last_batch[0])
+        good = good and peaks[:2] == [4, 4] and (peaks[2] > 4) == timed
+        wrappers._extras_allowed, wrappers._extras_learn = lambda size: True, lambda size, used, rate: None
+        # (a read that fails among readers added on the way: the batch raises its error)
+        try:
+            cppzarr.read_zarr_batch(many_small[:20] + [(many_small[0][0], [0, 0, 0], [999, 1, 1])] + many_small[20:], num_threads=2)
+            good = False
+        except Exception:
+            pass
+    finally:
+        good = good and (wrappers._wait_share[0] is None or wrappers._wait_share[0] >= 0)
+        wrappers._READS_PER_THREAD, wrappers.pybind11_on_network, wrappers._readers_wanted = saved_rpt, saved_net, saved_wanted
+        wrappers._wait_share[0], wrappers._process_read_bytes = saved_share, saved_fetched
+        wrappers._extras_allowed, wrappers._extras_learn = saved_allowed, saved_learn
+        wrappers._trials.clear()
+        wrappers._trials.update(saved_trials)
+    found = wrappers._process_read_bytes()
+    # the trials' states: a size's first batch and the next without more readers, then a batch with them,
+    # kept if it fetched at least 1.1 times as fast as the one before without (and tried against one
+    # without every _EXTRA_ON batches), else left off for _EXTRA_OFF batches and tried again
+    saved_trials = dict(wrappers._trials)
+    wrappers._trials.clear()
+    try:
+        seen = []
+        for used, rate in ((False, 1.0), (False, 100.0), (True, 105.0)):
+            seen.append(wrappers._extras_allowed(7))
+            wrappers._extras_learn(7, used, rate)
+        good = good and seen == [False, False, True]
+        seen = []
+        for k in range(wrappers._EXTRA_OFF):
+            seen.append(wrappers._extras_allowed(7))
+            wrappers._extras_learn(7, False, 100.0)
+        good = good and not any(seen) and wrappers._extras_allowed(7)
+        wrappers._extras_learn(7, True, 115.0)
+        seen = []
+        for k in range(wrappers._EXTRA_ON):
+            seen.append(wrappers._extras_allowed(7))
+            wrappers._extras_learn(7, True, 115.0)
+        good = good and all(seen) and not wrappers._extras_allowed(7)
+        wrappers._extras_learn(7, False, 100.0)
+        # (a batch whose reads called for no more readers gives a later baseline)
+        good = good and wrappers._extras_allowed(7)
+        wrappers._extras_learn(7, False, 200.0)
+        wrappers._extras_learn(7, True, 210.0)
+        good = good and not wrappers._extras_allowed(7) and wrappers._extras_allowed(8) is False
+    finally:
+        wrappers._trials.clear()
+        wrappers._trials.update(saved_trials)
+    good = good and (found is None or (isinstance(found, int) and found >= 0))
+    good = good and [wrappers._readers_wanted(16, 48, 4.0, w) for w in (0.0, 1.0, 2.0, 3.4, 100.0)] == [16, 16, 32, 44, 48]
+    good = good and wrappers._readers_wanted(16, 48, 0.0, 0.0) == 16 and wrappers._readers_wanted(4, 4, 1.0, 9.0) == 4
+    saved = os.environ.get('CPPZARR_BATCH_READS_PER_THREAD')
+    for v, n in (('', 3), ('2', 2), ('1', 1), ('0', 1), ('-2', 1), ('x', 3)):
+        os.environ['CPPZARR_BATCH_READS_PER_THREAD'] = v
+        good = good and wrappers._reads_per_thread() == n
+    if saved is None:
+        del os.environ['CPPZARR_BATCH_READS_PER_THREAD']
+    else:
+        os.environ['CPPZARR_BATCH_READS_PER_THREAD'] = saved
+    good = good and isinstance(wrappers.pybind11_on_network(tmp), bool)
+    # each array's metadata is read once a batch, not kept between batches: an array written again
+    # (other values, another shape) reads as written in the next batch
+    again = os.path.join(tmp, "batch_again.zarr")
+    first = values_like(rng, np.zeros((40, 30, 20), np.uint16))
+    cppzarr.write_zarr(again, first, chunks=[16, 16, 8], zarr_format=3, shards=[32, 32, 16])
+    got = cppzarr.read_zarr_batch([(again, [0, 0, 0], [10, 10, 10])] * 5 + [(again, None, None)], num_threads=4)
+    good = good and all(np.array_equal(g, first[:10, :10, :10]) for g in got[:5]) and np.array_equal(got[5], first)
+    shutil.rmtree(again)
+    second = values_like(rng, np.zeros((50, 30, 20), np.uint16))
+    cppzarr.write_zarr(again, second, chunks=[8, 8, 8], zarr_format=3)
+    got = cppzarr.read_zarr_batch([(again, [0, 0, 0], [10, 10, 10])] * 5 + [(again, None, None)], num_threads=4)
+    good = good and all(np.array_equal(g, second[:10, :10, :10]) for g in got[:5]) and np.array_equal(got[5], second)
+    # a batch leaves nothing for Python's garbage collector: its objects are freed as it returns (kept
+    # until a collection, they made the collector run often, and in a process of many objects a collection
+    # can take longer than a batch), here with readers added as reads end (the 2nd and 3rd batches: the
+    # 1st starts the pools' threads)
+    import gc
+    saved_rpt, saved_net, saved_wanted = wrappers._READS_PER_THREAD, wrappers.pybind11_on_network, wrappers._readers_wanted
+    saved_share, saved_fetched = wrappers._wait_share[0], wrappers._process_read_bytes
+    collecting = gc.isenabled()
+    try:
+        wrappers.pybind11_on_network = lambda folder: True
+        wrappers._readers_wanted = lambda threads, most, cpu, wait: most
+        wrappers._READS_PER_THREAD = 3
+        fetched_bytes = [0]
+
+        def more_fetched():
+            fetched_bytes[0] += 4096
+            return fetched_bytes[0]
+        wrappers._process_read_bytes = more_fetched
+        saved_allowed, saved_learn = wrappers._extras_allowed, wrappers._extras_learn
+        wrappers._extras_allowed, wrappers._extras_learn = lambda size: True, lambda size, used, rate: None
+        gc.disable()
+        found = []
+        for k in range(3):
+            gc.collect()
+            got = cppzarr.read_zarr_batch(many_small, num_threads=4)
+            found.append(gc.collect())
+            good = good and all(np.array_equal(g, x) for g, x in zip(got, want_small))
+            good = good and (wrappers._last_batch[0] > 4 or not wrappers.pybind11_read_times_available())
+        good = good and found[1:] == [0, 0]
+        if found[1:] != [0, 0]:
+            print(f'  a batch left {found} objects for the garbage collector')
+    finally:
+        if collecting:
+            gc.enable()
+        wrappers._READS_PER_THREAD, wrappers.pybind11_on_network, wrappers._readers_wanted = saved_rpt, saved_net, saved_wanted
+        wrappers._wait_share[0], wrappers._process_read_bytes = saved_share, saved_fetched
+        wrappers._extras_allowed, wrappers._extras_learn = saved_allowed, saved_learn
+    # a batch of one array starts no openers (its first read opens it), a batch of several arrays does
+    opener_calls = [0]
+    real_opener = wrappers._opener
+
+    def counting_opener():
+        opener_calls[0] += 1
+        return real_opener()
+    wrappers._opener = counting_opener
+    try:
+        got = cppzarr.read_zarr_batch([(again, [0, 0, 0], [10, 10, 10])] * 8, num_threads=2)
+        good = good and opener_calls[0] == 0 and all(np.array_equal(g, second[:10, :10, :10]) for g in got)
+        got = cppzarr.read_zarr_batch(requests[:12], num_threads=2)
+        good = good and opener_calls[0] > 0 and all(np.array_equal(g, x) for g, x in zip(got, expected[:12]))
+    finally:
+        wrappers._opener = real_opener
     big = os.path.join(tmp, "gil.zarr")
     cppzarr.write_zarr(big, values_like(rng, np.zeros((512, 512, 128), np.uint16)), chunks=[128, 128, 64])
     count = [0]
@@ -766,6 +939,24 @@ def test_gpu(tmp, rng, libs):
             if 'SAME' not in r.stdout:
                 good = False
                 print('  GPU read into PyTorch memory with', conf, 'failed:', (r.stderr.strip().splitlines() or [r.stdout])[-1])
+    # regions whose chunks' stored bytes run over several of the reads' pieces (1 MiB, 4 MiB in runs
+    # of 8 MiB or more: such a run's file is opened once for all its pieces), many of one array (its
+    # metadata read once for the batch), in one batch with regions of another array (of as many
+    # dimensions: a GPU batch's arrays all have the same number)
+    runs = os.path.join(tmp, 'gpu_runs.zarr')
+    dr = (np.arange(3 * 128 * 192 * 160, dtype=np.uint32).reshape(3, 128, 192, 160) * 2654435761 >> 20).astype(np.uint16)
+    cppzarr.write_zarr(runs, dr, chunks=[1, 32, 64, 64], shards=[3, 128, 192, 192], zarr_format=3, cname='zstd', clevel=1)
+    runs2 = os.path.join(tmp, 'gpu_runs2.zarr')
+    cppzarr.write_zarr(runs2, dr[:, :64, :96, :80] ^ 0x5a5a, chunks=[1, 16, 32, 32], shards=[3, 64, 96, 96], zarr_format=3,
+                       cname='zstd', clevel=1)
+    batch = [(runs, [t, 0, 0, 0], [t + 1, 128, 192, 160]) for t in range(3)] * 2 + [(runs, [0, 17, 5, 9], [3, 100, 190, 151])]
+    batch += [(runs2, [0, 0, 0, 0], [3, 64, 96, 80]), (runs2, [1, 3, 5, 7], [2, 60, 90, 77])]
+    outs = [cupy.empty(tuple(b - a for a, b in zip(s, e)), dtype=np.uint16) for q, s, e in batch]
+    got = cppzarr.read_zarr_batch([r + (o,) for r, o in zip(batch, outs)], num_threads=4)
+    tried += len(batch)
+    if not all(np.array_equal(o.get(), cppzarr.read_zarr(q, s, e, order='C')) for o, (q, s, e) in zip(outs, batch)):
+        good = False
+        print('  GPU batch over runs of several pieces differs')
     # refused: another shape, another data type, a batch of GPU and host outputs, an output
     # that is not contiguous, a batch with an array that is not there, gpu=True with a host
     # output (alone, and in a batch)

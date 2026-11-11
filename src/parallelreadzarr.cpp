@@ -537,6 +537,15 @@ ForkSafetyOwner forkSafetyOwner;
 const uint64_t bigChunk = CPPZARR_BIG_CHUNK;
 }
 
+bool readsFromNetwork(const std::string &folder){
+#ifdef __linux__
+    return arrayOnNetwork(folder);
+#else
+    (void)folder;
+    return false;
+#endif
+}
+
 void releaseReadBuffers(){ readScratchPool.clear(); }
 void freeKeptReadBuffers(){
     if(keptReadBufferBytes() > 0) readScratchPool.forEach([](ReadScratch &s){ s.dropBigRuns(); });

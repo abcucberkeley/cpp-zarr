@@ -1,12 +1,14 @@
-import itertools
 import json
+import math
 import numpy as np
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11_gpu_available, pybind11_gpu_set_cufile, pybind11_gpu_set_nvcomp,
-                      pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_region_info, pybind11_release_buffers,
-                      pybind11_write_zarr, pybind11_write_zarr_gpu)
+                      pybind11_last_read_times, pybind11_on_network, pybind11_open_zarrs, pybind11_read_times_available,
+                      pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_read_zarr_opened, pybind11_region_info,
+                      pybind11_release_buffers, pybind11_write_zarr, pybind11_write_zarr_gpu)
 
 
 def _default_chunks(ndim):
@@ -338,7 +340,9 @@ _pools_lock = threading.Lock()
 _pools_pid = os.getpid()
 
 
-def _pool(threads_per_read):
+def _pool(threads_per_read, workers):
+    # A pool for reads of threads_per_read threads each, with at least workers threads (and as many
+    # as the process has CPUs)
     global _pools_pid
     with _pools_lock:
         # (a forked child has the pools but none of their threads: it makes its own)
@@ -346,10 +350,47 @@ def _pool(threads_per_read):
             _pools.clear()
             _pools_pid = os.getpid()
         pool = _pools.get(threads_per_read)
-        if pool is None:
-            pool = _pools[threads_per_read] = ThreadPoolExecutor(max_workers=max(_cpus(), 1),
+        if pool is None or pool._max_workers < workers:
+            # (a bigger one replaces it: the old one's threads end once no call holds it, so a call
+            # still handing reads to it is not cut short)
+            pool = _pools[threads_per_read] = ThreadPoolExecutor(max_workers=max(_cpus(), workers, 1),
                                                                  thread_name_prefix=f'cppzarr{threads_per_read}')
         return pool
+
+
+_openers = [None, None]
+
+# A batch's openers at once (see read_zarr_batch), each opening one array at a time
+_OPENERS = 4
+
+# An array's metadata that one of a batch's reads or openers is reading (in the batch's opened)
+_OPENING = object()
+
+
+class _OpenFailed:
+    # The error an array's metadata could not be read with, for each of the batch's reads of it to raise
+    __slots__ = ('error',)
+
+    def __init__(self, error):
+        self.error = error
+
+
+def _opener():
+    # The pool that opens a batch's arrays ahead of their reads, one for each process (a forked child
+    # makes its own): _OPENERS threads, which mostly wait for the storage (with 16, batches of single time
+    # points of many arrays read from the page cache were up to 1.12 times as slow, its threads taking
+    # turns on the CPUs with the reads)
+    with _pools_lock:
+        if _openers[0] is None or _openers[1] != os.getpid():
+            _openers[0], _openers[1] = ThreadPoolExecutor(max_workers=_OPENERS, thread_name_prefix='cppzarr_open'), os.getpid()
+        return _openers[0]
+
+
+# The wait for the storage of the process's last batch of reads of one thread each from network storage,
+# as a share of their CPU time (None before the first): a batch starts with as many readers as that calls
+# for, not with one a thread, whose first round of reads would wait (a batch of 64 at 16 threads, all of
+# it); a batch that waits otherwise than the one before adds or ends readers as it goes
+_wait_share = [None]
 
 
 # Elements a read's thread works on in a batch: reads of up to this many use one thread each,
@@ -366,6 +407,120 @@ _ELEMENTS_PER_THREAD = 32 << 20
 # the page cache took 1.13 times as long with all 8 at once). Smaller reads, whose time goes more to
 # waiting for the storage, all run at once as the threads allow.
 _LEAST_ROUNDS = 2
+
+
+def _reads_per_thread():
+    # CPPZARR_BATCH_READS_PER_THREAD (3 when unset or not a number; at least 1)
+    v = os.environ.get('CPPZARR_BATCH_READS_PER_THREAD')
+    try:
+        return max(1, int(v)) if v else 3
+    except ValueError:
+        return 3
+
+
+# Reads of one thread each (of up to _ELEMENTS_PER_THREAD elements, such as single time points) from
+# network storage run up to this many at once for each of a batch's threads, as many as their waiting
+# for the storage calls for: such a read waits for the server before its chunks arrive (from VAST about
+# 1 ms for a shard's index, then for its first bytes), and meanwhile its thread has nothing to decode;
+# from the page cache it hardly waits, and more reads than threads would only take turns on the CPUs.
+# A batch starts with as many as the wait of the batch before called for (the first: one a thread) and,
+# once as many reads as it has threads have ended, keeps threads x (CPU + 2 x wait) / CPU of them going
+# (the reads' own time neither on a CPU nor waiting for one, as the library measures it: Linux), at most
+# half the batch at once: cold batches of 512 single time points of the training data read from VAST
+# with 16 threads of a B200 node, 11 of an array as a training loader's batches are or each of another,
+# 1.3-1.5 times as fast as one at once a thread (each array's metadata read once in both). Only in a
+# batch that has had data fetched from the storage, and where more at once have read faster (see
+# _trials). Elsewhere, and in batches of bigger reads, one at once a thread.
+_READS_PER_THREAD = _reads_per_thread()
+
+
+# Reads of one thread each from network storage wait for the storage at least this share of their CPU time
+# before a batch runs more of them at once than it has threads (see _readers_wanted)
+_LEAST_WAIT_SHARE = 0.5
+
+
+def _process_read_bytes():
+    # The bytes this process has had fetched from its storage so far (Linux: /proc/self/io; the NFS client
+    # counts what it fetches from the server, and nothing for reads the page cache serves), or None where
+    # that cannot be read
+    try:
+        fd = os.open('/proc/self/io', os.O_RDONLY)
+        try:
+            text = os.read(fd, 1024)
+        finally:
+            os.close(fd)
+        for line in text.split(b'\n'):
+            if line.startswith(b'read_bytes:'):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+# Whether more readers than threads help the process's batches, for each batch size (number of requests):
+# a batch that runs them is compared, in bytes fetched from the storage a second, with the last batch of
+# that size that did not (not the process's first of it, which also starts the pools' threads), and they
+# are kept while it reads at least _EXTRA_GAIN times as fast; else they are left off for _EXTRA_OFF
+# batches of that size and tried again, and kept, tried against a batch without them every _EXTRA_ON
+# (cold batches only; where the bytes fetched cannot be read, they are not tried, only called for). Cold
+# batches of 64 single time points of one array read with every core of a 24-core node, 32 at once (24
+# threads), took 1.08-1.12 times as long as 24 at once, where on a B200 node's 16 cores 32-48 at once
+# read batches of single time points of the training data 1.2-1.5 times as fast as 16.
+_EXTRA_GAIN, _EXTRA_OFF, _EXTRA_ON = 1.1, 32, 64
+_trials = {}
+_trials_lock = threading.Lock()
+
+
+def _extras_allowed(size):
+    # Whether a batch of size requests may run more readers than threads (see _trials)
+    with _trials_lock:
+        t = _trials.get(size)
+        if t is None:
+            if len(_trials) >= 64:
+                _trials.clear()
+            t = _trials[size] = ['first', 0.0, 0]
+        return t[0] in ('try', 'on')
+
+
+def _extras_learn(size, used, rate):
+    # A cold batch of size requests has ended, having run more readers than threads (used) or not, at
+    # rate bytes fetched a second
+    with _trials_lock:
+        t = _trials.get(size)
+        if t is None:
+            return
+        state = t[0]
+        if state == 'first':
+            t[0] = 'measure'
+        elif state == 'measure':
+            t[0], t[1] = 'try', rate
+        elif state == 'try':
+            if not used:
+                # (its reads did not call for more: a later baseline)
+                t[1] = rate
+            elif rate >= _EXTRA_GAIN * t[1]:
+                t[0], t[2] = 'on', _EXTRA_ON
+            else:
+                t[0], t[2] = 'off', _EXTRA_OFF
+        else:
+            if state == 'off':
+                t[1] = rate
+            t[2] -= 1
+            if t[2] <= 0:
+                t[0] = 'try' if state == 'off' else 'measure'
+
+
+def _readers_wanted(threads, most, cpu, wait):
+    # How many reads of one thread each to keep going, from the CPU time and the wait for the storage of
+    # those done: one a thread while they wait less than half their CPU time (from the page cache, where
+    # the NFS client still asks the server about each file it opens: more readers then only took turns
+    # on the CPUs, a warm batch of clustered single time points 1.12 times as slow with 20 readers on 16
+    # threads), else threads x (CPU + 2 x wait) / CPU, at most most (twice the wait: reads that wait the
+    # same on average do not all wait at once, and as many as would just cover the average read cold
+    # time points from VAST 1.15 times as slow as at 3 a thread)
+    if wait < _LEAST_WAIT_SHARE * cpu:
+        return threads
+    return max(threads, min(most, math.ceil(threads * (cpu + 2 * wait) / max(cpu, 1e-9))))
 
 
 def _read_ahead_threads():
@@ -414,10 +569,13 @@ def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=Fal
     # OMP_NUM_THREADS, or every CPU this process may run on). Each read gets a thread per
     # 32M elements it reads (at least one, at most all of them; with more threads than
     # CPPZARR_READ_AHEAD_THREADS, 64, a thread per 8M), and as many reads as the threads
-    # allow run at once (with fewer reads than that, the threads are shared out among them).
+    # allow run at once (with fewer reads than that, the threads are shared out among them;
+    # reads of one thread each from network storage, up to CPPZARR_BATCH_READS_PER_THREAD, 3,
+    # at once a thread, as their wait for the storage calls for). Each array's metadata is read
+    # once for the batch, however many of its regions the batch reads.
     # Into GPU memory (every out a CuPy array, a PyTorch tensor on a CUDA device, or an array
     # with __cuda_array_interface__, all on one GPU): the chunks' stored bytes are read on the
-    # host (the files with at least 32 threads at once, since reading mostly waits on the
+    # host (the files with at least 128 threads at once, since reading mostly waits on the
     # storage; num_threads threads prepare them) and decompressed on the GPU (nvCOMP: pip install
     # nvidia-libnvcomp-cu12), all of the batch's at once, with the GPU work on stream (a
     # PyTorch or CuPy stream, or a CUDA stream handle; by default the default stream), done
@@ -455,31 +613,219 @@ def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=Fal
         at_once -= 1
     # (the threads split as evenly as they go: some reads may get one more)
     threads = [total // at_once + (i < total % at_once) for i in range(at_once)]
+    if order not in (None, 'F', 'C'):
+        raise Exception(f"order must be 'F', 'C' or None, not {order!r}")
+    # (reads of one thread each from network storage: up to _READS_PER_THREAD at once a thread, as
+    # their waiting for the storage calls for)
+    most = len(threads)
+    if (per_read == 1 and not many and _READS_PER_THREAD > 1 and len(requests) > total
+            and pybind11_read_times_available() and pybind11_on_network(requests[0][0])):
+        # (and at most half the batch at once, but the threads: all of it at once, the batch waits for
+        # its slowest read, which no other read overlaps any more, where more reads at once only shared
+        # out the same bandwidth: 64 single time points read cold with 24 threads, all 64 at once, were
+        # up to 1.18 times as slow)
+        most = min(len(requests), total * _READS_PER_THREAD, max(total, -(-len(requests) // _LEAST_ROUNDS)))
     results = [None] * len(requests)
-    following = itertools.count()
+    taken = [0]
     lock = threading.Lock()
     failed = []
+    # (each array's metadata read once for the batch, by whichever comes to it first: its first read, or
+    # one of the batch's openers, which open the arrays of the next requests in their order, up to
+    # `window` requests past the reads; the batch's other reads of it wait for that, and it is dropped
+    # after its last read. All opened before the reads, a batch of many arrays waited for the slowest;
+    # opened only by the reads, a batch's reads of one array, which come together, all waited for it at
+    # once. An array that is not there fails the reads that need it. Kept in one dict and waited for on
+    # one condition, so that a batch makes few objects: with a Future an array and a task a request,
+    # each batch of 64 single time points of 64 arrays made Python's garbage collector run twice, and
+    # in a process holding many objects a collection of its older generation took twice as long as a
+    # batch)
+    opened = {}
+    left = {}
+    for r in requests:
+        left[r[0]] = left.get(r[0], 0) + 1
+    asked = [0]
+    openers = [0]
+    window = 4 * most
+    opener_tasks = []
+    arrived = threading.Condition(lock)
+
+    def open_one(path):
+        try:
+            v = pybind11_open_zarrs([path])[0]
+        except BaseException as e:
+            v = _OpenFailed(e)
+        with lock:
+            opened[path] = v
+            arrived.notify_all()
+        return v
+
+    def opener():
+        # (opens the arrays of the next requests that no read or opener has come to, until `window`
+        # requests past the reads)
+        while True:
+            with lock:
+                end = min(taken[0] + window, len(requests))
+                while asked[0] < end and (requests[asked[0]][0] in opened or not left[requests[asked[0]][0]]):
+                    asked[0] += 1
+                if failed or asked[0] >= end:
+                    openers[0] -= 1
+                    return
+                path = requests[asked[0]][0]
+                asked[0] += 1
+                opened[path] = _OPENING
+            open_one(path)
+
+    def start_openers(n):
+        # (without the lock: a pool starting threads waits for each to start)
+        for _ in range(n):
+            opener_tasks.append(_opener().submit(opener))
+
+    def metadata(path):
+        with lock:
+            # (the openers end a window past the reads, and start again once the reads are half a
+            # window closer; a batch of one array needs none)
+            more = 0
+            if (openers[0] < _OPENERS and len(left) > 1 and not failed and asked[0] < len(requests)
+                    and asked[0] - taken[0] < window // 2):
+                more = _OPENERS - openers[0]
+                openers[0] = _OPENERS
+            v = opened.get(path)
+            if v is None:
+                opened[path] = _OPENING
+        if v is None:
+            # (its own array first, the openers after: their threads may still have to start)
+            v = open_one(path)
+            start_openers(more)
+        else:
+            start_openers(more)
+            if v is _OPENING:
+                with lock:
+                    v = opened[path]
+                    while v is _OPENING:
+                        arrived.wait()
+                        v = opened[path]
+        if isinstance(v, _OpenFailed):
+            raise v.error
+        return v
+
+    def finished(path):
+        with lock:
+            left[path] -= 1
+            if left[path] == 0:
+                opened.pop(path, None)
+    # (reads of one thread each from network storage, as many at once as their wait for the storage
+    # calls for: from the batches before's to begin with, then the batch's own, once as many reads as
+    # it has threads have ended; readers are added, or end after a read, to keep that many going)
+    adaptive = most > len(threads)
+    done = [0.0, 0.0, 0]
+    futures = []
+    # (and only once the batch has had data fetched from the storage: reads the page cache serves still
+    # wait, the NFS client asking the server about each file they open, and on a B200 node busy with other
+    # jobs warm batches of 512 single time points measured waits of half their CPU time, where more readers
+    # made them up to 1.27 times as slow; where the bytes fetched cannot be read, as before)
+    fetched_before = _process_read_bytes() if adaptive else None
+    cold = [fetched_before is None]
+    # (and where they have helped batches of this size, see _trials)
+    allowed = adaptive and (fetched_before is None or _extras_allowed(len(requests)))
+    first = len(threads)
+    if allowed and _wait_share[0] is not None:
+        first = min(_readers_wanted(total, most, 1.0, _wait_share[0]), len(requests))
+    running, peak = [first], [first]
+
+    def fetched():
+        # (whether the process has had bytes fetched from its storage since the batch began)
+        now = _process_read_bytes()
+        return now is None or now > fetched_before
 
     def reader(each):
-        # (each task takes the next request until none are left, or a read has failed)
+        # (each task takes the next request until none are left, a read has failed, or fewer readers are
+        # called for)
         while not failed:
             with lock:
-                i = next(following)
+                i = taken[0]
+                taken[0] += 1
             if i >= len(requests):
                 return
             file_name, start, end, out = requests[i]
             try:
-                results[i] = read_zarr(file_name, start, end, order=order, num_threads=each, out=out)
+                # (as read_zarr reads, from the array's metadata read once for the batch)
+                results[i] = pybind11_read_zarr_opened(metadata(file_name), list(start) if start is not None else [0, 0, 0],
+                                                       list(end) if end is not None else [0, 0, 0], order or '', each, out, adaptive)
             except BaseException:
                 failed.append(True)
                 raise
+            finished(file_name)
+            if adaptive:
+                cpu, waited = pybind11_last_read_times()
+                # (asked without the lock, until the batch has had data fetched)
+                now_cold = cold[0] or (allowed and done[2] + 1 >= total and fetched())
+                more = 0
+                with lock:
+                    if waited >= 0:
+                        done[0] += cpu
+                        done[1] += waited
+                    done[2] += 1
+                    cold[0] = cold[0] or now_cold
+                    if done[2] >= total and not failed:
+                        want = min(_readers_wanted(total, most, done[0], done[1]), running[0] + len(requests) - taken[0])
+                        if not cold[0] or not allowed:
+                            want = min(want, total)
+                        if want > running[0]:
+                            more = want - running[0]
+                            running[0] = want
+                            peak[0] = max(peak[0], want)
+                        elif want < running[0]:
+                            running[0] -= 1
+                            return
+                if more:
+                    # (started without the lock, which the other readers need meanwhile; the batch waits for
+                    # this reader, so it sees them)
+                    added = [_pool(1, most).submit(reader, 1) for _ in range(more)]
+                    with lock:
+                        futures.extend(added)
 
-    futures = [_pool(each).submit(reader, each) for each in threads]
-    # (a failed read's error is raised once the reads under way have ended)
-    wait(futures)
-    for f in futures:
-        f.result()
+    try:
+        # (the readers submitted without the lock: a pool starting threads waits for each to start,
+        # and the readers already started need the lock; a process's first batch of 64 single time points
+        # with 24 threads read its first region 10 ms late)
+        began = time.perf_counter()
+        started = [_pool(each, most).submit(reader, each) for each in (threads if first == len(threads) else [1] * first)]
+        with lock:
+            futures.extend(started)
+        # (a failed read's error is raised once the reads under way have ended; readers started on the
+        # way are waited for too)
+        while True:
+            with lock:
+                pending = [f for f in futures if not f.done()]
+            if not pending:
+                break
+            wait(pending)
+        took = time.perf_counter() - began
+        # (openers no read is left to need, after a failed one, are not started)
+        with lock:
+            for f in opener_tasks:
+                f.cancel()
+        for f in futures:
+            f.result()
+    finally:
+        # (reader, which starts readers, holds itself: without this the batch's objects would stay until a
+        # garbage collection)
+        reader = None
+    if adaptive:
+        now = _process_read_bytes() if fetched_before is not None else None
+        if done[0] > 0:
+            # (a batch the page cache served starts the next with one reader a thread)
+            _wait_share[0] = done[1] / done[0] if now is None or now > fetched_before else 0.0
+        if now is not None and now > fetched_before:
+            _extras_learn(len(requests), peak[0] > total, (now - fetched_before) / max(took, 1e-9))
+    # (for tests and benchmarks: the last batch's most readers at once, and its measured reads' CPU time
+    # and wait)
+    global _last_batch
+    _last_batch = (peak[0], done[0], done[1])
     return results
+
+
+_last_batch = (0, 0.0, 0.0)
 
 
 def _metadata_dtype(meta):

@@ -59,6 +59,10 @@ void* readZarrParallelHelper(const char* folderName,
 							 uint64_t endX, uint64_t endY, uint64_t endZ,
 							 uint8_t imageJIm);
 
+// Whether the array in folder is read from network storage (Linux, found once per folder as the
+// readers find it; false elsewhere)
+bool readsFromNetwork(const std::string &folder);
+
 // Frees the buffers the readers keep between calls (see releaseBuffers in parallelwritezarr.h)
 void releaseReadBuffers();
 // Frees the read-ahead's buffers for chunks over 1 MB that the readers keep between calls,

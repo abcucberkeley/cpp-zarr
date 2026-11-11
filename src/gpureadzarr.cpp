@@ -803,12 +803,14 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
     bool pushed = false;
     Ctx* cx = nullptr;
     const int threads = threadsIn > 0 ? threadsIn : std::max(1, callThreads());
-    // The files are read with at least CPPZARR_GPU_READS (32) threads, however few the call has:
+    // The files are read with at least CPPZARR_GPU_READS (128) threads, however few the call has:
     // reading mostly waits on the storage, and cold reads from network storage need many at once
-    // (batches of 4 hypercubes of 128 MiB from VAST, 5 cores: 1.3 times as fast at 32 as at 5)
+    // (batches of 4 hypercubes of 128 MiB from VAST, 5 cores: 1.3 times as fast at 32 as at 5;
+    // batches of 512 single time points, 16 cores of a B200 node: 1.33-1.40 times as fast at 128 as
+    // at 32, 1.23-1.36 at 64, and as fast from the page cache)
     static const int minReaders = [](){
         const char* e = std::getenv("CPPZARR_GPU_READS");
-        return e ? std::max(1, std::atoi(e)) : 32;
+        return e ? std::max(1, std::atoi(e)) : 128;
     }();
     const int readers = std::max(threads, minReaders);
     bool hung = false;
@@ -1084,9 +1086,31 @@ uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* 
             const double r0 = now();
             if(cf) readGds(a, cf, ctx, cx->copyStream, slot, runs, pieces, stored, readers);
             else{
+                // (a run of several pieces is opened once, by whichever of its pieces comes first, and
+                // closed after its last: on network storage an open waits on the server, and a single
+                // time point's 5 MB run read in 1 MiB pieces opened its shard five times. On Windows
+                // each piece opens its own, as reads at once through one handle may take turns)
+                std::vector<int64_t> piecesOf(runs.size(), 0);
+                for(const auto &p : pieces) piecesOf[p.run]++;
+            #ifndef _WIN32
+                std::vector<File> runFile(runs.size());
+                std::vector<std::once_flag> opening(runs.size());
+                std::vector<uint8_t> isOpen(runs.size(), 0);
+                std::vector<std::atomic<int64_t>> left(runs.size());
+                for(size_t k = 0; k < runs.size(); k++) left[k].store(piecesOf[k], std::memory_order_relaxed);
+            #endif
                 err = pool().run((int64_t)pieces.size(), readers, [&](int64_t i){
                     const Piece &p = pieces[i];
                     const Run &r = runs[p.run];
+                #ifndef _WIN32
+                    if(piecesOf[p.run] > 1){
+                        std::call_once(opening[p.run], [&](){ isOpen[p.run] = runFile[p.run].open(*r.path); });
+                        const bool ok = isOpen[p.run] && runFile[p.run].readAt(r.off+p.off, slot.host+r.at+p.off, p.bytes);
+                        if(left[p.run].fetch_sub(1, std::memory_order_acq_rel) == 1) runFile[p.run].close();
+                        if(!ok) throw Fail("The file "+*r.path+" could not be read");
+                        return;
+                    }
+                #endif
                     File f;
                     if(!f.open(*r.path) || !f.readAt(r.off+p.off, slot.host+r.at+p.off, p.bytes))
                         throw Fail("The file "+*r.path+" could not be read");

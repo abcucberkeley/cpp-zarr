@@ -5,7 +5,14 @@
 #include <exception>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
+#ifdef __linux__
+#include <cstdio>
+#include <ctime>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "zarr.h"
 #include "parallelreadzarr.h"
 #include "parallelwritezarr.h"
@@ -128,21 +135,52 @@ static std::vector<uint64_t> fitCoords(const std::vector<uint64_t> &coords, cons
                              " values but the array has " + std::to_string(nDims) + " dimensions");
 }
 
-pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
-                                   std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &order = "",
-                                   const int64_t numThreads = 0, const pybind11::object &out = pybind11::none()){
-    // order is the memory layout of the returned array: "F" (first axis
-    // contiguous), "C" (last axis contiguous), or "" for the file's storage order
-    // (or out's). The GIL is released while the array is opened and read, so other
-    // Python threads run, and read other arrays, meanwhile.
-    if (!order.empty() && order != "F" && order != "C") throw std::runtime_error("order must be 'F' or 'C', not '" + order + "'");
-    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
-    const CallThreads threads(numThreads);
-    zarr Zarr;
-    {
-        pybind11::gil_scoped_release release;
-        Zarr = openZarr(fileName);
+// The calling thread's clocks (seconds): wall, CPU, and time waiting for a CPU (Linux:
+// /proc/thread-self/schedstat; ok false without it)
+struct ThreadClocks {
+    double wall = 0, cpu = 0, queued = 0;
+    bool ok = false;
+};
+static ThreadClocks threadClocks() {
+    ThreadClocks t;
+#ifdef __linux__
+    timespec w, c;
+    if (clock_gettime(CLOCK_MONOTONIC, &w) != 0 || clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c) != 0) return t;
+    t.wall = (double)w.tv_sec + w.tv_nsec * 1e-9;
+    t.cpu = (double)c.tv_sec + c.tv_nsec * 1e-9;
+    const int fd = open("/proc/thread-self/schedstat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return t;
+    char buf[128];
+    const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    unsigned long long run = 0, waited = 0;
+    if (n > 0) {
+        buf[n] = 0;
+        if (sscanf(buf, "%llu %llu", &run, &waited) == 2) {
+            t.queued = waited * 1e-9;
+            t.ok = true;
+        }
     }
+#endif
+    return t;
+}
+
+// The calling thread's last measured read (pybind11_read_zarr_opened with measure): its CPU time and
+// its time waiting for the storage (neither on a CPU nor waiting for one), or -1 for that unknown.
+// (Only the read: not the wait for the GIL, nor for the array's metadata.)
+static thread_local double lastReadCpu = 0, lastReadWait = -1;
+
+// A region of an opened array (whose chunk information the read sets) read into a new NumPy array,
+// or into out (see pybind11_read_zarr); measure: time the read (see lastReadWait)
+static pybind11::array readOpened(zarr &Zarr, const std::vector<uint64_t> &startCoords, const std::vector<uint64_t> &endCoords,
+                                  const std::string &order, const pybind11::object &out, const bool measure = false) {
+    ThreadClocks t0;
+    auto measured = [&](){
+        if (!measure) return;
+        const ThreadClocks t1 = threadClocks();
+        lastReadCpu = t1.cpu - t0.cpu;
+        lastReadWait = t0.ok && t1.ok ? std::max(0.0, (t1.wall - t0.wall) - (t1.cpu - t0.cpu) - (t1.queued - t0.queued)) : -1;
+    };
     bool cOrder = order.empty() ? Zarr.get_order() == "C" : order == "C";
     // (before reading: bfloat16 needs ml_dtypes)
     const pybind11::dtype dt = numpyDtype(dtypeInfo(Zarr.get_dtype()), Zarr.get_dtype());
@@ -199,8 +237,10 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
         uint8_t err = 0;
         {
             pybind11::gil_scoped_release release;
+            if (measure) t0 = threadClocks();
             if (!crop) Zarr.set_chunkInfo(start, end);
             err = parallelReadZarr(Zarr, ptr, start, end, dims, Zarr.dtypeBytes()*8, true, false, cOrder, fillElem);
+            measured();
         }
         if (err) throw std::runtime_error(Zarr.get_errString());
         return a;
@@ -209,10 +249,54 @@ pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vecto
     void* data = nullptr;
     {
         pybind11::gil_scoped_release release;
+        if (measure) t0 = threadClocks();
         data = parallelReadZarrWriteWrapper(Zarr, crop, start, end, cOrder);
+        measured();
     }
     if (!data) throw std::runtime_error("Failed to read the zarr file (unsupported dtype or read error)");
     return createArray(data, dims, cOrder, dt);
+}
+
+pybind11::array pybind11_read_zarr(const std::string &fileName, const std::vector<uint64_t> &startCoords = std::vector<uint64_t>{0, 0, 0},
+                                   const std::vector<uint64_t> &endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &order = "",
+                                   const int64_t numThreads = 0, const pybind11::object &out = pybind11::none()){
+    // order is the memory layout of the returned array: "F" (first axis
+    // contiguous), "C" (last axis contiguous), or "" for the file's storage order
+    // (or out's). The GIL is released while the array is opened and read, so other
+    // Python threads run, and read other arrays, meanwhile.
+    if (!order.empty() && order != "F" && order != "C") throw std::runtime_error("order must be 'F' or 'C', not '" + order + "'");
+    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
+    const CallThreads threads(numThreads);
+    zarr Zarr;
+    {
+        pybind11::gil_scoped_release release;
+        Zarr = openZarr(fileName);
+    }
+    return readOpened(Zarr, startCoords, endCoords, order, out);
+}
+
+// An array's metadata, read once for all of a batch's reads of it (read_zarr_batch): on network
+// storage each read of an array's metadata waits on the server (about 1 ms from VAST), and a
+// batch often reads many regions of one array
+struct OpenedZarr {
+    zarr z;
+};
+
+// As pybind11_read_zarr, from an array opened before (pybind11_open_zarrs): each read has its own
+// copy of the metadata, so that reads of one array run at once. measure: the read's CPU time and
+// wait for the storage are kept for pybind11_last_read_times
+pybind11::array pybind11_read_zarr_opened(const OpenedZarr &opened, const std::vector<uint64_t> &startCoords,
+                                          const std::vector<uint64_t> &endCoords, const std::string &order,
+                                          const int64_t numThreads, const pybind11::object &out, const bool measure) {
+    if (!order.empty() && order != "F" && order != "C") throw std::runtime_error("order must be 'F' or 'C', not '" + order + "'");
+    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
+    const CallThreads threads(numThreads);
+    zarr Zarr;
+    {
+        pybind11::gil_scoped_release release;
+        Zarr = opened.z;
+    }
+    return readOpened(Zarr, startCoords, endCoords, order, out, measure);
 }
 
 // A new write's array settings: format first (it sets the Zarr v3 defaults for order and
@@ -395,15 +479,25 @@ void pybind11_convert_to_v3(const std::string &fileName){
 // Reading into GPU memory: requests of (file, start, end, the output's device pointer, its data
 // type (a typestr, or "bfloat16") and shape), all of one order ("C" or "F"), read in one GPU batch.
 // stream: a CUDA stream handle (0 for the default stream). The GIL is released throughout.
-// Arrays opened at once (on network file systems each open waits on the server); call without
-// the GIL
-static std::vector<zarr> openZarrs(const std::vector<std::string> &fileNames) {
-    const size_t n = fileNames.size(), nt = std::min<size_t>(n, 16);
+// Arrays opened at once (on network file systems each open waits on the server), each once
+// however often the names give it: which[i] is the place of fileNames[i]'s array in the result
+// (a batch of 16,384 single time points read from 1,430 arrays opened each 11 times); call
+// without the GIL. An array that cannot be opened fails the call, the first one by name's
+static std::vector<zarr> openZarrs(const std::vector<std::string> &fileNames, std::vector<size_t> &which) {
+    std::vector<const std::string*> distinct;
+    std::unordered_map<std::string, size_t> at;
+    which.resize(fileNames.size());
+    for (size_t i = 0; i < fileNames.size(); i++) {
+        const auto e = at.emplace(fileNames[i], distinct.size());
+        if (e.second) distinct.push_back(&fileNames[i]);
+        which[i] = e.first->second;
+    }
+    const size_t n = distinct.size(), nt = std::min<size_t>(n, 16);
     std::vector<zarr> arrays(n);
     std::vector<std::exception_ptr> failed(n);
     auto open = [&](const size_t first) {
         for (size_t i = first; i < n; i += nt) {
-            try { arrays[i] = openZarr(fileNames[i]); }
+            try { arrays[i] = openZarr(*distinct[i]); }
             catch (...) { failed[i] = std::current_exception(); }
         }
     };
@@ -438,9 +532,10 @@ std::vector<std::tuple<std::vector<uint64_t>, std::string, std::string>> pybind1
     pybind11::gil_scoped_release release;
     std::vector<std::string> names;
     for (const auto &q : requests) names.push_back(std::get<0>(q));
-    std::vector<zarr> arrays = openZarrs(names);
+    std::vector<size_t> which;
+    std::vector<zarr> arrays = openZarrs(names, which);
     for (size_t i = 0; i < requests.size(); i++) {
-        zarr &Z = arrays[i];
+        zarr &Z = arrays[which[i]];
         std::vector<uint64_t> start, end, shape;
         regionOf(Z, std::get<1>(requests[i]), std::get<2>(requests[i]), start, end);
         for (size_t d = 0; d < start.size(); d++) shape.push_back(end[d] - start[d]);
@@ -470,11 +565,13 @@ void pybind11_read_zarr_gpu(const std::vector<std::tuple<std::string, std::vecto
         pybind11::gil_scoped_release release;
         std::vector<std::string> names;
         for (const auto &q : requests) names.push_back(std::get<0>(q));
-        std::vector<zarr> arrays = openZarrs(names);
+        // (the regions of one array share its metadata: the GPU reads only look at it)
+        std::vector<size_t> which;
+        std::vector<zarr> arrays = openZarrs(names, which);
         std::vector<GpuRegion> regions;
         for (size_t i = 0; i < requests.size(); i++) {
             const auto &q = requests[i];
-            zarr &Z = arrays[i];
+            zarr &Z = arrays[which[i]];
             const uint64_t nDims = Z.get_ndims();
             std::vector<uint64_t> start, end;
             regionOf(Z, std::get<1>(q), std::get<2>(q), start, end);
@@ -505,6 +602,36 @@ PYBIND11_MODULE(cppzarr, m) {
 	m.def("pybind11_read_zarr", &pybind11_read_zarr, pybind11::arg("fileName"), pybind11::arg("startCoords"),
 	      pybind11::arg("endCoords"), pybind11::arg("order"), pybind11::arg("numThreads") = 0,
 	      pybind11::arg("out") = pybind11::none(), "Read a zarr file");
+
+	pybind11::class_<OpenedZarr>(m, "_OpenedZarr", "An array's metadata, read once for all of a batch's reads of it");
+
+	m.def("pybind11_open_zarrs", [](const std::vector<std::string> &fileNames) {
+	          std::vector<OpenedZarr> opened;
+	          {
+	              pybind11::gil_scoped_release release;
+	              std::vector<size_t> which;
+	              std::vector<zarr> arrays = openZarrs(fileNames, which);
+	              opened.reserve(fileNames.size());
+	              for (size_t i = 0; i < fileNames.size(); i++) opened.push_back({arrays[which[i]]});
+	          }
+	          return opened;
+	      }, pybind11::arg("fileNames"), "Open arrays' metadata at once, each array once (for read_zarr_batch)");
+
+	m.def("pybind11_on_network", [](const std::string &folder) {
+	          pybind11::gil_scoped_release release;
+	          return readsFromNetwork(folder);
+	      }, pybind11::arg("folder"), "Whether an array's folder is on network storage, as the reads find it (Linux; false elsewhere)");
+
+	m.def("pybind11_read_zarr_opened", &pybind11_read_zarr_opened, pybind11::arg("opened"), pybind11::arg("startCoords"),
+	      pybind11::arg("endCoords"), pybind11::arg("order"), pybind11::arg("numThreads") = 0,
+	      pybind11::arg("out") = pybind11::none(), pybind11::arg("measure") = false,
+	      "Read a region of an array opened with pybind11_open_zarrs");
+
+	m.def("pybind11_last_read_times", []() { return std::make_pair(lastReadCpu, lastReadWait); },
+	      "The calling thread's last measured read: its CPU time and its wait for the storage in seconds (-1: unknown)");
+
+	m.def("pybind11_read_times_available", []() { return threadClocks().ok; },
+	      "Whether reads can be measured here (their wait for the storage)");
 
 	m.def("pybind11_write_zarr", &pybind11_write_zarr, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("startCoords"),
 	      pybind11::arg("endCoords"), pybind11::arg("cname"), pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"),
