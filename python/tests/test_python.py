@@ -698,12 +698,16 @@ def main():
                     and fx['dtype'] != 'bfloat16' and len(fx['shape']) > 0]
         for fx in bigs:
             pbig = os.path.join(v3dir, fx['name'] + '.zarr')
+            # (the values its writer stored, from its .bin file: zarr-python reads Zarr v2's ">" arrays in
+            # big-endian order, cpp-zarr in native order)
+            exp = np.fromfile(os.path.join(v3dir, fx['name'] + '.bin'), dtype=np.dtype(fx['dtype'])).reshape(fx['shape'])
             ref = cppzarr.read_zarr(pbig)
             base = np.empty((2 * ref.shape[0],) + ref.shape[1:], ref.dtype)
             sent = np.asarray(sentinel).astype(ref.dtype)
             base[...] = sent
-            got = cppzarr.read_zarr(pbig, out=base[::2], num_threads=4)
-            if not (np.array_equal(base[::2], ref, equal_nan=ref.dtype.kind in 'fc') and same(zarr_read(pbig), ref)
+            view = base[::2]
+            got = cppzarr.read_zarr(pbig, out=view, num_threads=4)
+            if not (got is view and np.array_equal(view, ref, equal_nan=ref.dtype.kind in 'fc') and same(ref, exp)
                     and np.all(base[1::2] == sent)):
                 bad.append(f"big-endian {fx['name']}")
                 good = False
