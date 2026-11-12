@@ -74,6 +74,17 @@ jobs:
           cmake --build build --parallel 4
           cmake --install build --prefix install
 
+      # The installed library names no folder of this machine, and on Windows a source named with \
+      # (as the release build names them) is remapped too (see the script)
+      - name: No build paths in the library
+        run: |
+          case "$RUNNER_OS" in
+            Windows) LIB=install/bin/libcppZarr.dll ;;
+            macOS)   LIB=install/lib/libcppZarr.dylib ;;
+            *)       LIB=install/lib/libcppZarr.so ;;
+          esac
+          bash .github/scripts/check_build_paths.sh "$PWD" "$LIB" "$PWD/build"
+
       - name: C++ tests
         run: ctest --test-dir build --output-on-failure
 
