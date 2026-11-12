@@ -68,6 +68,10 @@ cppzarr.write_zarr('outputFilename.zarr', im)
 
 # Write a Zarr v3 file instead
 cppzarr.write_zarr('outputFilename.zarr', im, zarr_format=3)
+
+# On Linux and macOS a path that starts with ~ or ~name is in that home folder (as a shell expands it);
+# nothing else in a path is expanded: spaces, parentheses, $ and a ~ further on are kept as they are
+im = cppzarr.read_zarr('~/data/run (2).zarr')
 ````
 
 #### Read a region of a Zarr file

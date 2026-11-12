@@ -34,6 +34,10 @@
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #endif
+#ifndef _WIN32
+#include <pwd.h>
+#include <unistd.h>
+#endif
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "parallelreadzarr.h"
@@ -1977,6 +1981,97 @@ int main(int argc, char** argv){
             ok = ok && !convertValues(oh, "<f2", ou, "<u2", 3) && !convertValues(oh, "bfloat16", ou, "<u2", 3) && !convertValues(d, "<c8", ou, "<u2", 1);
             return ok;
         });
+
+#ifndef _WIN32
+        check("a leading ~ or ~name expanded to that home folder and any other path kept as it is (expandTilde: a ~ "
+              "elsewhere, spaces, parentheses, $ and backquotes left alone, nothing run), and arrays written and read "
+              "in folders of such names and under ~", [&](){
+            bool ok = true;
+            // (HOME set back as it was, however the check ends)
+            const char* h0 = getenv("HOME");
+            struct HomeBack { bool had; std::string value; ~HomeBack(){ if (had) setenv("HOME", value.c_str(), 1); else unsetenv("HOME"); } }
+                homeBack{h0 != nullptr, h0 ? h0 : ""};
+            auto expect = [&](const std::string &in, const std::string &want){
+                const std::string got = expandTilde(in);
+                if (got != want){
+                    std::fprintf(stderr, "    expandTilde(\"%s\") gave \"%s\", not \"%s\"\n", in.c_str(), got.c_str(), want.c_str());
+                    ok = false;
+                }
+            };
+            // (a user's home folder from the user database, the current user's for nullptr, without trailing slashes)
+            auto userHome = [](const char* name, std::string &home, std::string &user){
+                std::vector<char> buf(1 << 16);
+                struct passwd pw, *found = nullptr;
+                const int err = name ? getpwnam_r(name, &pw, buf.data(), buf.size(), &found)
+                                     : getpwuid_r(getuid(), &pw, buf.data(), buf.size(), &found);
+                if (err || !found || !found->pw_dir) return false;
+                home = found->pw_dir;
+                user = found->pw_name ? found->pw_name : "";
+                while (!home.empty() && home.back() == '/') home.pop_back();
+                return true;
+            };
+            const std::string t = dir + "/rt_tilde", ran = t + "/ran";
+            std::error_code ec;
+            std::filesystem::remove_all(t, ec);
+            std::filesystem::create_directories(t + "/home", ec);
+            setenv("HOME", "/h/one", 1);
+            expect("~", "/h/one");
+            expect("~/", "/h/one/");
+            expect("~/a b (c)/x~y $HOME `id`.zarr", "/h/one/a b (c)/x~y $HOME `id`.zarr");
+            const std::vector<std::string> kept = {"/data/run~2 (copy)/a.zarr", "til~de (x)/a.zarr", "a/~/b", "x~y", "", "$HOME/~",
+                "~nosuchuser_cppzarr_rt/x", "~ /x", "a~b/$(touch " + ran + ")", "a~b/`touch " + ran + "`", "~$(touch " + ran + ")"};
+            for (const std::string &p : kept) expect(p, p);
+            setenv("HOME", "/h/two//", 1);
+            expect("~/x", "/h/two/x");
+            expect("~", "/h/two");
+            setenv("HOME", "/", 1);
+            expect("~", "/");
+            expect("~/x", "/x");
+            // (~name is that user's home folder whatever HOME is; without HOME, ~ is the current user's)
+            std::string h, u;
+            if (userHome("root", h, u)){
+                expect("~root", h.empty() ? std::string("/") : h);
+                expect("~root/x y", h + "/x y");
+            }
+            unsetenv("HOME");
+            if (userHome(nullptr, h, u)){
+                expect("~/x", h + "/x");
+                if (!u.empty()) expect("~" + u + "/x", h + "/x");
+            }
+            else expect("~/x", "~/x");
+            // arrays in folders whose names hold a ~ (not first), spaces, parentheses, $ and backquotes, and under ~
+            // (a write into "run~2 copy" went to "run~2" before)
+            setenv("HOME", (t + "/home").c_str(), 1);
+            const V shp = {6, 5, 4};
+            std::vector<uint16_t> data(6*5*4);
+            for (size_t i = 0; i < data.size(); i++) data[i] = (uint16_t)(i*37 + 11);
+            const std::vector<std::pair<std::string, std::string>> places = {
+                {t + "/til~de (x)/a.zarr", t + "/til~de (x)/a.zarr"}, {t + "/run~2 copy/a.zarr", t + "/run~2 copy/a.zarr"},
+                {t + "/a~b $HOME `id`/a.zarr", t + "/a~b $HOME `id`/a.zarr"}, {t + "/~c/a.zarr", t + "/~c/a.zarr"},
+                {"~/b.zarr", t + "/home/b.zarr"}, {"~/d (1)/e~f g.zarr", t + "/home/d (1)/e~f g.zarr"}};
+            for (const auto &pl : places){
+                std::filesystem::create_directories(std::filesystem::path(pl.second).parent_path(), ec);
+                zarr W;
+                W.set_fileName(pl.first);
+                W.set_zarr_format(3); W.set_dtype("<u2"); W.set_chunks({4, 4, 4}); W.set_shape(shp);
+                W.write_zarray();
+                W.set_chunkInfo({0, 0, 0}, shp);
+                bool good = parallelWriteZarr(W, data.data(), {0, 0, 0}, shp, shp, 16, true, false) == 0;
+                if (good){
+                    std::vector<uint16_t> back(data.size(), 0);
+                    zarr R(pl.first);
+                    R.set_chunkInfo({0, 0, 0}, shp);
+                    good = parallelReadZarr(R, back.data(), {0, 0, 0}, shp, shp, 16) == 0 && back == data;
+                }
+                good = good && std::filesystem::exists(pl.second + "/zarr.json");
+                if (!good) std::fprintf(stderr, "    the array at %s (%s) was not written and read there\n", pl.first.c_str(), pl.second.c_str());
+                ok = ok && good;
+            }
+            ok = ok && !std::filesystem::exists(t + "/run~2") && !std::filesystem::exists(ran);
+            std::filesystem::remove_all(t, ec);
+            return ok;
+        });
+#endif
     }
 
     // How the reader hands out and decodes chunks, and how the writer adds inner chunks

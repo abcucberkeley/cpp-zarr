@@ -102,7 +102,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     std::string folderName(mxArrayToString(prhs[0]));
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
-    folderName = expandTilde(folderName.c_str());
+    folderName = expandTilde(folderName);
     #endif
     
     // Check if metadata exists that we can use or if we have to create new metadata

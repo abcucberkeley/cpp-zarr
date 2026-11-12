@@ -23,15 +23,38 @@
 #include "zarr.h"
 
 #ifndef _WIN32
-#include <wordexp.h>
-// Expand the tilde to the home directory on Mac and Linux
-const char* expandTilde(const char* path) {
-    if(strchr(path,'~')){
-        wordexp_t expPath;
-        wordexp(path, &expPath, 0);
-        return expPath.we_wordv[0];
+#include <pwd.h>
+#include <unistd.h>
+// Expands a leading ~ to a home folder on Mac and Linux, as a shell and Python's os.path.expanduser
+// do: ~ and ~/... to $HOME (when HOME is not set, the user's home folder from the user database),
+// ~name and ~name/... to that user's home folder. The rest of the path is kept as it is, and a path
+// that does not start with ~, or names a user who does not exist, is returned unchanged. (wordexp,
+// used before, expanded the whole path as a shell word whenever it held a ~ anywhere: it cut the
+// path at spaces, failed on characters such as parentheses, and substituted variables and commands.)
+std::string expandTilde(const std::string &path){
+    if(path.empty() || path[0] != '~') return path;
+    const size_t end = std::min(path.find('/'), path.size());
+    std::string home;
+    const char* env = end == 1 ? getenv("HOME") : nullptr;
+    if(env) home = env;
+    else{
+        const long hint = sysconf(_SC_GETPW_R_SIZE_MAX);
+        std::vector<char> buf(hint > 0 ? (size_t)hint : 16384);
+        struct passwd pw;
+        struct passwd* found = nullptr;
+        int err;
+        while(true){
+            err = end == 1 ? getpwuid_r(getuid(), &pw, buf.data(), buf.size(), &found)
+                           : getpwnam_r(path.substr(1, end - 1).c_str(), &pw, buf.data(), buf.size(), &found);
+            if(err != ERANGE || buf.size() >= (size_t(1) << 20)) break;
+            buf.resize(buf.size() * 2);
+        }
+        if(err || !found || !found->pw_dir) return path;
+        home = found->pw_dir;
     }
-    else return path;
+    while(!home.empty() && home.back() == '/') home.pop_back();
+    const std::string out = home + path.substr(end);
+    return out.empty() ? std::string("/") : out;
 }
 #endif
     

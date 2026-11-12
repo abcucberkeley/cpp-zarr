@@ -554,6 +554,39 @@ function test_matlab(mexDir)
     assert(strcmp(caught, 'zarr:inputError'), 'a bbox of characters was accepted (%s)', caught);
     fprintf('PASS  options of any class\n');
 
+    % paths: a ~ that is not first, spaces, parentheses, $ and backquotes in folder names kept as they are, and
+    % (Linux and macOS) a leading ~ expanded to the home folder: arrays written, read, written into, converted to
+    % Zarr v3 and created there (a write into "run~2 copy" went to "run~2" before)
+    tv = uint16(reshape(0:119, 6, 5, 4));
+    td = fullfile(tmp, 'tilde');
+    places = {fullfile(td, 'til~de (x)', 'a.zarr'), fullfile(td, 'run~2 copy', 'a.zarr'), ...
+              fullfile(td, 'a~b $HOME `id`', 'a.zarr'), fullfile(td, '~c', 'a.zarr')};
+    reals = places;
+    if ~ispc
+        oldHome = getenv('HOME');
+        homeBack = onCleanup(@() setenv('HOME', oldHome));
+        setenv('HOME', fullfile(td, 'home'));
+        places(end+1:end+2) = {'~/b.zarr', '~/d (1)/e~f g.zarr'};
+        reals(end+1:end+2) = {fullfile(td, 'home', 'b.zarr'), fullfile(td, 'home', 'd (1)', 'e~f g.zarr')};
+    end
+    for k = 1:numel(places)
+        [~, ~] = mkdir(fileparts(reals{k}));
+        parallelWriteZarr(places{k}, tv, 'chunks', [4 4 4]);
+        assert(isfile(fullfile(reals{k}, '.zarray')) && isequal(parallelReadZarr(places{k}), tv), ...
+            'the array at %s was not written and read at %s', places{k}, reals{k});
+        tv2 = tv;
+        tv2(1:2, :, :) = tv2(1:2, :, :) + 1;
+        parallelWriteZarr(places{k}, tv2(1:2, :, :), 'bbox', [1 1 1 2 5 4]);
+        convertZarrToV3(places{k});
+        assert(isfile(fullfile(reals{k}, 'zarr.json')) && isequal(parallelReadZarr(places{k}), tv2), ...
+            'the array at %s differs after a region write and its conversion to Zarr v3', places{k});
+        createZarrFile([places{k} '_c'], 'shape', [6 5 4], 'dtype', 'uint16', 'chunks', [4 4 4]);
+        assert(isfile(fullfile([reals{k} '_c'], '.zarray')), 'createZarrFile wrote no array at %s', [reals{k} '_c']);
+    end
+    assert(~isfolder(fullfile(td, 'run~2')), 'a write into run~2 copy went to run~2');
+    clear homeBack
+    fprintf('PASS  paths with a ~, spaces and parentheses, and under ~\n');
+
     % clear mex frees the buffers reads and writes keep between calls (writes keep those of
     % chunks over 1 MB; on Linux the library itself stays loaded): reads and writes after it
     % give the same data

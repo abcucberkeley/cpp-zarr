@@ -714,6 +714,51 @@ def main():
     print(f"reading into views of any layout  {'OK' if good else 'FAIL'}" + ('' if good else f" ({'; '.join(bad)})"))
     ok = ok and good
 
+    # Paths: a ~ that is not first, spaces, parentheses, $ and backquotes in folder names kept as they are, and (Linux
+    # and macOS) a leading ~ expanded to the home folder: arrays written, read (alone and in a batch), written into,
+    # converted to Zarr v3 and created there (a write into "run~2 copy" went to "run~2" before)
+    good, bad = True, []
+    d6 = rng.integers(0, 4000, size=(6, 5, 4)).astype(np.uint16)
+    td = os.path.join(tmp, 'tilde')
+    places = [(n, n) for n in (os.path.join(td, 'til~de (x)', 'a.zarr'), os.path.join(td, 'run~2 copy', 'a.zarr'),
+                                os.path.join(td, 'a~b $HOME `id`', 'a.zarr'), os.path.join(td, '~c', 'a.zarr'))]
+    old_home = os.environ.get('HOME')
+    if os.name != 'nt':
+        os.environ['HOME'] = os.path.join(td, 'home')
+        places += [('~/b.zarr', os.path.join(td, 'home', 'b.zarr')),
+                   ('~/d (1)/e~f g.zarr', os.path.join(td, 'home', 'd (1)', 'e~f g.zarr'))]
+    try:
+        for given, real in places:
+            try:
+                os.makedirs(os.path.dirname(real), exist_ok=True)
+                cppzarr.write_zarr(given, d6, chunks=[4, 4, 4])
+                good_p = os.path.isfile(os.path.join(real, '.zarray')) and np.array_equal(cppzarr.read_zarr(given), d6) and \
+                    np.array_equal(cppzarr.read_zarr_batch([(given, [0, 0, 0], [6, 5, 4])])[0], d6)
+                e6 = d6.copy()
+                e6[:2] += 1
+                cppzarr.write_zarr(given, e6[:2], start_coords=[0, 0, 0], end_coords=[2, 5, 4])
+                cppzarr.convert_to_v3(given)
+                good_p = good_p and os.path.isfile(os.path.join(real, 'zarr.json')) and np.array_equal(cppzarr.read_zarr(given), e6)
+                cppzarr.create_zarr(given + '_c', d6.shape, np.uint16, chunks=[4, 4, 4])
+                good_p = good_p and os.path.isfile(os.path.join(real + '_c', '.zarray'))
+            except Exception as e:
+                good_p = False
+                print(f"  {given}: {e}")
+            if not good_p:
+                bad.append(given)
+            good = good and good_p
+        if os.path.exists(os.path.join(td, 'run~2')):
+            bad.append('run~2 written')
+            good = False
+    finally:
+        if os.name != 'nt':
+            if old_home is None:
+                os.environ.pop('HOME', None)
+            else:
+                os.environ['HOME'] = old_home
+    print(f"paths with a ~, spaces and parentheses, and under ~  {'OK' if good else 'FAIL'}" + ('' if good else f" ({'; '.join(bad)})"))
+    ok = ok and good
+
     # Batches of reads: the same values as reading each region on its own, in the
     # requests' order, into new arrays or into given ones (one batch buffer), from
     # several arrays; and other Python threads run while cpp-zarr reads (the GIL is

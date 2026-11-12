@@ -56,6 +56,7 @@ def read_zarr(file_name, start_coords=None, end_coords=None, order=None, num_thr
     # or a CUDA stream handle; by default the default stream), done when this returns.
     # gpu=True reads into a new CuPy array on the current CUDA device instead of a NumPy array
     # (needs CuPy; CuPy has no bfloat16: read bfloat16 arrays into a PyTorch tensor with out=).
+    file_name = _path(file_name)
     if order not in (None, 'F', 'C'):
         raise Exception(f"order must be 'F', 'C' or None, not {order!r}")
     if gpu and out is None:
@@ -577,6 +578,7 @@ def read_zarr_batch(requests, order=None, num_threads=None, stream=None, gpu=Fal
     requests = [tuple(r) + (None,) * (4 - len(r)) for r in requests]
     if any(len(r) != 4 for r in requests):
         raise Exception('Each request is (file_name, start_coords, end_coords) or (file_name, start_coords, end_coords, out)')
+    requests = [(_path(r[0]),) + r[1:] for r in requests]
     if not requests:
         return []
     if gpu:
@@ -839,6 +841,13 @@ def _metadata_dtype(meta):
     return dt.newbyteorder('=') if dt.kind in 'buifc' else None
 
 
+def _path(file_name):
+    # file_name as the library takes it, for the checks here that look at the array's files before the library is
+    # called: on Linux and macOS a leading ~ or ~name expanded to that home folder (as the library expands it, and
+    # os.path.expanduser), any other path unchanged
+    return file_name if os.name == 'nt' else os.path.expanduser(file_name)
+
+
 def _existing_format(file_name):
     # The Zarr format of the array at file_name (2 or 3), or None if there is none
     if os.path.isfile(os.path.join(file_name, '.zarray')):
@@ -905,6 +914,7 @@ def create_zarr(file_name, shape, dtype, chunks=None, cname='zstd', clevel=1, or
     # regions written into it later (write_zarr with start_coords and end_coords) fill it, and what is never written
     # reads as zeros. The options, and their defaults, are write_zarr's. Chunk files already at file_name are left
     # as they are.
+    file_name = _path(file_name)
     if zarr_format not in (None, 2, 3):
         raise Exception(f'zarr_format must be 2 or 3, not {zarr_format!r}')
     zarr_format = zarr_format or _existing_format(file_name) or 2
@@ -962,6 +972,7 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
     # reader never sees a partly written file (False writes them in place: for a new array with one writer per
     # chunk). sparse: chunks whose values are all zero are left out (and an existing file of one deleted), as
     # missing chunks read as zeros; False writes them too.
+    file_name = _path(file_name)
     gpu = _cuda_data(data) is not None
     if gpu:
         _find_nvcomp()
@@ -1060,6 +1071,7 @@ def convert_to_v3(file_name):
     # Turn the Zarr v2 array at file_name into a Zarr v3 array in place: a zarr.json
     # replaces its .zarray (and takes in its .zattrs attributes), and its chunk files
     # are kept as they are, so no data is rewritten
+    file_name = _path(file_name)
     if _existing_format(file_name) != 2:
         raise Exception(f'{file_name} is not a Zarr v2 array (no .zarray metadata file was found)')
     pybind11_convert_to_v3(file_name)

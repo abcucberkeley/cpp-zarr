@@ -5,7 +5,8 @@
 #include <vector>
 
 #ifndef _WIN32
-const char* expandTilde(const char* path);
+// The path with a leading ~ or ~name expanded to that home folder; any other path unchanged
+std::string expandTilde(const std::string &path);
 #endif
     
 #ifdef _WIN32

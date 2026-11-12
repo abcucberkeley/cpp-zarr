@@ -21,7 +21,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     std::string folderName(mxArrayToString(prhs[0]));
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
-    folderName = expandTilde(folderName.c_str());
+    folderName = expandTilde(folderName);
     #endif
     if(!fileExists(folderName+"/.zarray")){
         mexErrMsgIdAndTxt("zarr:zarrayError","%s is not a Zarr v2 array (no .zarray metadata file was found)\n",folderName.c_str());

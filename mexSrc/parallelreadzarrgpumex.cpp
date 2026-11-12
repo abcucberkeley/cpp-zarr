@@ -57,7 +57,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
-    folderName = expandTilde(folderName.c_str());
+    folderName = expandTilde(folderName);
     #endif
     zarr Zarr;
     try{

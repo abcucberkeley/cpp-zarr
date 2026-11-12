@@ -377,11 +377,15 @@ clevel(5), cname("lz4"), id("blosc"), shuffle(1), dtype("<u2"),
 fill_value("0"), filters({}), order("F"), shape({0,0,0}),
 zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
 {
+    // Handle the tilde character in filenames on Linux/Mac (as set_fileName and the other constructor do)
+    #ifndef _WIN32
+    this->fileName = expandTilde(this->fileName);
+    #endif
     // A v2 array (.zarray) is read as before; without one, a Zarr v3 array (zarr.json)
-    if(!fileExists(fileName+"/.zarray")){
-        if(fileExists(fileName+"/zarr.json")){
+    if(!fileExists(this->fileName+"/.zarray")){
+        if(fileExists(this->fileName+"/zarr.json")){
             try{
-                std::ifstream f(fileName+"/zarr.json");
+                std::ifstream f(this->fileName+"/zarr.json");
                 zarray = json::parse(f);
             }
             catch(...){
@@ -390,11 +394,11 @@ zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
             parseZarrJson();
             return;
         }
-        throw std::string("metadataFileMissing:"+fileName);
+        throw std::string("metadataFileMissing:"+this->fileName);
         //mexErrMsgIdAndTxt("zarr:zarrayError","Metadata file in \"%s\" is missing. Does the file exist?",fileName.c_str());
     }
     try{
-        std::ifstream f(fileName+"/.zarray");
+        std::ifstream f(this->fileName+"/.zarray");
         zarray = json::parse(f);
     }
     catch(...){
@@ -499,7 +503,7 @@ zarr_format(zarr_format), subfolders(subfolders), shard(shard), chunk_shape(chun
 {
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
-    this->fileName = expandTilde(this->fileName.c_str());
+    this->fileName = expandTilde(this->fileName);
     #endif
     set_jsonValues();
 }
@@ -738,7 +742,7 @@ void zarr::set_fileName(const std::string &fileName){
     // Handle the tilde character in filenames on Linux/Mac
     this->fileName = fileName;
     #ifndef _WIN32
-    this->fileName = expandTilde(this->fileName.c_str());
+    this->fileName = expandTilde(this->fileName);
     #endif
 }
 
