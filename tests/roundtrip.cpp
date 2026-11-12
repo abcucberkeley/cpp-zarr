@@ -1747,15 +1747,18 @@ int main(int argc, char** argv){
                             if (parallelWriteZarr(W, fIn ? fdata.data() : data.data(), zeros, shape, shape, fIn ? fStrides(shape) : cStrides(shape),
                                                   bytes*8, false, false, false))
                                 throw std::string("write: ") + W.get_errString();
-                            // (the same chunk files: TZYXC keys c/t/z/y/x/0, TCZYX ones c/t/0/z/y/x)
+                            // (the same chunk files: TZYXC keys c/t/z/y/x/0, TCZYX ones c/t/0/z/y/x; the keys' parts taken
+                            // as the file system names them, whose separator is \ on Windows)
                             const auto a = chunkFiles(p);
                             bool same = a.size() == b.size() && !a.empty();
                             for (size_t i = 0; same && i < a.size(); i++){
-                                const std::string ka = a[i].first.substr(p.size() + 1);
                                 std::vector<std::string> parts;
-                                for (size_t s0 = 0, s1; s0 <= ka.size(); s0 = s1 + 1){ s1 = ka.find('/', s0); if (s1 == std::string::npos) s1 = ka.size(); parts.push_back(ka.substr(s0, s1 - s0)); }
-                                const std::string kb = q + "/" + parts[0] + "/" + parts[1] + "/0/" + parts[2] + "/" + parts[3] + "/" + parts[4];
-                                const auto it = std::find_if(b.begin(), b.end(), [&](const std::pair<std::string, std::string>& f){ return f.first == kb; });
+                                for (const auto& c : std::filesystem::path(a[i].first).lexically_relative(p)) parts.push_back(c.string());
+                                same = parts.size() == 6;
+                                if (!same) break;
+                                const std::filesystem::path kb = std::filesystem::path(q) / parts[0] / parts[1] / "0" / parts[2] / parts[3] / parts[4];
+                                const auto it = std::find_if(b.begin(), b.end(), [&](const std::pair<std::string, std::string>& f){
+                                    return std::filesystem::path(f.first) == kb; });
                                 same = it != b.end() && it->second == a[i].second;
                             }
                             if (!same) std::fprintf(stderr, "    %s: chunk files written from %s order differ from the TCZYX array's\n", name.c_str(), fIn ? "F" : "C");
