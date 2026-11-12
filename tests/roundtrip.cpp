@@ -1795,6 +1795,148 @@ int main(int argc, char** argv){
             return ok;
         });
 
+        check("reads into outputs of any layout (outStrides): TZYXC data with each channel in a plane of its own (padded), and "
+              "with its axes permuted, from chunks that keep the channels apart (the transpose codec), from chunks of one channel "
+              "and from chunks of all of them, plain and sharded, whole and in regions, every element size, missing chunks given "
+              "the fill value, nothing outside the output written, invalid strides refused; and chunks of one channel each into "
+              "channels-last (C-order) output", [&](){
+            bool ok = true;
+            std::mt19937 vrng(91);
+            for (const char* dtype : {"<u1", "<u2", "<u8", "<c16"}){
+                const uint64_t bytes = dtypeInfo(dtype).bytes;
+                for (uint64_t nc = 1; nc <= 3; nc++){
+                    for (int layout = 0; layout < 3; layout++){
+                        for (const bool sharded : {false, true}){
+                            // (0: the channels apart in each chunk, 1: one channel a chunk, 2: all channels in each chunk)
+                            const V shape = {3, 20, 18, 22, nc};
+                            const V inner = {1, 8, 8, 8, layout == 1 ? 1 : nc};
+                            const V chunk = sharded ? V{2, 16, 16, 16, inner[4]} : inner;
+                            const std::string name = std::string(dtype+1) + "_c" + std::to_string(nc) + "_l" + std::to_string(layout) + (sharded ? "_sh" : "");
+                            const std::string p = dir + "/rt_os_" + name + ".zarr";
+                            std::error_code ec;
+                            std::filesystem::remove_all(p, ec);
+                            {
+                                zarr Z;
+                                Z.set_fileName(p); Z.set_zarr_format(3); Z.set_cname("zstd"); Z.set_clevel(1); Z.set_order("C");
+                                Z.set_chunks(chunk); Z.set_dtype(dtype); Z.set_shape(shape);
+                                if (sharded){ Z.set_shard(true); Z.set_chunk_shape(inner); }
+                                Z.write_zarray();
+                            }
+                            if (layout == 0){
+                                json m = readJson(p + "/zarr.json");
+                                json& codecs = sharded ? m["codecs"][0]["configuration"]["codecs"] : m["codecs"];
+                                codecs.insert(codecs.begin(), json{{"name", "transpose"}, {"configuration", {{"order", {0, 4, 1, 2, 3}}}}});
+                                std::ofstream(p + "/zarr.json") << m.dump();
+                            }
+                            // (C-order data with values, and its first chunks all zero: missing, as sparse writes leave them)
+                            const uint64_t n = 3*20*18*22*nc;
+                            std::vector<uint8_t> data(n*bytes);
+                            for (auto& v : data) v = (uint8_t)(1 + vrng() % 200);
+                            for (uint64_t z = 0; z < 8; z++) for (uint64_t y = 0; y < 8; y++) for (uint64_t x = 0; x < 8; x++)
+                                for (uint64_t c = 0; c < nc; c++) memset(&data[(((z*18 + y)*22 + x)*nc + c)*bytes], 0, bytes);
+                            V cst(5);
+                            for (uint64_t a = 1, d = 5; d-- > 0;){ cst[d] = a; a *= shape[d]; }
+                            const V zeros(5, 0);
+                            {
+                                zarr W(p);
+                                W.set_chunkInfo(zeros, shape);
+                                if (parallelWriteZarr(W, data.data(), zeros, shape, shape, cst, bytes*8, false, false, true))
+                                    throw std::string("write: ") + W.get_errString();
+                            }
+                            const uint8_t fillElem[16] = {0};
+                            for (int k = 0; k < 4 && ok; k++){
+                                V s(5, 0), e = shape;
+                                if (k >= 2) for (int d = 0; d < 5; d++){ s[d] = vrng() % shape[d]; e[d] = s[d] + 1 + vrng() % (shape[d] - s[d]); }
+                                V rs(5);
+                                for (int d = 0; d < 5; d++) rs[d] = e[d] - s[d];
+                                // (k even: channel planes, rows and planes padded; k odd: the axes permuted (c, x, t, z, y), padded)
+                                V st(5);
+                                if (k % 2 == 0){
+                                    st[3] = 1; st[2] = rs[3] + 3; st[1] = st[2]*(rs[2] + 1); st[4] = st[1]*(rs[1] + 1); st[0] = st[4]*rs[4] + 7;
+                                }
+                                else{
+                                    st[2] = 1; st[1] = rs[2]; st[0] = st[1]*rs[1] + 2; st[3] = st[0]*rs[0]; st[4] = st[3]*rs[3] + 5;
+                                }
+                                uint64_t span = 1;
+                                for (int d = 0; d < 5; d++) span += (rs[d] - 1)*st[d];
+                                std::vector<uint8_t> out((span + 16)*bytes, 0xEE);
+                                zarr R(p);
+                                R.set_chunkInfo(s, e);
+                                if (parallelReadZarr(R, out.data() + 8*bytes, s, e, rs, bytes*8, true, false, st, fillElem)){
+                                    std::fprintf(stderr, "    %s: read %d: %s", name.c_str(), k, R.get_errString().c_str());
+                                    ok = false;
+                                    break;
+                                }
+                                uint64_t written = 0;
+                                for (uint64_t t = 0; t < rs[0] && ok; t++) for (uint64_t z = 0; z < rs[1] && ok; z++) for (uint64_t y = 0; y < rs[2] && ok; y++)
+                                    for (uint64_t x = 0; x < rs[3] && ok; x++) for (uint64_t c = 0; c < rs[4] && ok; c++){
+                                        const uint64_t g = 8 + t*st[0] + z*st[1] + y*st[2] + x*st[3] + c*st[4];
+                                        const uint64_t w = (((((s[0]+t)*20 + s[1]+z)*18 + s[2]+y)*22 + s[3]+x)*nc + s[4]+c);
+                                        ok = memcmp(&out[g*bytes], &data[w*bytes], bytes) == 0;
+                                        written++;
+                                    }
+                                // (every byte outside the output's elements kept its 0xEE)
+                                uint64_t kept = 0;
+                                for (const uint8_t b : out) kept += b == 0xEE;
+                                uint64_t eeInside = 0;
+                                for (uint64_t t = 0; t < rs[0]; t++) for (uint64_t z = 0; z < rs[1]; z++) for (uint64_t y = 0; y < rs[2]; y++)
+                                    for (uint64_t x = 0; x < rs[3]; x++) for (uint64_t c = 0; c < rs[4]; c++){
+                                        const uint64_t g = 8 + t*st[0] + z*st[1] + y*st[2] + x*st[3] + c*st[4];
+                                        for (uint64_t b = 0; b < bytes; b++) eeInside += out[g*bytes + b] == 0xEE;
+                                    }
+                                if (ok && kept - eeInside != out.size() - written*bytes){
+                                    std::fprintf(stderr, "    %s: read %d wrote outside the output\n", name.c_str(), k);
+                                    ok = false;
+                                }
+                                if (!ok) std::fprintf(stderr, "    %s: read %d wrong\n", name.c_str(), k);
+                            }
+                            // channels-last (C-order) output, whole and a region
+                            for (int k = 0; k < 2 && ok; k++){
+                                V s(5, 0), e = shape;
+                                if (k) { s = {1, 3, 2, 5, 0}; e = {3, 17, 15, 20, nc}; }
+                                V rs(5);
+                                uint64_t rn = 1;
+                                for (int d = 0; d < 5; d++){ rs[d] = e[d] - s[d]; rn *= rs[d]; }
+                                std::vector<uint8_t> got(rn*bytes, 0xEE);
+                                zarr R(p);
+                                R.set_chunkInfo(s, e);
+                                if (parallelReadZarr(R, got.data(), s, e, rs, bytes*8, true, false, true, fillElem)){ ok = false; break; }
+                                for (uint64_t t = 0; t < rs[0] && ok; t++) for (uint64_t z = 0; z < rs[1] && ok; z++) for (uint64_t y = 0; y < rs[2] && ok; y++)
+                                    for (uint64_t x = 0; x < rs[3] && ok; x++) for (uint64_t c = 0; c < rs[4] && ok; c++){
+                                        const uint64_t g = (((t*rs[1] + z)*rs[2] + y)*rs[3] + x)*rs[4] + c;
+                                        const uint64_t w = (((((s[0]+t)*20 + s[1]+z)*18 + s[2]+y)*22 + s[3]+x)*nc + s[4]+c);
+                                        ok = memcmp(&got[g*bytes], &data[w*bytes], bytes) == 0;
+                                    }
+                                if (!ok) std::fprintf(stderr, "    %s: channels-last read %d wrong\n", name.c_str(), k);
+                            }
+                            std::filesystem::remove_all(p, ec);
+                        }
+                    }
+                }
+            }
+            // invalid strides: two elements in one place, a zero stride, too few strides
+            {
+                const std::string p = dir + "/rt_os_bad.zarr";
+                std::error_code ec;
+                std::filesystem::remove_all(p, ec);
+                zarr Z;
+                Z.set_fileName(p); Z.set_zarr_format(3); Z.set_chunks({8, 8}); Z.set_dtype("<u2"); Z.set_shape({16, 16});
+                Z.write_zarray();
+                std::vector<uint16_t> buf(1024);
+                const uint8_t fillElem[16] = {0};
+                const std::vector<V> bads = {{8, 1}, {16, 0}, {1}};
+                const std::vector<std::string> why = {"two of the output", "positive", "outStrides has"};
+                for (size_t b = 0; b < bads.size(); b++){
+                    zarr R(p);
+                    R.set_chunkInfo({0, 0}, {16, 16});
+                    const bool refused = parallelReadZarr(R, buf.data(), {0, 0}, {16, 16}, {16, 16}, 16, true, false, bads[b], fillElem) != 0;
+                    ok = ok && refused && R.get_errString().find(why[b]) != std::string::npos;
+                }
+                std::filesystem::remove_all(p, ec);
+            }
+            return ok;
+        });
+
         check("values converted between data types as MATLAB converts between classes (convertValues, for data written into "
               "an array of another type): integers rounded to the nearest, halves away from zero, saturated, NaN to 0; any "
               "nonzero value true; float16 directly from double and bfloat16 through float; only MATLAB's types as sources", [&](){

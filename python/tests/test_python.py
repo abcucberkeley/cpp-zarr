@@ -617,7 +617,7 @@ def main():
                 good = good and got is o and same(o, ref[region]) and same(cppzarr.read_zarr(p, s, e, num_threads=1), ref[region])
     p = os.path.join(tmp, "out_2_None_uint16.zarr")
     for bad, what in [(np.empty((70, 45, 33), np.float32), 'data type'), (np.empty((70, 45, 32), np.uint16), 'shape'),
-                      (np.empty((70, 45, 66), np.uint16)[:, :, ::2], 'contiguous')]:
+                      (np.empty((70, 45, 33), np.uint16)[:, :, ::-1], 'positive')]:
         try:
             cppzarr.read_zarr(p, out=bad)
             good = False
@@ -629,7 +629,85 @@ def main():
             good = False
         except Exception as e:
             good = good and 'num_threads' in str(e)
+    try:
+        cppzarr.read_zarr(p, order='C', out=np.empty((70, 45, 66), np.uint16)[:, :, ::2])
+        good = False
+    except Exception as e:
+        good = good and 'C-contiguous' in str(e)
     print(f"reading into arrays, and num_threads  {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
+    # Reading into views of any layout of positive strides (out not contiguous): every other row of a bigger
+    # array, a permutation of the axes, each channel of (t, z, y, x, c) data into a plane of its own (from chunks
+    # that keep the channels apart, Zarr v3's transpose codec, and from chunks of one channel), missing chunks
+    # (the fill value), an array stored big-endian; the elements outside the view keep what they held
+    good, bad = True, []
+    sentinel = 4321
+    def check_view(name, path, base, view, ref, threads):
+        base[...] = sentinel
+        got = cppzarr.read_zarr(path, out=view, num_threads=threads)
+        good_v = got is view and np.array_equal(view, ref)
+        if not good_v:
+            bad.append(f'{name}: values')
+        # (the elements outside the view kept the sentinel)
+        if int(np.count_nonzero(base == sentinel)) - int(np.count_nonzero(ref == sentinel)) != base.size - view.size:
+            bad.append(f'{name}: memory outside the view changed')
+            good_v = False
+        return good_v
+    d = rng.integers(0, 4000, size=(37, 29, 41)).astype(np.uint16)
+    for zf, shards in ((2, None), (3, None), (3, [16, 16, 16])):
+        p = os.path.join(tmp, f"views_v{zf}{'_sh' if shards else ''}.zarr")
+        cppzarr.write_zarr(p, d, chunks=[8, 8, 8], zarr_format=zf, shards=shards)
+        for threads in (1, 8):
+            base = np.empty((37, 58, 41), np.uint16)
+            good = check_view(f'every other row v{zf}', p, base, base[:, ::2, :], d, threads) and good
+            base = np.empty((29, 41, 37), np.uint16)
+            good = check_view(f'permuted v{zf}', p, base, base.transpose(2, 0, 1), d, threads) and good
+            base = np.empty((40, 31, 44), np.uint16)
+            good = check_view(f'region of a bigger array v{zf}', p, base, base[2:39, 1:30, 3:44], d, threads) and good
+    # (t, z, y, x, c) channels into planes
+    t5 = rng.integers(0, 4000, size=(3, 20, 18, 22, 2)).astype(np.uint16)
+    pt = os.path.join(tmp, "views_transposed.zarr")
+    cppzarr.create_zarr(pt, t5.shape, np.uint16, chunks=[1, 8, 8, 8, 2], zarr_format=3, shards=[2, 16, 16, 16, 2])
+    meta = load_json(os.path.join(pt, 'zarr.json'))
+    meta['codecs'][0]['configuration']['codecs'].insert(0, {'name': 'transpose', 'configuration': {'order': [0, 4, 1, 2, 3]}})
+    with open(os.path.join(pt, 'zarr.json'), 'w') as fh:
+        json.dump(meta, fh)
+    cppzarr.write_zarr(pt, t5, start_coords=[0] * 5, end_coords=list(t5.shape))
+    p1 = os.path.join(tmp, "views_one_channel.zarr")
+    cppzarr.write_zarr(p1, t5, chunks=[1, 8, 8, 8, 1], zarr_format=3)
+    for name, p in (('transpose codec', pt), ('one channel a chunk', p1)):
+        for threads in (1, 8):
+            planes = np.empty((3, 2, 20, 18, 22), np.uint16)
+            good = check_view(f'channel planes, {name}', p, planes, np.moveaxis(planes, 1, -1), t5, threads) and good
+            if not np.array_equal(planes[:, 1], t5[..., 1]):
+                bad.append(f'channel planes, {name}: plane 1')
+                good = False
+    # (missing chunks get the fill value; a big-endian array)
+    pm = os.path.join(tmp, "views_missing.zarr")
+    dm = d.copy()
+    dm[:8, :8, :8] = 0
+    cppzarr.write_zarr(pm, dm, chunks=[8, 8, 8], zarr_format=3)
+    base = np.empty((37, 58, 41), np.uint16)
+    good = check_view('missing chunks', pm, base, base[:, 1::2, :], dm, 4) and good
+    # (arrays stored big-endian, from the test arrays other writers made: cpp-zarr writes little-endian only)
+    v3dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'test_arrays')
+    if os.path.isfile(os.path.join(v3dir, 'arrays.json')):
+        with open(os.path.join(v3dir, 'arrays.json')) as fh:
+            bigs = [fx for fx in json.load(fh)['arrays'] if 'big_endian' in fx['name'] and 'error' not in fx
+                    and fx['dtype'] != 'bfloat16' and len(fx['shape']) > 0]
+        for fx in bigs:
+            pbig = os.path.join(v3dir, fx['name'] + '.zarr')
+            ref = cppzarr.read_zarr(pbig)
+            base = np.empty((2 * ref.shape[0],) + ref.shape[1:], ref.dtype)
+            sent = np.asarray(sentinel).astype(ref.dtype)
+            base[...] = sent
+            got = cppzarr.read_zarr(pbig, out=base[::2], num_threads=4)
+            if not (np.array_equal(base[::2], ref, equal_nan=ref.dtype.kind in 'fc') and same(zarr_read(pbig), ref)
+                    and np.all(base[1::2] == sent)):
+                bad.append(f"big-endian {fx['name']}")
+                good = False
+    print(f"reading into views of any layout  {'OK' if good else 'FAIL'}" + ('' if good else f" ({'; '.join(bad)})"))
     ok = ok and good
 
     # Batches of reads: the same values as reading each region on its own, in the

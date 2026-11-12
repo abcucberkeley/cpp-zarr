@@ -47,7 +47,9 @@ def read_zarr(file_name, start_coords=None, end_coords=None, order=None, num_thr
     # CPU the process may run on). The GIL is released while reading, so reads from
     # several Python threads run at once: give each a share of the CPUs.
     # out: a NumPy array to read into instead of a new one (of the region's shape and
-    # the array's data type, writeable and C- or F-contiguous); it is returned. Or GPU
+    # the array's data type, writeable: C- or F-contiguous, or with order None also a view of
+    # any layout of positive strides, such as a plane for each channel or a region of a bigger
+    # array, of which only its own elements are written); it is returned. Or GPU
     # memory: a CuPy array, a PyTorch tensor on a CUDA device, or another array with
     # __cuda_array_interface__ (C- or F-contiguous): the chunks are then decompressed on
     # the GPU (see read_zarr_batch), with the GPU work on stream (a PyTorch or CuPy stream,

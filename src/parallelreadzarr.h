@@ -36,6 +36,22 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const bool cOrder,
                          const void* fillMissing);
 
+// Same as above, into an output of any memory layout: outStrides gives, for each axis of the region, the
+// distance in elements between neighboring elements of the output along it (as parallelWriteZarr's inStrides),
+// so that, for example, each channel of an image goes to a plane of its own, or a region to its place in a
+// bigger array. The strides along axes the region is more than one element long must be positive and place no
+// two elements in one place (returns 1 otherwise, with the reason in Zarr's errString); only the output's own
+// elements are written.
+uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
+                         const std::vector<uint64_t> &startCoords,
+                         const std::vector<uint64_t> &endCoords,
+                         const std::vector<uint64_t> &readShape,
+                         const uint64_t bits,
+                         const bool useCtx,
+                         const bool sparse,
+                         const std::vector<uint64_t> &outStrides,
+                         const void* fillMissing);
+
 void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
                               std::vector<uint64_t> startCoords,
                               std::vector<uint64_t> endCoords);

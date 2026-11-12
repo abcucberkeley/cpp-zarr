@@ -209,7 +209,8 @@ static pybind11::array readOpened(zarr &Zarr, const std::vector<uint64_t> &start
     }
 
     // Into the caller's array (out): of the region's shape and the array's data type,
-    // writeable, and contiguous (in order, when given)
+    // writeable, and contiguous in order when it is given; with no order also any other
+    // layout of positive strides (a view: a channel's planes, a region of a bigger array)
     if (!out.is_none()) {
         if (!pybind11::isinstance<pybind11::array>(out)) throw std::runtime_error("out must be a NumPy array");
         pybind11::array a = out.cast<pybind11::array>();
@@ -225,9 +226,21 @@ static pybind11::array readOpened(zarr &Zarr, const std::vector<uint64_t> &start
         const pybind11::object flags = a.attr("flags");
         const bool cContig = flags.attr("c_contiguous").cast<bool>(), fContig = flags.attr("f_contiguous").cast<bool>();
         if (!flags.attr("writeable").cast<bool>()) throw std::runtime_error("out must be writeable");
-        if (!order.empty() ? !(cOrder ? cContig : fContig) : !(cContig || fContig)) {
-            throw std::runtime_error(order.empty() ? std::string("out must be C- or F-contiguous")
-                                                   : "out must be " + order + "-contiguous for order '" + order + "'");
+        if (!order.empty() && !(cOrder ? cContig : fContig)) {
+            throw std::runtime_error("out must be " + order + "-contiguous for order '" + order + "'");
+        }
+        std::vector<uint64_t> outStrides;
+        if (order.empty() && !cContig && !fContig) {
+            const uint64_t itemsize = (uint64_t)a.itemsize();
+            outStrides.assign(nDims, 0);
+            for (uint64_t d = 0; d < nDims; d++) {
+                if (dims[d] <= 1) continue;
+                const ssize_t st = a.strides(d);
+                if (st <= 0 || (uint64_t)st % itemsize) {
+                    throw std::runtime_error("out's strides must be positive multiples of its element size");
+                }
+                outStrides[d] = (uint64_t)st / itemsize;
+            }
         }
         // (its own layout, unless order says; one that is both, the file's order)
         if (order.empty() && cContig != fContig) cOrder = cContig;
@@ -239,7 +252,8 @@ static pybind11::array readOpened(zarr &Zarr, const std::vector<uint64_t> &start
             pybind11::gil_scoped_release release;
             if (measure) t0 = threadClocks();
             if (!crop) Zarr.set_chunkInfo(start, end);
-            err = parallelReadZarr(Zarr, ptr, start, end, dims, Zarr.dtypeBytes()*8, true, false, cOrder, fillElem);
+            err = outStrides.empty() ? parallelReadZarr(Zarr, ptr, start, end, dims, Zarr.dtypeBytes()*8, true, false, cOrder, fillElem)
+                                     : parallelReadZarr(Zarr, ptr, start, end, dims, Zarr.dtypeBytes()*8, true, false, outStrides, fillElem);
             measured();
         }
         if (err) throw std::runtime_error(Zarr.get_errString());

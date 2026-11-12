@@ -148,6 +148,11 @@ im = cppzarr.read_zarr('filename.zarr', num_threads=4)
 batch = np.empty((8, 128, 128, 128), dtype=np.uint16)
 cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 
+# out can be a view of any layout of positive strides too, such as a plane for each channel of
+# (t, z, y, x, c) data, or a region of a bigger array: only its own elements are written
+planes = np.empty((2, 2, 128, 1024, 1024), dtype=np.uint16)                        # (t, c, z, y, x)
+cppzarr.read_zarr('tzyxc.zarr', [0] * 5, [2, 128, 1024, 1024, 2], out=np.moveaxis(planes, 1, -1))
+
 # Reads and writes release the GIL, so several Python threads can read at once: give each
 # a share of the CPUs with num_threads. The same goes for several processes reading at once
 # (a multiprocessing pool, a data loader's workers): give each process a share with

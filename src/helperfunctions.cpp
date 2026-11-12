@@ -818,22 +818,49 @@ struct CzScratch {
     }
 };
 
-// Copy one element-strided box with a loop over every element (used only for
-// layouts that have no contiguous axis to exploit)
-static void copyBoxElementwise(const uint64_t bytes, const uint8_t* src, uint8_t* dst, const uint64_t m,
-                               const uint64_t* ext, const uint64_t* ss, const uint64_t* ds){
+// One row of n elements, sr and dr elements apart in the source and the destination
+template <typename T>
+static inline void copyRowStrided(const T* src, T* dst, const uint64_t n, const uint64_t sr, const uint64_t dr){
+    if(sr == 1) for(uint64_t k = 0; k < n; k++) dst[k*dr] = src[k];
+    else for(uint64_t k = 0; k < n; k++) dst[k*dr] = src[k*sr];
+}
+
+// Copy a box by rows along axis r, where neither side is contiguous along another axis to transpose with:
+// r contiguous in the source and the destination's smallest stride but not contiguous there (an axis the
+// destination interleaves with one the source holds one element of, as reads of chunks of one channel each
+// into channels-last output), or one axis alone. The other axes are stepped through with the destination's
+// smallest stride innermost. (Copied an element at a time over every axis, such reads, of a 17 GB TZYXC array in
+// chunks of 1x128x256x256x1 on a 24-core node, took 18-44 times as long.)
+static void copyBoxRows(const uint64_t bytes, const uint8_t* src, uint8_t* dst, const uint64_t m,
+                        const uint64_t* ext, const uint64_t* ss, const uint64_t* ds, const uint64_t r){
     CzScratch scratch;
-    uint64_t* idx = scratch.get(m, 1);
+    uint64_t* buf = scratch.get(m, 4);
+    uint64_t *idx = buf, *oe = buf+m, *os = buf+2*m, *od = buf+3*m;
+    uint64_t k = 0;
+    for(uint64_t d = 0; d < m; d++){
+        if(d == r) continue;
+        uint64_t p = k++;
+        while(p > 0 && od[p-1] > ds[d]){ oe[p] = oe[p-1]; os[p] = os[p-1]; od[p] = od[p-1]; p--; }
+        oe[p] = ext[d]; os[p] = ss[d]; od[p] = ds[d];
+    }
+    const uint64_t n = ext[r], sr = ss[r], dr = ds[r];
     uint64_t sOff = 0, dOff = 0;
     while(true){
-        memcpy(dst+dOff*bytes, src+sOff*bytes, bytes);
-        uint64_t l = 0;
-        for(; l < m; l++){
-            idx[l]++; sOff += ss[l]; dOff += ds[l];
-            if(idx[l] < ext[l]) break;
-            sOff -= ext[l]*ss[l]; dOff -= ext[l]*ds[l]; idx[l] = 0;
+        switch(bytes){
+            case 1: copyRowStrided((const uint8_t*)src+sOff, (uint8_t*)dst+dOff, n, sr, dr); break;
+            case 2: copyRowStrided((const uint16_t*)src+sOff, (uint16_t*)dst+dOff, n, sr, dr); break;
+            case 4: copyRowStrided((const uint32_t*)src+sOff, (uint32_t*)dst+dOff, n, sr, dr); break;
+            case 8: copyRowStrided((const uint64_t*)src+sOff, (uint64_t*)dst+dOff, n, sr, dr); break;
+            case 16: copyRowStrided((const CzElem16*)src+sOff, (CzElem16*)dst+dOff, n, sr, dr); break;
+            default: for(uint64_t e = 0; e < n; e++) memcpy(dst+(dOff+e*dr)*bytes, src+(sOff+e*sr)*bytes, bytes);
         }
-        if(l == m) return;
+        uint64_t l = 0;
+        for(; l < k; l++){
+            idx[l]++; sOff += os[l]; dOff += od[l];
+            if(idx[l] < oe[l]) break;
+            sOff -= oe[l]*os[l]; dOff -= oe[l]*od[l]; idx[l] = 0;
+        }
+        if(l == k) return;
     }
 }
 
@@ -938,7 +965,7 @@ void copyBoxND(const uint64_t bytes, const void* src, void* dst,
         for(uint64_t d = 0; d < m; d++) if(d != i && ss[d] < ss[kk]) kk = d;
     }
     if(i == kk || m == 1){
-        copyBoxElementwise(bytes, s, dp, m, ext, ss, ds);
+        copyBoxRows(bytes, s, dp, m, ext, ss, ds, i);
         return;
     }
     // Middle axes: the one with the smallest destination stride is the kernel's

@@ -575,21 +575,23 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     return parallelReadZarr(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, cOrder, nullptr);
 }
 
-uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
-                         const std::vector<uint64_t> &startCoords,
-                         const std::vector<uint64_t> &endCoords,
-                         const std::vector<uint64_t> &readShape,
-                         const uint64_t bits,
-                         const bool useCtx,
-                         const bool sparse,
-                         const bool cOrder,
-                         const void* fillMissing)
+// The read into an output in F or C order (cOrder), or with the element strides outStridesIn when given
+static uint8_t readZarrInto(zarr &Zarr, void* zarrArr,
+                            const std::vector<uint64_t> &startCoords,
+                            const std::vector<uint64_t> &endCoords,
+                            const std::vector<uint64_t> &readShape,
+                            const uint64_t bits,
+                            const bool useCtx,
+                            const bool sparse,
+                            const bool cOrder,
+                            const void* fillMissing,
+                            const std::vector<uint64_t>* outStridesIn)
 {
     // (in a child made by fork(), on the thread that forked: see ForkSafety)
     if(ForkSafety::get().needRegionThread()){
         uint8_t r = 1;
         ForkSafety::get().onRegionThread([&]{
-            r = parallelReadZarr(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, cOrder, fillMissing);
+            r = readZarrInto(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, cOrder, fillMissing, outStridesIn);
         });
         return r;
     }
@@ -650,20 +652,26 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     const uint64_t sB = s*bytes;
 
     // Element strides of a decompressed chunk (its stored axes, slowest first: C or
-    // F order, or a Zarr v3 transpose) and of the output (F or C order)
+    // F order, or a Zarr v3 transpose) and of the output (F or C order, or the caller's)
     std::vector<uint64_t> chunkStrides(nDims), outStrides(nDims);
     {
         const std::vector<uint64_t> axes = Zarr.get_chunkAxisOrder();
         uint64_t acc = 1;
         for(int64_t i = (int64_t)nDims-1; i >= 0; i--){ chunkStrides[axes[i]] = acc; acc *= Zarr.get_chunks(axes[i]); }
         acc = 1;
-        if(cOrder){
+        if(outStridesIn) outStrides = *outStridesIn;
+        else if(cOrder){
             for(int64_t d = (int64_t)nDims-1; d >= 0; d--){ outStrides[d] = acc; acc *= readShape[d]; }
         }
         else{
             for(uint64_t d = 0; d < nDims; d++){ outStrides[d] = acc; acc *= readShape[d]; }
         }
     }
+    // The output's axes from its fastest (smallest stride) to its slowest; of equal strides
+    // (axes the region is one element thick along) the later axis first, as in C order
+    std::vector<uint64_t> outOrder(nDims);
+    for(uint64_t d = 0; d < nDims; d++) outOrder[d] = nDims-1-d;
+    std::stable_sort(outOrder.begin(), outOrder.end(), [&](uint64_t a, uint64_t b){ return outStrides[a] < outStrides[b]; });
 
     // Sparse reads skip all-zero chunks, which the output already holds when the
     // fill value is zero
@@ -707,12 +715,22 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         innerStride[d] = d+1 < (int64_t)nDims ? innerStride[d+1]*innerCount[d+1] : 1;
     }
     const bool regular = nOuter*nPer == (uint64_t)listed;
-    bool reorder = !cOrder && nDims > 1 && regular;
+    // (the list's order, last axis fastest, is the output's when its axes that are more than
+    // one element thick go from fast to slow last to first)
+    bool listInOrder = true;
+    for(uint64_t j = 0, prev = nDims; j < nDims; j++){
+        const uint64_t d = outOrder[j];
+        if(readShape[d] <= 1) continue;
+        if(prev < nDims && d > prev) listInOrder = false;
+        prev = d;
+    }
+    bool reorder = !listInOrder && nDims > 1 && regular;
     // The list position of the chunk at position q of the output's order
     auto listIndex = [&](uint64_t q) -> int64_t {
         if(!reorder) return (int64_t)q;
         uint64_t o = q/nPer, c = q%nPer, f = 0, g = 0;
-        for(uint64_t d = 0; d < nDims; d++){
+        for(uint64_t j = 0; j < nDims; j++){
+            const uint64_t d = outOrder[j];
             f += (o%outerCount[d])*outerStride[d];
             o /= outerCount[d];
             g += (c%innerCount[d])*innerStride[d];
@@ -1305,12 +1323,7 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
 
     // The output's slowest axis (more than one element thick)
     int64_t outSlow = 0;
-    if(cOrder){
-        for(int64_t d = 0; d < (int64_t)nDims; d++) if(readShape[d] > 1){ outSlow = d; break; }
-    }
-    else{
-        for(int64_t d = (int64_t)nDims-1; d >= 0; d--) if(readShape[d] > 1){ outSlow = d; break; }
-    }
+    for(int64_t j = (int64_t)nDims-1; j >= 0; j--) if(readShape[outOrder[j]] > 1){ outSlow = (int64_t)outOrder[j]; break; }
     // Big blosc chunks whose slices run along the output's slowest axis are decoded a part
     // (a few blocks, whole slices) at a time into a small buffer, and each part copied out
     // while it is in the cache. Decoded whole, they went through memory twice more, into
@@ -2281,9 +2294,71 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
     }
     uint64_t readSize = 1;
     for(uint64_t d = 0; d < nDims; d++) readSize *= readShape[d];
-    // (each part of a complex number on its own)
-    if(oppositeEndianness(Zarr.get_dtype())) swapDtypeEndianness(zarrArr, dtypeInfo(Zarr.get_dtype()), readSize);
+    // (each part of a complex number on its own; in an output with the caller's strides, element by element)
+    if(oppositeEndianness(Zarr.get_dtype())){
+        const DtypeInfo t = dtypeInfo(Zarr.get_dtype());
+        if(!outStridesIn) swapDtypeEndianness(zarrArr, t, readSize);
+        else if(readSize){
+            std::vector<uint64_t> idx(nDims, 0);
+            uint64_t off = 0;
+            while(true){
+                swapDtypeEndianness((uint8_t*)zarrArr+off*bytes, t, 1);
+                uint64_t l = 0;
+                for(; l < nDims; l++){
+                    idx[l]++; off += outStrides[l];
+                    if(idx[l] < readShape[l]) break;
+                    off -= readShape[l]*outStrides[l]; idx[l] = 0;
+                }
+                if(l == nDims) break;
+            }
+        }
+    }
     return 0;
+}
+
+uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
+                         const std::vector<uint64_t> &startCoords,
+                         const std::vector<uint64_t> &endCoords,
+                         const std::vector<uint64_t> &readShape,
+                         const uint64_t bits,
+                         const bool useCtx,
+                         const bool sparse,
+                         const bool cOrder,
+                         const void* fillMissing)
+{
+    return readZarrInto(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, cOrder, fillMissing, nullptr);
+}
+
+uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
+                         const std::vector<uint64_t> &startCoords,
+                         const std::vector<uint64_t> &endCoords,
+                         const std::vector<uint64_t> &readShape,
+                         const uint64_t bits,
+                         const bool useCtx,
+                         const bool sparse,
+                         const std::vector<uint64_t> &outStrides,
+                         const void* fillMissing)
+{
+    // One stride for each axis, positive along the axes the region is more than one element long, and no two
+    // elements in one place: sorted by stride, each axis's stride at least the span of the ones before it
+    if(outStrides.size() != readShape.size()){
+        Zarr.set_errString("outStrides has "+std::to_string(outStrides.size())+" values but the region has "+
+                           std::to_string(readShape.size())+" dimensions\n");
+        return 1;
+    }
+    std::vector<uint64_t> axes;
+    for(uint64_t d = 0; d < readShape.size(); d++) if(readShape[d] > 1) axes.push_back(d);
+    std::stable_sort(axes.begin(), axes.end(), [&](uint64_t a, uint64_t b){ return outStrides[a] < outStrides[b]; });
+    uint64_t span = 1;
+    for(const uint64_t d : axes){
+        if(outStrides[d] < span){
+            Zarr.set_errString(outStrides[d] ? "outStrides places two of the output's elements in one place\n"
+                                             : "outStrides must be positive along every axis longer than 1\n");
+            return 1;
+        }
+        span = outStrides[d]*readShape[d];
+    }
+    return readZarrInto(Zarr, zarrArr, startCoords, endCoords, readShape, bits, useCtx, sparse, false, fillMissing, &outStrides);
 }
 
 uint8_t decodeChunk(const std::string &compressor, const bool chunkChecksum,
