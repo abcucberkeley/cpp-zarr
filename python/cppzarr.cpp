@@ -360,7 +360,8 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
                          const std::vector<uint64_t> endCoords = std::vector<uint64_t>{0, 0, 0}, const std::string &cname = "zstd",
                          const uint64_t clevel = 1, const std::string &order = "F", const std::vector<uint64_t> &chunks = std::vector<uint64_t>{256, 256, 256},
                          const std::string &dimension_separator = ".", const bool crop = false, const uint64_t zarr_format = 2,
-                         const std::vector<uint64_t> &shards = std::vector<uint64_t>{}, const int64_t numThreads = 0){
+                         const std::vector<uint64_t> &shards = std::vector<uint64_t>{}, const int64_t numThreads = 0,
+                         const bool useUuid = true, const bool sparse = true){
     if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
     const CallThreads threads(numThreads);
 
@@ -418,7 +419,7 @@ void pybind11_write_zarr(const std::string &fileName, const pybind11::array &dat
     uint8_t err = 0;
     {
         pybind11::gil_scoped_release release;
-        err = parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, inStrides, dtype, true, crop);
+        err = parallelWriteZarr(Zarr, info.ptr, startCoords, endCoords, writeShape, inStrides, dtype, useUuid, crop, sparse);
     }
     if(err) throw std::runtime_error(Zarr.get_errString());
 }
@@ -431,7 +432,8 @@ void pybind11_write_zarr_gpu(const std::string &fileName, const uint64_t ptr, co
                              const std::vector<int64_t> &strides, const std::vector<uint64_t> &startCoords,
                              const std::vector<uint64_t> &endCoords, const std::string &cname, const uint64_t clevel, const std::string &order,
                              const std::vector<uint64_t> &chunks, const std::string &dimension_separator, const bool crop,
-                             const uint64_t zarr_format, const std::vector<uint64_t> &shards, const int64_t numThreads, const uint64_t stream){
+                             const uint64_t zarr_format, const std::vector<uint64_t> &shards, const int64_t numThreads, const uint64_t stream,
+                             const bool useUuid, const bool sparse){
     if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
     const CallThreads threads(numThreads);
     zarr Zarr;
@@ -453,13 +455,61 @@ void pybind11_write_zarr_gpu(const std::string &fileName, const uint64_t ptr, co
     {
         pybind11::gil_scoped_release release;
         err = gpuWriteZarr(Zarr, reinterpret_cast<const void*>(static_cast<uintptr_t>(ptr)), startCoords, endCoords, writeShape, inStrides,
-                           t.bytes*8, true, crop, true, reinterpret_cast<void*>(static_cast<uintptr_t>(stream)));
+                           t.bytes*8, useUuid, crop, sparse, reinterpret_cast<void*>(static_cast<uintptr_t>(stream)));
     }
     if (err) {
         std::string e = Zarr.get_errString();
         while (!e.empty() && e.back() == '\n') e.pop_back();
         throw std::runtime_error(e);
     }
+}
+
+// A new array's metadata alone (.zarray or zarr.json), with no chunks, as a write of data of the data type dtype
+// (a typestr in this machine's byte order, or "bfloat16") and of this shape makes it; the regions written into
+// it later fill it. The chunk files already at fileName are left as they are.
+void pybind11_create_zarr(const std::string &fileName, const std::vector<uint64_t> &shape, const std::string &dtype,
+                          const std::string &cname, const uint64_t clevel, const std::string &order, const std::vector<uint64_t> &chunks,
+                          const std::string &dimension_separator, const uint64_t zarr_format, const std::vector<uint64_t> &shards){
+    zarr Zarr;
+    configureWrite(Zarr, fileName, cname, clevel, order, chunks, dimension_separator, zarr_format, shards);
+    const DtypeInfo t = dtypeInfo(dtype);
+    if (!t.kind || t.bigEndian) throw std::runtime_error("Unsupported data type: " + dtype);
+    Zarr.set_dtype(dtype);
+    Zarr.set_shape(shape);
+    pybind11::gil_scoped_release release;
+    writeZarray(Zarr);
+}
+
+// data (C- or F-contiguous, of a type MATLAB has: bool, integers, float32 or float64) converted to the data type
+// dtype (a typestr, or "bfloat16", returned as its bits: uint16) as MATLAB converts between classes (see
+// convertValues), into a new array of the same shape and memory order
+pybind11::array pybind11_convert_values(const pybind11::array &data, const std::string &dtype, const int64_t numThreads){
+    if (numThreads < 0) throw std::runtime_error("num_threads must be at least 1");
+    const DtypeInfo t = dtypeInfo(dtype);
+    if (!t.kind || t.bigEndian) throw std::runtime_error("Unsupported data type: " + dtype);
+    const bool cOrder = data.flags() & pybind11::array::c_style, fOrder = data.flags() & pybind11::array::f_style;
+    if (!cOrder && !fOrder) throw std::runtime_error("The data to convert must be C- or F-contiguous");
+    const char kind = data.dtype().kind();
+    const uint64_t itemsize = (uint64_t)data.dtype().itemsize();
+    const std::string from = kind == 'b' ? "|b1" : std::string("<") + kind + std::to_string(itemsize);
+    const std::vector<ssize_t> shape(data.shape(), data.shape() + data.ndim());
+    const pybind11::dtype outType(t.bfloat16 ? std::string("uint16") : dtype);
+    std::vector<ssize_t> strides(shape.size());
+    ssize_t acc = (ssize_t)outType.itemsize();
+    if (cOrder) for (ssize_t d = (ssize_t)shape.size()-1; d >= 0; d--) { strides[d] = acc; acc *= shape[d]; }
+    else for (size_t d = 0; d < shape.size(); d++) { strides[d] = acc; acc *= shape[d]; }
+    pybind11::array out(outType, shape, strides);
+    const void* src = data.data();
+    void* dst = out.mutable_data();
+    const uint64_t n = (uint64_t)data.size();
+    bool ok = false;
+    {
+        pybind11::gil_scoped_release release;
+        const CallThreads threads(numThreads);
+        ok = convertValues(src, from, dst, dtype, n);
+    }
+    if (!ok) throw std::runtime_error("Cannot convert data of the type " + from + " to " + dtype);
+    return out;
 }
 
 // Turn a Zarr v2 array into a Zarr v3 one in place (only its metadata is rewritten)
@@ -636,13 +686,20 @@ PYBIND11_MODULE(cppzarr, m) {
 	m.def("pybind11_write_zarr", &pybind11_write_zarr, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("startCoords"),
 	      pybind11::arg("endCoords"), pybind11::arg("cname"), pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"),
 	      pybind11::arg("dimension_separator"), pybind11::arg("crop"), pybind11::arg("zarr_format"), pybind11::arg("shards"),
-	      pybind11::arg("numThreads") = 0, "Write a zarr file");
+	      pybind11::arg("numThreads") = 0, pybind11::arg("useUuid") = true, pybind11::arg("sparse") = true, "Write a zarr file");
 
 	m.def("pybind11_write_zarr_gpu", &pybind11_write_zarr_gpu, pybind11::arg("fileName"), pybind11::arg("ptr"), pybind11::arg("dtype"),
 	      pybind11::arg("shape"), pybind11::arg("strides"), pybind11::arg("startCoords"), pybind11::arg("endCoords"), pybind11::arg("cname"),
 	      pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"), pybind11::arg("dimension_separator"),
 	      pybind11::arg("crop"), pybind11::arg("zarr_format"), pybind11::arg("shards"), pybind11::arg("numThreads") = 0,
-	      pybind11::arg("stream") = 0, "Write a zarr file from GPU memory");
+	      pybind11::arg("stream") = 0, pybind11::arg("useUuid") = true, pybind11::arg("sparse") = true, "Write a zarr file from GPU memory");
+
+	m.def("pybind11_create_zarr", &pybind11_create_zarr, pybind11::arg("fileName"), pybind11::arg("shape"), pybind11::arg("dtype"),
+	      pybind11::arg("cname"), pybind11::arg("clevel"), pybind11::arg("order"), pybind11::arg("chunks"), pybind11::arg("dimension_separator"),
+	      pybind11::arg("zarr_format"), pybind11::arg("shards"), "Write a new array's metadata alone");
+
+	m.def("pybind11_convert_values", &pybind11_convert_values, pybind11::arg("data"), pybind11::arg("dtype"), pybind11::arg("numThreads") = 0,
+	      "Convert values as MATLAB converts between classes");
 
 	m.def("pybind11_convert_to_v3", &pybind11_convert_to_v3, pybind11::arg("fileName"),
 	      "Convert a Zarr v2 array to Zarr v3 in place (metadata only)");

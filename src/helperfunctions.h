@@ -97,6 +97,14 @@ float halfToFloat(uint16_t h);
 uint16_t floatToBfloat16(float v);
 float bfloat16ToFloat(uint16_t b);
 
+// n values of the data type srcDtype at src converted to the data type dstDtype at dst (both typestrs, as
+// dtypeInfo reads them), as MATLAB converts between classes and the MATLAB writer converts the data it writes
+// into an array of another type: into integer types rounded to the nearest integer (halves away from zero) and
+// saturated at the type's limits, NaN to 0; into bool any nonzero value true; into floating point and complex
+// types rounded to the nearest value (float16 directly from double, bfloat16 through float). Sources of the
+// types MATLAB has: bool, integers of 1 to 8 bytes, float32 and float64. Returns false for other types.
+bool convertValues(const void* src, const std::string &srcDtype, void* dst, const std::string &dstDtype, const uint64_t n);
+
 // Parse a zarr fill_value string for memset-style fills. Returns 0 for anything
 // unparsable or outside int range (e.g. the int64 min/max strings that
 // Infinity/-Infinity fill values normalize to), instead of throwing like stoi.

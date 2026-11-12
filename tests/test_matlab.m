@@ -490,6 +490,70 @@ function test_matlab(mexDir)
     assert(strcmp(caught, 'zarr:zarrayError'), 'writing into incomplete metadata raised "%s", not zarr:zarrayError', caught);
     fprintf('PASS  errors\n');
 
+    % Options as any class gives them: sparse and uuid as logicals (1 byte, which the mex files read as an
+    % 8-byte double before) or numbers of any class, and bbox, chunks and shape in integer classes or single
+    % (read as doubles before: garbage); other values are refused
+    z = zeros(32, 32, 10, 'uint16');
+    nChunks = @(f) sum(~cellfun(@isempty, regexp({dir(f).name}, '^\d+\.\d+\.\d+$', 'once')));
+    vals = {false, 0, int8(0), single(0), true, 1, uint64(1), int32(-2)};
+    for k = 1:numel(vals)
+        fs = fullfile(tmp, sprintf('sparse_opt_%d.zarr', k));
+        parallelWriteZarr(fs, z, 'chunks', [16 16 5], 'dimension_separator', '.', 'sparse', vals{k});
+        assert(nChunks(fs) == 8*(k <= 4), '''sparse'', %s (%s) wrote %d chunk files', mat2str(vals{k}), class(vals{k}), nChunks(fs));
+        assert(isequal(parallelReadZarr(fs, 'sparse', vals{k}), z), '''sparse'', %s read mismatch', mat2str(vals{k}));
+        fu = fullfile(tmp, sprintf('uuid_opt_%d.zarr', k));
+        parallelWriteZarr(fu, a4, 'chunks', [8 8 8 8], 'uuid', vals{k});
+        assert(isequal(parallelReadZarr(fu), a4), '''uuid'', %s (%s) round-trip mismatch', mat2str(vals{k}), class(vals{k}));
+    end
+    bad = {'yes', [true false], [], {false}, 1i};
+    for k = 1:numel(bad)
+        for opt = {'sparse', 'uuid'}
+            caught = '';
+            try
+                parallelWriteZarr(fullfile(tmp, 'bad_opt.zarr'), z, opt{1}, bad{k});
+            catch e
+                caught = e.identifier;
+            end
+            assert(strcmp(caught, 'zarr:inputError'), '''%s'' given a %s (%d values) was accepted (%s)', opt{1}, class(bad{k}), numel(bad{k}), caught);
+        end
+        caught = '';
+        try
+            parallelReadZarr(fullfile(tmp, 'sparse_opt_1.zarr'), 'sparse', bad{k});
+        catch e
+            caught = e.identifier;
+        end
+        assert(strcmp(caught, 'zarr:inputError'), 'reading with ''sparse'' given a %s (%d values) was accepted (%s)', class(bad{k}), numel(bad{k}), caught);
+    end
+    fv = fullfile(tmp, 'vector_opts.zarr');
+    parallelWriteZarr(fv, a4, 'chunks', [8 8 8 8]);
+    box = [2 3 4 5 7 9 11 13];
+    for cls = {'int32', 'uint64', 'single', 'uint16', 'int8'}
+        b = cast(box, cls{1});
+        assert(isequal(parallelReadZarr(fv, 'bbox', b), a4(2:7, 3:9, 4:11, 5:13)), 'bbox as %s mismatch', cls{1});
+        fw = fullfile(tmp, ['vector_opts_' cls{1} '.zarr']);
+        parallelWriteZarr(fw, a4, 'chunks', cast([8 4 8 16], cls{1}));
+        meta = jsondecode(fileread(fullfile(fw, '.zarray')));
+        assert(isequal(meta.chunks(:)', [8 4 8 16]) && isequal(parallelReadZarr(fw), a4), 'chunks as %s mismatch', cls{1});
+        parallelWriteZarr(fw, a4(2:7, 3:9, 4:11, 5:13) + 1, 'bbox', b);
+        w = a4;
+        w(2:7, 3:9, 4:11, 5:13) = a4(2:7, 3:9, 4:11, 5:13) + 1;
+        assert(isequal(parallelReadZarr(fw), w), 'writing with bbox as %s mismatch', cls{1});
+        fc2 = fullfile(tmp, ['created_' cls{1} '.zarr']);
+        shp = [40 24 18];
+        createZarrFile(fc2, 'shape', cast(shp, cls{1}), 'dtype', '<u2', 'chunks', cast([16 16 16], cls{1}));
+        z2 = parallelReadZarr(fc2);
+        meta = jsondecode(fileread(fullfile(fc2, '.zarray')));
+        assert(isequal(size(z2), shp) && ~any(z2(:)) && isequal(meta.chunks(:)', [16 16 16]), 'createZarrFile with %s options mismatch', cls{1});
+    end
+    caught = '';
+    try
+        parallelReadZarr(fv, 'bbox', 'abcdefgh');
+    catch e
+        caught = e.identifier;
+    end
+    assert(strcmp(caught, 'zarr:inputError'), 'a bbox of characters was accepted (%s)', caught);
+    fprintf('PASS  options of any class\n');
+
     % clear mex frees the buffers reads and writes keep between calls (writes keep those of
     % chunks over 1 MB; on Linux the library itself stays loaded): reads and writes after it
     % give the same data

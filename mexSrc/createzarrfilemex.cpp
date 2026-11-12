@@ -36,7 +36,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         std::string currInput = mxArrayToString(prhs[i]);
 
         if(currInput == "chunks"){
-            chunksVals = mexVector(prhs[i+1]);
+            chunksVals = mexVector(prhs[i+1], "chunks");
             hasChunks = true;
         }
         else if(currInput == "cname"){
@@ -58,7 +58,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             zarrFormat = mexZarrFormat(prhs[i+1]);
         }
         else if(currInput == "shape"){
-            const std::vector<uint64_t> shape = mexVector(prhs[i+1]);
+            const std::vector<uint64_t> shape = mexVector(prhs[i+1], "shape");
             // An empty shape is a 0-dimensional array (a single element)
             Zarr.set_shape(shape);
         }
@@ -66,11 +66,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
             Zarr.set_clevel(mexClevel(prhs[i+1]));
         }
         else if(currInput == "subfolders"){
-            subfoldersVals = mexVector(prhs[i+1]);
+            subfoldersVals = mexVector(prhs[i+1], "subfolders");
             hasSubfolders = true;
         }
         else if(currInput == "chunk_shape"){
-            chunkShapeVals = mexVector(prhs[i+1]);
+            chunkShapeVals = mexVector(prhs[i+1], "chunk_shape");
             hasChunkShape = true;
         }
         else{

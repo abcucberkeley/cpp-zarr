@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11_gpu_available, pybind11_gpu_set_cufile, pybind11_gpu_set_nvcomp,
                       pybind11_last_read_times, pybind11_on_network, pybind11_open_zarrs, pybind11_read_times_available,
                       pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_read_zarr_opened, pybind11_region_info,
-                      pybind11_release_buffers, pybind11_write_zarr, pybind11_write_zarr_gpu)
+                      pybind11_release_buffers, pybind11_write_zarr, pybind11_write_zarr_gpu, pybind11_create_zarr,
+                      pybind11_convert_values)
 
 
 def _default_chunks(ndim):
@@ -172,16 +173,6 @@ def _gpu_dtype_name(a):
     if type(a).__module__.split('.')[0] == 'torch':
         return str(a.dtype).replace('torch.', '')
     return np.dtype(a.dtype).name
-
-
-def _gpu_astype(a, dtype):
-    # GPU data converted on the GPU to the NumPy data type dtype (PyTorch tensors and CuPy arrays)
-    if type(a).__module__.split('.')[0] == 'torch':
-        import torch
-        return a.to(getattr(torch, dtype.name))
-    if hasattr(a, 'astype'):
-        return a.astype(dtype)
-    raise Exception(f'The GPU data is {_gpu_dtype_name(a)}, not the array\'s {dtype.name}: convert it first')
 
 
 def _gpu_ready(a):
@@ -855,8 +846,98 @@ def _existing_format(file_name):
     return None
 
 
+def _typestr(dt):
+    # A NumPy data type as cpp-zarr names it ('|b1', '<u2', ..., and ml_dtypes' 'bfloat16')
+    dt = np.dtype(dt)
+    if dt.name == 'bfloat16':
+        return 'bfloat16'
+    if dt.kind == 'b':
+        return '|b1'
+    if dt.kind in 'iufc':
+        return '<' + dt.kind + str(dt.itemsize)
+    raise Exception(f'Unsupported data type: {dt}')
+
+
+def _gpu_to_host(a):
+    # GPU data copied into host memory as a NumPy array (PyTorch's bfloat16 as float32, which holds its values
+    # exactly)
+    if type(a).__module__.split('.')[0] == 'torch':
+        import torch
+        t = a.detach()
+        if t.dtype == torch.bfloat16:
+            t = t.float()
+        return t.cpu().numpy()
+    if hasattr(a, 'get'):
+        return a.get()
+    import cupy
+    return cupy.asarray(a).get()
+
+
+def _convert_values(data, dtype, num_threads=None):
+    # Host data converted to the data type dtype as MATLAB converts between classes, as the MATLAB writer converts
+    # the data it writes into an array of another type: into integer types rounded to the nearest integer (halves
+    # away from zero) and saturated at the type's limits, NaN to 0 (NumPy's astype truncates and wraps around);
+    # into bool any nonzero value true; into floating point types rounded to the nearest value. Complex data goes
+    # only into complex arrays. (In cpp-zarr, with the call's threads.)
+    data = np.asarray(data)
+    if data.dtype.kind == 'c':
+        if dtype.kind != 'c':
+            raise Exception(f'Complex data can only be written into complex64 or complex128 arrays, not {dtype.name}')
+        return data.astype(dtype)
+    if data.dtype.name in ('float16', 'bfloat16'):
+        data = data.astype(np.float32)   # (exactly)
+    elif data.dtype.kind not in 'biuf':
+        raise Exception(f'Data of the type {data.dtype} cannot be written into an array of {dtype.name}')
+    if not data.dtype.isnative:
+        data = data.astype(data.dtype.newbyteorder('='))
+    if not (data.flags['C_CONTIGUOUS'] or data.flags['F_CONTIGUOUS']):
+        data = np.ascontiguousarray(data)
+    out = pybind11_convert_values(data, _typestr(dtype), _threads(num_threads))
+    return out.view(dtype) if dtype.name == 'bfloat16' else out
+
+
+def create_zarr(file_name, shape, dtype, chunks=None, cname='zstd', clevel=1, order=None, dimension_separator=None,
+                zarr_format=None, shards=None):
+    # Writes only the metadata (.zarray or zarr.json) of a new array of this shape and data type (a NumPy data type
+    # or its name; bfloat16 needs ml_dtypes), as write_zarr makes it for data of that shape and type, and no chunks:
+    # regions written into it later (write_zarr with start_coords and end_coords) fill it, and what is never written
+    # reads as zeros. The options, and their defaults, are write_zarr's. Chunk files already at file_name are left
+    # as they are.
+    if zarr_format not in (None, 2, 3):
+        raise Exception(f'zarr_format must be 2 or 3, not {zarr_format!r}')
+    zarr_format = zarr_format or _existing_format(file_name) or 2
+    if shards is not None and zarr_format != 3:
+        raise Exception('shards needs zarr_format=3')
+    if order is None:
+        order = 'C' if zarr_format == 3 else 'F'
+    if dimension_separator is None:
+        dimension_separator = '/'
+    shape = [int(n) for n in shape]
+    ndim = len(shape)
+    if any(n < 0 for n in shape):
+        raise Exception(f'Invalid shape {shape}')
+    dt = _metadata_dtype({'dtype': dtype}) if isinstance(dtype, str) else np.dtype(dtype)
+    if dt is None:
+        raise Exception(f'Unsupported data type: {dtype}')
+    if chunks is None:
+        chunks = _default_chunks(ndim)
+    chunks = [int(c) for c in chunks]
+    if len(chunks) < ndim:
+        raise Exception(f'chunks has {len(chunks)} values but the array has {ndim} dimensions')
+    chunks = chunks[:ndim]
+    if shards is not None:
+        shards = [int(v) for v in shards]
+        if len(shards) < ndim:
+            raise Exception(f'shards has {len(shards)} values but the array has {ndim} dimensions')
+        shards = shards[:ndim]
+        if any(c <= 0 or v % c for v, c in zip(shards, chunks)):
+            raise Exception(f'shards {shards} must be a multiple of chunks {chunks} along each axis')
+    pybind11_create_zarr(file_name, shape, _typestr(dt), cname, clevel, order, chunks, dimension_separator, zarr_format,
+                         shards or [])
+
+
 def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd', clevel=1, order=None, chunks=None,
-               dimension_separator=None, zarr_format=None, shards=None, num_threads=None, stream=None):
+               dimension_separator=None, zarr_format=None, shards=None, num_threads=None, stream=None, uuid=True, sparse=True):
     # zarr_format: 2 or 3. By default the format of the array already at file_name,
     # or 2 for a new one. Zarr v3 arrays default to C order and chunk files named
     # c/0/0/0 (order='C', dimension_separator='/'), v2 ones to F order and chunk
@@ -872,6 +953,13 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
     # stream, where the work that made the data most likely went), done when this returns. The GPU compresses blosc's zstd and lz4 and the zstd codec at nvCOMP's one level
     # of each, whatever clevel says (the chunks decode the same, and are about as small as at clevel
     # 1); arrays of other compressors are written from a copy of the data in host memory.
+    # A region written into an existing array of another data type is converted to it as the MATLAB writer
+    # converts data (see _convert_values: integers rounded, halves away from zero, and saturated, NaN to 0),
+    # in host memory, and written from there (GPU data too).
+    # uuid: each chunk file is written under a unique temporary name and then renamed into place, so that a
+    # reader never sees a partly written file (False writes them in place: for a new array with one writer per
+    # chunk). sparse: chunks whose values are all zero are left out (and an existing file of one deleted), as
+    # missing chunks read as zeros; False writes them too.
     gpu = _cuda_data(data) is not None
     if gpu:
         _find_nvcomp()
@@ -901,9 +989,13 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
         dtype = _metadata_dtype(meta)
         if gpu:
             if dtype is not None and _gpu_dtype_name(data) != dtype.name:
-                data = _gpu_astype(data, dtype)
-        elif dtype is not None and data.dtype != dtype:
-            data = np.asarray(data).astype(dtype)
+                # (converted in host memory and written from there, as the MATLAB writer converts GPU data of
+                # another class; the data is waited for on its stream first)
+                if stream is not None and hasattr(stream, 'synchronize'):
+                    stream.synchronize()
+                data, gpu = _convert_values(_gpu_to_host(data), dtype, num_threads), False
+        elif dtype is not None and np.asarray(data).dtype != dtype:
+            data = _convert_values(data, dtype, num_threads)
     # (the writer takes data in this machine's byte order)
     if gpu:
         data = _gpu_ready(data)
@@ -940,7 +1032,7 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
         ptr, typestr, shape, strides = _cuda_data(data)
         pybind11_write_zarr_gpu(file_name, ptr, typestr, list(shape), list(strides), start_coords, end_coords, cname, clevel, order,
                                 chunks, dimension_separator, crop, zarr_format, shards or [], _threads(num_threads),
-                                _stream_handle(stream if stream is not None else _current_stream(data)))
+                                _stream_handle(stream if stream is not None else _current_stream(data)), bool(uuid), bool(sparse))
         return
     # The writer reads the array in place in any memory layout (C or F order, or a
     # strided view), so it is not converted. Only reversed or repeated axes
@@ -949,7 +1041,7 @@ def write_zarr(file_name, data, start_coords=None, end_coords=None, cname='zstd'
                                         for s, n in zip(data.strides, data.shape)):
         data = np.array(data, order='K')
     pybind11_write_zarr(file_name, data, start_coords, end_coords, cname, clevel, order, chunks, dimension_separator, crop,
-                        zarr_format, shards or [], _threads(num_threads))
+                        zarr_format, shards or [], _threads(num_threads), bool(uuid), bool(sparse))
     return
 
 

@@ -38,11 +38,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
             if(!mxGetN(prhs[i+1])) continue;
             // Interpreted once the array's number of dimensions is known
             bbox = true;
-            bboxVals = mexVector(prhs[i+1]);
+            bboxVals = mexVector(prhs[i+1], "bbox");
         
         }
         else if(currInput == "sparse"){
-            sparse = (bool)*((mxGetPr(prhs[i+1])));
+            sparse = mexBool(prhs[i+1], "sparse");
         }
         else if(currInput == "threads"){
             threads = mexThreads(prhs[i+1]);

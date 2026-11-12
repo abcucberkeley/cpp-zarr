@@ -93,6 +93,7 @@ im = cppzarr.read_zarr('filename.zarr', order='C')
 
 #### Write a Zarr file with specific metadata
 ````
+import numpy as np
 import cppzarr
 im = cppzarr.read_zarr('filename.zarr')
 
@@ -105,6 +106,20 @@ cppzarr.write_zarr('outputFilename.zarr', im, cname='zstd', clevel=1, order='F',
 # Zarr v3 with 1024x1024x1024 shards made of 256x256x256 chunks (shards must be a multiple of chunks).
 # Zarr v3 files default to order='C' and dimension_separator='/' (chunk files named c/0/0/0)
 cppzarr.write_zarr('outputFilename.zarr', im, zarr_format=3, cname='zstd', clevel=1, chunks=[256, 256, 256], shards=[1024, 1024, 1024])
+
+# Or create an array's metadata alone (with write_zarr's options), then write regions into it: what is
+# never written reads as zeros
+cppzarr.create_zarr('big.zarr', (4096, 4096, 2048), 'uint16', chunks=[256, 256, 256], zarr_format=3)
+cppzarr.write_zarr('big.zarr', im, start_coords=[0, 0, 0], end_coords=list(im.shape))
+
+# Data written into an array of another data type is converted as MATLAB converts between classes, as
+# the MATLAB writer converts it: to integers rounded (halves away from zero) and saturated, NaN to 0
+cppzarr.write_zarr('big.zarr', np.full((2, 2, 2), 70000.6), start_coords=[0, 0, 0], end_coords=[2, 2, 2])  # 65535
+
+# Chunks whose values are all zero are not written (they read back as zeros); sparse=False writes them.
+# uuid=False writes the chunk files in place instead of under temporary names (for a new array with one
+# writer per chunk)
+cppzarr.write_zarr('outputFilename.zarr', im, sparse=False, uuid=False)
 ````
 
 #### Data types
@@ -129,7 +144,7 @@ import cppzarr
 im = cppzarr.read_zarr('filename.zarr', num_threads=4)
 
 # Read a region into an existing array instead of a new one (of the region's shape and the
-# array's data type, C- or F-contiguous), such as one slot of a batch buffer
+# array's data type), such as one slot of a batch buffer
 batch = np.empty((8, 128, 128, 128), dtype=np.uint16)
 cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 

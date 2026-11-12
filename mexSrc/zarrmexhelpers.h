@@ -12,6 +12,7 @@
 #include "mex.h"
 #include "../src/helperfunctions.h"
 #include "../src/parallelwritezarr.h"
+#include "../src/convertvalues.h"
 
 // At clear mex (or when MATLAB exits), the buffers reads and writes keep between calls are
 // freed (releaseBuffers): on Linux the library itself stays loaded, as the unique symbols of
@@ -27,12 +28,31 @@ static inline void mexReleaseBuffersAtClear(){
 #endif
 }
 
-// Numeric vector argument (read as double, like mxGetPr)
-static std::vector<uint64_t> mexVector(const mxArray* a){
-    const size_t n = mxGetNumberOfElements(a);
-    std::vector<uint64_t> v(n);
-    const double* p = mxGetPr(a);
-    for(size_t i = 0; i < n; i++) v[i] = (uint64_t)p[i];
+// A numeric vector option (bbox, chunks, shape, ...): its values as whole numbers, each read in the array's
+// own class (read through mxGetPr as doubles, the values of an integer, single or logical array were garbage,
+// and those of a smaller class took the bytes after them along). An empty value of any class is no values.
+template <typename T> static void mexValuesOf(const mxArray* a, std::vector<uint64_t> &v){
+    const T* p = (const T*)mxGetData(a);
+    for(size_t i = 0; i < v.size(); i++) v[i] = (uint64_t)p[i];
+}
+static std::vector<uint64_t> mexVector(const mxArray* a, const char* name){
+    std::vector<uint64_t> v(mxGetNumberOfElements(a));
+    if(v.empty()) return v;
+    if(mxIsComplex(a)) mexErrMsgIdAndTxt("zarr:inputError","%s must be real numbers\n",name);
+    switch(mxGetClassID(a)){
+        case mxDOUBLE_CLASS: mexValuesOf<double>(a, v); break;
+        case mxSINGLE_CLASS: mexValuesOf<float>(a, v); break;
+        case mxINT8_CLASS:   mexValuesOf<int8_t>(a, v); break;
+        case mxUINT8_CLASS:  mexValuesOf<uint8_t>(a, v); break;
+        case mxINT16_CLASS:  mexValuesOf<int16_t>(a, v); break;
+        case mxUINT16_CLASS: mexValuesOf<uint16_t>(a, v); break;
+        case mxINT32_CLASS:  mexValuesOf<int32_t>(a, v); break;
+        case mxUINT32_CLASS: mexValuesOf<uint32_t>(a, v); break;
+        case mxINT64_CLASS:  mexValuesOf<int64_t>(a, v); break;
+        case mxUINT64_CLASS: mexValuesOf<uint64_t>(a, v); break;
+        case mxLOGICAL_CLASS: mexValuesOf<mxLogical>(a, v); break;
+        default: mexErrMsgIdAndTxt("zarr:inputError","%s must be numbers\n",name);
+    }
     return v;
 }
 
@@ -81,6 +101,16 @@ static std::string mexOrder(const mxArray* a){
     if(order == "C" || order == "c") return "C";
     mexErrMsgIdAndTxt("zarr:inputError","order must be \"F\" or \"C\"\n");
     return order;
+}
+
+// A true/false option: one logical, or one real number of any class (nonzero is true). (Read as a double
+// from the array's data, a 1-byte logical took its 7 neighboring bytes along, so that false could read true.)
+static bool mexBool(const mxArray* a, const char* name){
+    if(!(mxIsLogical(a) || (mxIsNumeric(a) && !mxIsComplex(a))) || mxGetNumberOfElements(a) != 1){
+        mexErrMsgIdAndTxt("zarr:inputError","%s must be true or false (one logical or number)\n",name);
+    }
+    if(mxIsLogical(a)) return mxGetLogicals(a)[0];
+    return mxGetScalar(a) != 0;
 }
 
 // The zarr_format option: 2 or 3
@@ -175,97 +205,6 @@ static std::string mexClassDtype(const mxArray* a){
     }
 }
 
-// MATLAB's conversions to an integer class: rounded to the nearest integer (halves
-// away from zero) and saturated at the class's limits, NaN to 0
-template <typename D> static inline D mexRoundToInt(const double v){
-    if(std::isnan(v)) return 0;
-    const double r = std::round(v);
-    if(r <= (double)std::numeric_limits<D>::min()) return std::numeric_limits<D>::min();
-    if(r >= (double)std::numeric_limits<D>::max()) return std::numeric_limits<D>::max();
-    return (D)r;
-}
-template <typename D> static inline D mexSignedToInt(const int64_t v){
-    if(std::numeric_limits<D>::is_signed){
-        if(v < (int64_t)std::numeric_limits<D>::min()) return std::numeric_limits<D>::min();
-        if(v > (int64_t)std::numeric_limits<D>::max()) return std::numeric_limits<D>::max();
-        return (D)v;
-    }
-    if(v < 0) return 0;
-    return (uint64_t)v > (uint64_t)std::numeric_limits<D>::max() ? std::numeric_limits<D>::max() : (D)v;
-}
-template <typename D> static inline D mexUnsignedToInt(const uint64_t v){
-    return v > (uint64_t)std::numeric_limits<D>::max() ? std::numeric_limits<D>::max() : (D)v;
-}
-template <typename S, typename D> static inline D mexToInt(const S v){
-    if(!std::numeric_limits<S>::is_integer) return mexRoundToInt<D>((double)v);
-    if(std::numeric_limits<S>::is_signed) return mexSignedToInt<D>((int64_t)v);
-    return mexUnsignedToInt<D>((uint64_t)v);
-}
-
-template <typename S, typename D>
-static void mexConvertInts(const S* re, const uint64_t stride, const int64_t n, void* out){
-    D* o = (D*)out;
-    #pragma omp parallel for
-    for(int64_t i = 0; i < n; i++) o[i] = mexToInt<S, D>(re[i*stride]);
-}
-
-// n elements (real parts re, imaginary parts im or NULL, stride elements apart)
-// converted to the data type t, as MATLAB converts between classes; any nonzero
-// value is true
-template <typename S>
-static void mexConvert(const S* re, const S* im, const uint64_t stride, const uint64_t n, const DtypeInfo &t, void* out){
-    const int64_t N = (int64_t)n;
-    if(t.kind == 'b'){
-        uint8_t* o = (uint8_t*)out;
-        #pragma omp parallel for
-        for(int64_t i = 0; i < N; i++) o[i] = re[i*stride] != 0 || (im && im[i*stride] != 0);
-    }
-    else if(t.kind == 'u'){
-        if(t.bytes == 1) mexConvertInts<S, uint8_t>(re, stride, N, out);
-        else if(t.bytes == 2) mexConvertInts<S, uint16_t>(re, stride, N, out);
-        else if(t.bytes == 4) mexConvertInts<S, uint32_t>(re, stride, N, out);
-        else mexConvertInts<S, uint64_t>(re, stride, N, out);
-    }
-    else if(t.kind == 'i'){
-        if(t.bytes == 1) mexConvertInts<S, int8_t>(re, stride, N, out);
-        else if(t.bytes == 2) mexConvertInts<S, int16_t>(re, stride, N, out);
-        else if(t.bytes == 4) mexConvertInts<S, int32_t>(re, stride, N, out);
-        else mexConvertInts<S, int64_t>(re, stride, N, out);
-    }
-    else if(t.kind == 'f' && t.bytes == 2){
-        uint16_t* o = (uint16_t*)out;
-        const bool bf = t.bfloat16;
-        #pragma omp parallel for
-        for(int64_t i = 0; i < N; i++) o[i] = bf ? floatToBfloat16((float)re[i*stride]) : doubleToHalf((double)re[i*stride]);
-    }
-    else if(t.kind == 'f' && t.bytes == 4){
-        float* o = (float*)out;
-        #pragma omp parallel for
-        for(int64_t i = 0; i < N; i++) o[i] = (float)re[i*stride];
-    }
-    else if(t.kind == 'f'){
-        double* o = (double*)out;
-        #pragma omp parallel for
-        for(int64_t i = 0; i < N; i++) o[i] = (double)re[i*stride];
-    }
-    else if(t.kind == 'c' && t.bytes == 8){
-        float* o = (float*)out;
-        #pragma omp parallel for
-        for(int64_t i = 0; i < N; i++){
-            o[2*i] = (float)re[i*stride];
-            o[2*i+1] = im ? (float)im[i*stride] : 0.0f;
-        }
-    }
-    else if(t.kind == 'c'){
-        double* o = (double*)out;
-        #pragma omp parallel for
-        for(int64_t i = 0; i < N; i++){
-            o[2*i] = (double)re[i*stride];
-            o[2*i+1] = im ? (double)im[i*stride] : 0.0;
-        }
-    }
-}
-
 template <typename S>
 static void mexConvertArray(const mxArray* a, const uint64_t n, const DtypeInfo &t, void* out){
     const S* re = (const S*)mxGetData(a);
@@ -280,7 +219,7 @@ static void mexConvertArray(const mxArray* a, const uint64_t n, const DtypeInfo 
         im = (const S*)mxGetImagData(a);
 #endif
     }
-    mexConvert<S>(re, im, stride, n, t, out);
+    czConvertValues<S>(re, im, stride, n, t, out);
 }
 
 // A MATLAB array's n elements as the data type (a malloc'd buffer the caller

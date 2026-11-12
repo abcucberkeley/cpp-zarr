@@ -1794,6 +1794,47 @@ int main(int argc, char** argv){
             }
             return ok;
         });
+
+        check("values converted between data types as MATLAB converts between classes (convertValues, for data written into "
+              "an array of another type): integers rounded to the nearest, halves away from zero, saturated, NaN to 0; any "
+              "nonzero value true; float16 directly from double and bfloat16 through float; only MATLAB's types as sources", [&](){
+            bool ok = true;
+            const double d[] = {2.5, -1, 70000, NAN, 65535.6, 0.5, -0.5, 1.5, -2.5, 0.49999999999999994, INFINITY, -INFINITY};
+            const uint16_t u16[] = {3, 0, 65535, 0, 65535, 1, 0, 2, 0, 0, 65535, 0};
+            const int8_t i8[] = {3, -1, 127, 0, 127, 1, -1, 2, -3, 0, 127, -128};
+            uint16_t ou[12];
+            int8_t oi[12];
+            ok = ok && convertValues(d, "<f8", ou, "<u2", 12) && memcmp(ou, u16, sizeof u16) == 0;
+            ok = ok && convertValues(d, "<f8", oi, "<i1", 12) && memcmp(oi, i8, sizeof i8) == 0;
+            // (the 64-bit limits)
+            const double big[] = {9.3e18, -9.3e18, 4611686018427387904.0, NAN};
+            const int64_t i64[] = {INT64_MAX, INT64_MIN, 4611686018427387904LL, 0};
+            int64_t o64[4];
+            ok = ok && convertValues(big, "<f8", o64, "<i8", 4) && memcmp(o64, i64, sizeof i64) == 0;
+            const uint64_t u64in[] = {UINT64_MAX, 9223372036854775808ULL, 5};
+            const int64_t u64to64[] = {INT64_MAX, INT64_MAX, 5};
+            ok = ok && convertValues(u64in, "<u8", o64, "<i8", 3) && memcmp(o64, u64to64, sizeof u64to64) == 0;
+            const int64_t i64in[] = {INT64_MIN, -1, 0, INT64_MAX};
+            const uint32_t to32[] = {0, 0, 0, UINT32_MAX};
+            uint32_t o32[4];
+            ok = ok && convertValues(i64in, "<i8", o32, "<u4", 4) && memcmp(o32, to32, sizeof to32) == 0;
+            // (bool, from floats, NaN being nonzero, and into floats)
+            const double bd[] = {0.0, -0.0, 0.1, NAN, -3};
+            const uint8_t bexp[] = {0, 0, 1, 1, 1};
+            uint8_t ob[5];
+            ok = ok && convertValues(bd, "<f8", ob, "|b1", 5) && memcmp(ob, bexp, 5) == 0;
+            const uint8_t bin[] = {1, 0};
+            float of[2];
+            ok = ok && convertValues(bin, "|b1", of, "<f4", 2) && of[0] == 1.0f && of[1] == 0.0f;
+            // (float16 from double directly: 65520 rounds to infinity; bfloat16 through float)
+            const double h[] = {1.0/3, 65520.0, -2.5};
+            uint16_t oh[3];
+            ok = ok && convertValues(h, "<f8", oh, "<f2", 3) && oh[0] == doubleToHalf(1.0/3) && oh[1] == 0x7c00 && oh[2] == 0xc100;
+            ok = ok && convertValues(h, "<f8", oh, "bfloat16", 3) && oh[0] == floatToBfloat16((float)(1.0/3)) && oh[2] == floatToBfloat16(-2.5f);
+            // (float16, bfloat16 and complex values are no sources: MATLAB has no class for them)
+            ok = ok && !convertValues(oh, "<f2", ou, "<u2", 3) && !convertValues(oh, "bfloat16", ou, "<u2", 3) && !convertValues(d, "<c8", ou, "<u2", 1);
+            return ok;
+        });
     }
 
     // How the reader hands out and decodes chunks, and how the writer adds inner chunks

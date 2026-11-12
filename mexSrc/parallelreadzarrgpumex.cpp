@@ -35,7 +35,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             if(!mxGetN(prhs[i+1])) continue;
             // Interpreted once the array's number of dimensions is known
             bbox = true;
-            bboxVals = mexVector(prhs[i+1]);
+            bboxVals = mexVector(prhs[i+1], "bbox");
         }
         else if(currInput == "sparse"){
             // (accepted as parallelReadZarr takes it: missing chunks always read as the fill value)

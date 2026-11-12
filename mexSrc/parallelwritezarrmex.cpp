@@ -132,13 +132,13 @@ void mexFunction(int nlhs, mxArray *plhs[],
         std::string currInput = mxArrayToString(prhs[i]);
 
         if(currInput == "uuid"){
-            useUuid = (bool)*((mxGetPr(prhs[i+1])));
+            useUuid = mexBool(prhs[i+1], "uuid");
         }
         else if(currInput == "bbox"){
             // Skip bbox if it is empty
             if(!mxGetN(prhs[i+1])) continue;
             // A region [starts ends], or one value per axis for the chunk size
-            bboxVals = mexVector(prhs[i+1]);
+            bboxVals = mexVector(prhs[i+1], "bbox");
         }
         else if(currInput == "cname"){
             if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","cname must be a string\n");
@@ -150,19 +150,19 @@ void mexFunction(int nlhs, mxArray *plhs[],
             Zarr.set_clevel(mexClevel(prhs[i+1]));
         }
         else if(currInput == "subfolders"){
-            subfoldersVals = mexVector(prhs[i+1]);
+            subfoldersVals = mexVector(prhs[i+1], "subfolders");
             hasSubfolders = true;
         }
         else if(currInput == "chunks"){
-            chunksVals = mexVector(prhs[i+1]);
+            chunksVals = mexVector(prhs[i+1], "chunks");
             hasChunks = true;
         }
         else if(currInput == "chunk_shape"){
-            chunkShapeVals = mexVector(prhs[i+1]);
+            chunkShapeVals = mexVector(prhs[i+1], "chunk_shape");
             hasChunkShape = true;
         }
         else if(currInput == "sparse"){
-            sparse = (bool)*((mxGetPr(prhs[i+1])));
+            sparse = mexBool(prhs[i+1], "sparse");
         }
         else if(currInput == "dimension_separator"){
             if(!mxIsChar(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","dimension_separator must be a string\n");

@@ -95,6 +95,31 @@ def values_like(rng, a):
     return np.asarray(rng.integers(max(info.min, -10**6), min(info.max, 10**6), size=a.shape, endpoint=True), dtype=a.dtype)
 
 
+def matlab_cast(a, dt):
+    # MATLAB's conversion between classes, the reference for write_zarr's into an array of another type (written
+    # here with NumPy alone): into integers rounded to the nearest, halves away from zero, saturated at the type's
+    # limits, NaN to 0; into bool any nonzero value (NaN too) true; into float16 directly from double and into
+    # bfloat16 through float32; otherwise as NumPy converts
+    dt, a = np.dtype(dt), np.asarray(a)
+    if dt.kind in 'iu':
+        info = np.iinfo(dt)
+        if a.dtype.kind in 'biu':
+            return np.array([min(max(int(v), info.min), info.max) for v in a.ravel()], dt).reshape(a.shape)
+        x = a.astype(np.float64)
+        r = np.where(np.abs(x - np.trunc(x)) == 0.5, np.trunc(x) + np.sign(x), np.round(x))
+        out = np.zeros(a.shape, dt)
+        hi, lo = r >= float(info.max), r <= float(info.min)
+        mid = ~(hi | lo | np.isnan(r))
+        out[mid] = r[mid].astype(dt)
+        out[hi], out[lo] = info.max, info.min
+        return out
+    if dt.kind == 'b':
+        return a != 0 if a.dtype.kind != 'f' else (a != 0) | np.isnan(a)
+    if is_bfloat16(dt):
+        return a.astype(np.float32).astype(dt)
+    return a.astype(np.float64).astype(dt) if a.dtype.kind != 'c' else a.astype(dt)
+
+
 def main():
     rng = np.random.default_rng(1234567)
     shape = (40, 24, 18)  # d0, d1, d2 (non-chunk-aligned -> exercises partial chunks)
@@ -370,7 +395,7 @@ def main():
     ok = ok and good
 
     # Writing a region into an existing array converts the data to the array's type,
-    # as the MATLAB writer does; data in the other byte order is written correctly
+    # as the MATLAB writer does (matlab_cast); data in the other byte order is written correctly
     good = True
     for zf, atype, dtype in [(2, np.uint16, np.float32), (3, np.float32, np.int64), (3, np.uint8, np.int32),
                              (3, np.int16, np.dtype('>i2')), (2, np.float64, np.dtype('>f4')),
@@ -384,7 +409,7 @@ def main():
         patch = (rng.random((10, 9, 8)) * 200).astype(dtype)
         cppzarr.write_zarr(path, patch, start_coords=[3, 5, 7], end_coords=[13, 14, 15])
         exp = base.copy()
-        exp[3:13, 5:14, 7:15] = patch.astype(atype)
+        exp[3:13, 5:14, 7:15] = matlab_cast(patch, atype)
         back = cppzarr.read_zarr(path)
         good = good and back.dtype == np.dtype(atype) and np.array_equal(back, exp) and same(zarr_read(path), exp)
     for dtype in ('>u2', '>i4', '>f8'):
@@ -401,6 +426,127 @@ def main():
     except Exception as e:
         good = good and 'does not match' in str(e)
     print(f"data converted to the array's type  {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
+    # The conversion's edge cases, through region writes, as the MATLAB writer converts them (rounding halves away
+    # from zero, and 0.49999999999999994 to 0; saturating, also at the 64-bit limits; NaN to 0; any nonzero value
+    # true), from strided views and F-order data too; complex data refused for real arrays
+    good, bad = True, []
+    third = 1 / 3
+    cases = [(np.uint16, np.array([2.5, -1, 70000, np.nan, 65535.6, 0.5, -0.5, 1.5, -2.5, 0.49999999999999994, np.inf, -np.inf]),
+              [3, 0, 65535, 0, 65535, 1, 0, 2, 0, 0, 65535, 0]),
+             (np.int8, np.array([2.5, -1, 70000, np.nan, 65535.6, 0.5, -0.5, 1.5, -2.5, 0.49999999999999994, -129.5, 126.5]),
+              [3, -1, 127, 0, 127, 1, -1, 2, -3, 0, -128, 127]),
+             (np.int64, np.array([9.3e18, -9.3e18, 2.0 ** 62, np.nan, np.inf, -np.inf, 4611686018427387904.5, -2.5]),
+              [2 ** 63 - 1, -2 ** 63, 2 ** 62, 0, 2 ** 63 - 1, -2 ** 63, 2 ** 62, -3]),
+             (np.uint64, np.array([1.9e19, -1.0, 2.0 ** 63, 0.5, 1.8446744073709552e19]), [2 ** 64 - 1, 0, 2 ** 63, 1, 2 ** 64 - 1]),
+             (np.int8, np.array([-2 ** 63, -1, 0, 2 ** 63 - 1], np.int64), [-128, -1, 0, 127]),
+             (np.uint32, np.array([-2 ** 63, -1, 0, 2 ** 63 - 1], np.int64), [0, 0, 0, 2 ** 32 - 1]),
+             (np.int64, np.array([2 ** 64 - 1, 2 ** 63, 5], np.uint64), [2 ** 63 - 1, 2 ** 63 - 1, 5]),
+             (np.int16, np.array([2 ** 64 - 1, 2 ** 63, 5], np.uint64), [32767, 32767, 5]),
+             (np.int32, np.array([1.5, 2.5, -1.5, 3.4e38, -3.4e38], np.float32), [2, 3, -2, 2 ** 31 - 1, -2 ** 31]),
+             (np.uint8, np.array([1.5, 300, -7, 254.5], np.float16), [2, 255, 0, 255]),
+             (np.bool_, np.array([0.0, -0.0, 0.1, np.nan, -3]), [False, False, True, True, True]),
+             (np.float32, np.array([True, False]), [1.0, 0.0]),
+             (np.float16, np.array([third, 65520.0, 1e-8, -2.5]), np.array([third, 65520.0, 1e-8, -2.5]).astype(np.float16)),
+             (np.float32, np.array([third, 1e300]), np.array([third, 1e300]).astype(np.float32))]
+    if ml_dtypes is not None:
+        bf = np.dtype(ml_dtypes.bfloat16)
+        cases.append((bf, np.array([third, 1.00390625, -3.0e38]), np.array([third, 1.00390625, -3.0e38]).astype(np.float32).astype(bf)))
+    for k, (atype, vals, want) in enumerate(cases):
+        want = np.asarray(want, dtype=atype)
+        n = len(vals)
+        path = os.path.join(tmp, f"cast_{k}.zarr")
+        cppzarr.write_zarr(path, np.zeros((n, 3), atype), chunks=[4, 2], zarr_format=2 + k % 2)
+        src = np.stack([vals, vals[::-1], vals], axis=1)
+        if k % 3 == 1:
+            src = np.asfortranarray(src)
+        elif k % 3 == 2:
+            src = np.stack([vals, vals * 0, vals[::-1], vals * 0, vals], axis=1)[:, ::2]   # (a strided view)
+        cppzarr.write_zarr(path, src, start_coords=[0, 0], end_coords=[n, src.shape[1]])
+        back = cppzarr.read_zarr(path)
+        exp = np.stack([want, want[::-1], want], axis=1)
+        good_k = back.dtype == np.dtype(atype) and back.tobytes(order='C') == exp.tobytes(order='C') \
+            and np.array_equal(back, matlab_cast(src, atype), equal_nan=back.dtype.kind == 'f')
+        if not good_k:
+            bad.append(f'{np.dtype(atype).name} from {vals.dtype.name}: {back[:, 0].tolist()} (want {want.tolist()})')
+        good = good and good_k
+    try:
+        path = os.path.join(tmp, "cast_complex.zarr")
+        cppzarr.write_zarr(path, np.zeros((4, 4), np.uint16), chunks=[4, 4])
+        cppzarr.write_zarr(path, np.ones((2, 2), np.complex64), start_coords=[0, 0], end_coords=[2, 2])
+        good = False
+        bad.append('complex data written into a uint16 array')
+    except Exception as e:
+        good = good and 'complex' in str(e)
+    print(f"values converted as MATLAB converts them  {'OK' if good else 'FAIL'}" + ('' if good else f" ({'; '.join(bad)})"))
+    ok = ok and good
+
+    # sparse: by default all-zero chunks are not written (and an existing file of one is deleted); with
+    # sparse=False they are, as the MATLAB writer's 'sparse', false writes them. uuid=False writes the same files
+    # (in place, without temporary names)
+    def chunk_count(p):
+        return sum(len([f for f in fs if f not in ('.zarray', 'zarr.json', '.zattrs')]) for _, _, fs in os.walk(p))
+    good = True
+    for zf, sep in ((2, '.'), (3, '/')):
+        z = np.zeros((32, 32, 10), np.uint16, order='F')
+        ps, pf = os.path.join(tmp, f"sparse_v{zf}.zarr"), os.path.join(tmp, f"nonsparse_v{zf}.zarr")
+        cppzarr.write_zarr(ps, z, order='F', chunks=[16, 16, 5], dimension_separator=sep, zarr_format=zf)
+        cppzarr.write_zarr(pf, z, order='F', chunks=[16, 16, 5], dimension_separator=sep, zarr_format=zf, sparse=False)
+        good = good and chunk_count(ps) == 0 and chunk_count(pf) == 8 and np.array_equal(cppzarr.read_zarr(pf), z) \
+            and np.array_equal(cppzarr.read_zarr(ps), z) and same(zarr_read(pf), z)
+        # a region of zeros over a chunk with values: its file deleted, or kept and written with zeros
+        d = rng.integers(1, 100, size=(32, 32, 10)).astype(np.uint16)
+        for p, sp, files in ((ps, True, 7), (pf, False, 8)):
+            cppzarr.write_zarr(p, d, order='F', chunks=[16, 16, 5], dimension_separator=sep, zarr_format=zf, sparse=sp)
+            cppzarr.write_zarr(p, np.zeros((16, 16, 5), np.uint16), start_coords=[0, 0, 0], end_coords=[16, 16, 5], sparse=sp)
+            exp = d.copy()
+            exp[:16, :16, :5] = 0
+            good = good and chunk_count(p) == files and np.array_equal(cppzarr.read_zarr(p), exp)
+    d = rng.integers(0, 1000, size=(40, 24, 18)).astype(np.uint16)
+    pu, pn = os.path.join(tmp, "with_uuid.zarr"), os.path.join(tmp, "no_uuid.zarr")
+    for p, u in ((pu, True), (pn, False)):
+        cppzarr.write_zarr(p, d, chunks=[16, 16, 16], uuid=u, zarr_format=3, shards=[32, 32, 32])
+        cppzarr.write_zarr(p, d[:5, :5, :5][::-1].copy(), start_coords=[2, 2, 2], end_coords=[7, 7, 7], uuid=u)
+    files = lambda p: sorted((os.path.relpath(os.path.join(r, f), p), open(os.path.join(r, f), 'rb').read())
+                             for r, _, fs in os.walk(p) for f in fs)
+    good = good and files(pu) == files(pn) and np.array_equal(cppzarr.read_zarr(pn), cppzarr.read_zarr(pu))
+    print(f"sparse=False writes all-zero chunks, uuid=False the same files  {'OK' if good else 'FAIL'}")
+    ok = ok and good
+
+    # create_zarr: the metadata write_zarr writes for data of that shape and type, and no chunk files; the array
+    # reads as zeros and regions written into it fill it; shards need Zarr v3
+    good, bad = True, []
+    combos = [dict(), dict(zarr_format=3), dict(zarr_format=3, shards=[32, 32, 16], chunks=[16, 16, 8]),
+              dict(order='C', dimension_separator='.', cname='lz4', clevel=5, chunks=[8, 16, 4]),
+              dict(zarr_format=3, order='F', cname='zlib', chunks=[40, 24, 18])]
+    for k, opts in enumerate(combos):
+        for dt in [np.uint16, np.float32, np.bool_, np.int8, np.complex64] + ([ml_dtypes.bfloat16] if ml_dtypes is not None else []):
+            name = np.dtype(dt).name
+            pc, pw = os.path.join(tmp, f"created_{k}_{name}.zarr"), os.path.join(tmp, f"written_{k}_{name}.zarr")
+            cppzarr.create_zarr(pc, (40, 24, 18), dt if k % 2 else name, **opts)
+            cppzarr.write_zarr(pw, np.zeros((40, 24, 18), dt), **opts)
+            meta = '.zarray' if os.path.isfile(os.path.join(pw, '.zarray')) else 'zarr.json'
+            same_meta = load_json(os.path.join(pc, meta)) == load_json(os.path.join(pw, meta))
+            empty = chunk_count(pc) == 0 and np.array_equal(cppzarr.read_zarr(pc), np.zeros((40, 24, 18), dt))
+            part = values_like(rng, np.zeros((7, 9, 5), dt))
+            cppzarr.write_zarr(pc, part, start_coords=[3, 4, 5], end_coords=[10, 13, 10])
+            exp = np.zeros((40, 24, 18), dt)
+            exp[3:10, 4:13, 5:10] = part
+            filled = np.array_equal(cppzarr.read_zarr(pc), exp)
+            if not (same_meta and empty and filled):
+                bad.append(f'{k} {name}: metadata {same_meta}, empty {empty}, filled {filled}')
+            good = good and same_meta and empty and filled
+    for args, kw, words in [((os.path.join(tmp, 'cz_bad1.zarr'), (8, 8), 'uint16'), dict(shards=[8, 8], zarr_format=2), 'zarr_format=3'),
+                            ((os.path.join(tmp, 'cz_bad2.zarr'), (8, 8), 'float128'), {}, 'data type'),
+                            ((os.path.join(tmp, 'cz_bad3.zarr'), (8, 8), 'uint16'), dict(chunks=[4]), 'chunks')]:
+        try:
+            cppzarr.create_zarr(*args, **kw)
+            good = False
+            bad.append(f'{args[0]} not refused')
+        except Exception as e:
+            good = good and (words in str(e) or 'Unsupported' in str(e))
+    print(f"create_zarr  {'OK' if good else 'FAIL'}" + ('' if good else f" ({'; '.join(bad)})"))
     ok = ok and good
 
     # The format of an existing array is kept: writes default to it, a crop write
@@ -1067,17 +1213,21 @@ def test_gpu_write(tmp, rng, libs):
             if a.dtype != b.dtype or a.tobytes() != b.tobytes() or chunk_files(pc) != chunk_files(pg):
                 good = False
                 print('  GPU write differs from the host write:', lib, pg)
-    # regions of other data converted to the array's data type on the GPU (floats into uint16)
+    # regions of other data converted to the array's data type (floats into uint16, with halves and values past
+    # its limits), as host data is: as MATLAB converts (matlab_cast), in host memory, then written from there
     for lib in libs:
         pc, pg = os.path.join(tmp, f'gw_conv_{lib}_cpu.zarr'), os.path.join(tmp, f'gw_conv_{lib}_gpu.zarr')
         data = rng.integers(0, 1000, shape).astype(np.uint16)
         part = (rng.random((20, 20, 10)) * 999).astype(np.float32)
+        part[0, 0, :4] = [2.5, -1.5, 70000, 0.5]
         cppzarr.write_zarr(pc, data, zarr_format=3)
         cppzarr.write_zarr(pg, to_gpu(lib, data, 0), zarr_format=3)
         cppzarr.write_zarr(pc, part, [5, 5, 5], [25, 25, 15])
         cppzarr.write_zarr(pg, to_gpu(lib, part, 0), [5, 5, 5], [25, 25, 15])
         n += 1
-        if cppzarr.read_zarr(pc).tobytes() != cppzarr.read_zarr(pg).tobytes():
+        exp = data.copy()
+        exp[5:25, 5:25, 5:15] = matlab_cast(part, np.uint16)
+        if cppzarr.read_zarr(pc).tobytes() != cppzarr.read_zarr(pg).tobytes() or not np.array_equal(cppzarr.read_zarr(pg), exp):
             good = False
             print('  GPU write of data converted to the array\'s data type differs:', lib)
     # on a PyTorch stream, data made on it

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include "helperfunctions.h"
+#include "convertvalues.h"
 #include "parallelwork.h"
 #include "zarr.h"
 
@@ -244,6 +245,24 @@ uint16_t floatToHalf(float v){
     if((fSig & 0x00003fffu) != 0x00001000u) fSig += 0x00001000u;
     // (a carry out of the significand increments the exponent, up to infinity)
     return (uint16_t)(sign+hExp+(uint16_t)(fSig >> 13));
+}
+
+bool convertValues(const void* src, const std::string &srcDtype, void* dst, const std::string &dstDtype, const uint64_t n){
+    const DtypeInfo s = dtypeInfo(srcDtype), t = dtypeInfo(dstDtype);
+    if(!s.kind || !t.kind || s.bigEndian || t.bigEndian) return false;
+    if(s.kind == 'b' && s.bytes == 1) czConvertValues((const uint8_t*)src, (const uint8_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 1) czConvertValues((const uint8_t*)src, (const uint8_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 2) czConvertValues((const uint16_t*)src, (const uint16_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 4) czConvertValues((const uint32_t*)src, (const uint32_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 8) czConvertValues((const uint64_t*)src, (const uint64_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 1) czConvertValues((const int8_t*)src, (const int8_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 2) czConvertValues((const int16_t*)src, (const int16_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 4) czConvertValues((const int32_t*)src, (const int32_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 8) czConvertValues((const int64_t*)src, (const int64_t*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'f' && s.bytes == 4 && !s.bfloat16) czConvertValues((const float*)src, (const float*)nullptr, 1, n, t, dst);
+    else if(s.kind == 'f' && s.bytes == 8) czConvertValues((const double*)src, (const double*)nullptr, 1, n, t, dst);
+    else return false;
+    return true;
 }
 
 // Double to float16 directly, as NumPy converts (npy_doublebits_to_halfbits), with
