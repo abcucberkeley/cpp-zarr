@@ -565,6 +565,51 @@ template <> struct CzBlockTranspose<16> {
     static const bool available = false;
     static inline void run(const uint8_t*, const uint64_t, uint8_t*, const uint64_t){}
 };
+
+// The even and the odd G-byte lanes of the 32 bytes of a and b.
+template <int G> static inline czV16u8 czEven(czV16u8 a, czV16u8 b);
+template <int G> static inline czV16u8 czOdd(czV16u8 a, czV16u8 b);
+template <> inline czV16u8 czEven<1>(czV16u8 a, czV16u8 b){ return __builtin_shufflevector(a, b, 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30); }
+template <> inline czV16u8 czOdd<1>(czV16u8 a, czV16u8 b){ return __builtin_shufflevector(a, b, 1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31); }
+template <> inline czV16u8 czEven<2>(czV16u8 a, czV16u8 b){ return (czV16u8)__builtin_shufflevector((czV8u16)a, (czV8u16)b, 0,2,4,6,8,10,12,14); }
+template <> inline czV16u8 czOdd<2>(czV16u8 a, czV16u8 b){ return (czV16u8)__builtin_shufflevector((czV8u16)a, (czV8u16)b, 1,3,5,7,9,11,13,15); }
+template <> inline czV16u8 czEven<4>(czV16u8 a, czV16u8 b){ return (czV16u8)__builtin_shufflevector((czV4u32)a, (czV4u32)b, 0,2,4,6); }
+template <> inline czV16u8 czOdd<4>(czV16u8 a, czV16u8 b){ return (czV16u8)__builtin_shufflevector((czV4u32)a, (czV4u32)b, 1,3,5,7); }
+template <> inline czV16u8 czEven<8>(czV16u8 a, czV16u8 b){ return (czV16u8)__builtin_shufflevector((czV2u64)a, (czV2u64)b, 0,2); }
+template <> inline czV16u8 czOdd<8>(czV16u8 a, czV16u8 b){ return (czV16u8)__builtin_shufflevector((czV2u64)a, (czV2u64)b, 1,3); }
+
+// Two rows of n elements of SZ bytes into one, side by side (zip), and one such row back into two (unzip), a
+// register at a time: the elements done (the rest are left to the caller). 16-byte elements are left whole.
+template <int SZ> struct CzPairs {
+    static inline uint64_t zip(const uint8_t* a, const uint8_t* b, uint8_t* d, const uint64_t n){
+        uint64_t k = 0;
+        for(; k+16/SZ <= n; k += 16/SZ){
+            czV16u8 x, y;
+            memcpy(&x, a+k*SZ, 16);
+            memcpy(&y, b+k*SZ, 16);
+            const czV16u8 lo = czUnpLo<SZ>(x, y), hi = czUnpHi<SZ>(x, y);
+            memcpy(d+2*k*SZ, &lo, 16);
+            memcpy(d+2*k*SZ+16, &hi, 16);
+        }
+        return k;
+    }
+    static inline uint64_t unzip(const uint8_t* s, uint8_t* a, uint8_t* b, const uint64_t n){
+        uint64_t i = 0;
+        for(; i+16/SZ <= n; i += 16/SZ){
+            czV16u8 x, y;
+            memcpy(&x, s+2*i*SZ, 16);
+            memcpy(&y, s+2*i*SZ+16, 16);
+            const czV16u8 e = czEven<SZ>(x, y), o = czOdd<SZ>(x, y);
+            memcpy(a+i*SZ, &e, 16);
+            memcpy(b+i*SZ, &o, 16);
+        }
+        return i;
+    }
+};
+template <> struct CzPairs<16> {
+    static inline uint64_t zip(const uint8_t*, const uint8_t*, uint8_t*, const uint64_t){ return 0; }
+    static inline uint64_t unzip(const uint8_t*, uint8_t*, uint8_t*, const uint64_t){ return 0; }
+};
 #endif
 
 // A 16-byte element (complex128), moved as a whole
@@ -585,6 +630,43 @@ static void copyBoxTiled(const T* __restrict src, T* __restrict dst,
     // Chunk strides are usually powers of two, which map a tile's rows onto the
     // same cache sets; working on them directly makes the rows evict each other.
     if(s2 == 1 && d0 == 1){
+        // A few elements along i (n0 at most 8, such as an image's channels) that go side by side: the
+        // destination's rows are n0 x n2 elements, contiguous (element (i, k) at k*n0 + i), each n0 rows of the
+        // source interleaved, as reads of arrays whose chunks keep the channels apart need (TZYXC arrays with
+        // Zarr v3's transpose codec storing their chunks as TCZYX); and the reverse, n2 at most 8 elements along
+        // k, for writes of them. Through the tiles, every tile was a partial one, copied an element at a time:
+        // warm reads of TZYXC arrays stored so (2 channels, chunks of 32^3 and 64^3) on 16 cores of a 24-core
+        // node took 1.32-1.42 times as long as of the same arrays stored as TZYXC chunks for whole windows of
+        // 16 time points and 1.35-1.42 times for single time points (1.36-1.43 times with one thread), and
+        // writes of them 1.41-1.48 times as long
+        if(n0 <= 8 && d2 == n0){
+            for(uint64_t j = 0; j < n1; j++){
+                const T* sj = src + j*s1;
+                T* dj = dst + j*d1;
+                uint64_t k = 0;
+#ifdef CPPZARR_VECTOR_TRANSPOSE
+                if(n0 == 2) k = CzPairs<sizeof(T)>::zip((const uint8_t*)sj, (const uint8_t*)(sj+s0), (uint8_t*)dj, n2);
+#endif
+                for(; k < n2; k++){
+                    for(uint64_t i = 0; i < n0; i++) dj[k*n0+i] = sj[i*s0+k];
+                }
+            }
+            return;
+        }
+        if(n2 <= 8 && s0 == n2){
+            for(uint64_t j = 0; j < n1; j++){
+                const T* sj = src + j*s1;
+                T* dj = dst + j*d1;
+                uint64_t i = 0;
+#ifdef CPPZARR_VECTOR_TRANSPOSE
+                if(n2 == 2) i = CzPairs<sizeof(T)>::unzip((const uint8_t*)sj, (uint8_t*)dj, (uint8_t*)(dj+d2), n0);
+#endif
+                for(; i < n0; i++){
+                    for(uint64_t k = 0; k < n2; k++) dj[k*d2+i] = sj[i*n2+k];
+                }
+            }
+            return;
+        }
         T buf[TB*TB];
         for(uint64_t j = 0; j < n1; j++){
             const T* sj = src + j*s1;

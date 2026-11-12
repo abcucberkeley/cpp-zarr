@@ -1688,6 +1688,109 @@ int main(int argc, char** argv){
             for (const std::string& p : paths) std::filesystem::remove_all(p, ec);
             return ok;
         });
+
+        check("arrays whose chunks keep their last axis apart (Zarr v3's transpose codec moving it before the others, as TZYXC images "
+              "stored as TCZYX): written from and read into C and F order, whole and in regions, every element size, 1 to 5 channels, "
+              "plain and sharded, and their chunks the bytes of the same data in that axis order", [&](){
+            bool ok = true;
+            std::mt19937 trng(77);
+            for (const char* dtype : {"<u1", "<u2", "<u4", "<u8", "<c16"}){
+                const uint64_t bytes = dtypeInfo(dtype).bytes;
+                for (uint64_t nc = 1; nc <= 5; nc++){
+                    for (const bool sharded : {false, true}){
+                        // (T, Z, Y, X, C, with partial chunks along Z, Y and X)
+                        const V shape = {3, 20, 18, 22, nc}, inner = {1, 8, 8, 8, nc}, chunk = sharded ? V{2, 16, 16, 16, nc} : inner;
+                        const V tshape = {3, nc, 20, 18, 22}, tinner = {1, nc, 8, 8, 8}, tchunk = sharded ? V{2, nc, 16, 16, 16} : tinner;
+                        const std::string name = std::string(dtype+1) + "_c" + std::to_string(nc) + (sharded ? "_sh" : "");
+                        const std::string p = dir + "/rt_tr_" + name + ".zarr", q = dir + "/rt_tr_ref_" + name + ".zarr";
+                        std::error_code ec;
+                        std::filesystem::remove_all(p, ec);
+                        std::filesystem::remove_all(q, ec);
+                        // (both arrays' metadata as cpp-zarr writes it, then the transposed one's codecs given the transpose)
+                        auto meta = [&](const std::string& path, const V& s, const V& c, const V& in){
+                            zarr Z;
+                            Z.set_fileName(path); Z.set_zarr_format(3); Z.set_cname("zstd"); Z.set_clevel(1); Z.set_order("C");
+                            Z.set_chunks(c); Z.set_dtype(dtype); Z.set_shape(s);
+                            if (sharded){ Z.set_shard(true); Z.set_chunk_shape(in); }
+                            Z.write_zarray();
+                        };
+                        meta(q, tshape, tchunk, tinner);
+                        // the data in C order (TZYXC), the same in F order, and in TCZYX (C order) for the reference
+                        const uint64_t n = 3*20*18*22*nc;
+                        std::vector<uint8_t> data(n*bytes), fdata(n*bytes), tdata(n*bytes);
+                        for (auto& v : data) v = (uint8_t)(trng() % 7);   // (compressible)
+                        for (uint64_t t = 0; t < 3; t++) for (uint64_t z = 0; z < 20; z++) for (uint64_t y = 0; y < 18; y++)
+                            for (uint64_t x = 0; x < 22; x++) for (uint64_t c = 0; c < nc; c++){
+                                const uint8_t* v = &data[((((t*20 + z)*18 + y)*22 + x)*nc + c)*bytes];
+                                memcpy(&tdata[((((t*nc + c)*20 + z)*18 + y)*22 + x)*bytes], v, bytes);
+                                memcpy(&fdata[(t + 3*(z + 20*(y + 18*(x + 22*c))))*bytes], v, bytes);
+                            }
+                        auto cStrides = [](const V& s){ V st(s.size()); uint64_t a = 1; for (size_t d = s.size(); d-- > 0;){ st[d] = a; a *= s[d]; } return st; };
+                        auto fStrides = [](const V& s){ V st(s.size()); uint64_t a = 1; for (size_t d = 0; d < s.size(); d++){ st[d] = a; a *= s[d]; } return st; };
+                        const V zeros(5, 0);
+                        zarr R(q);
+                        R.set_chunkInfo(zeros, tshape);
+                        if (parallelWriteZarr(R, tdata.data(), zeros, tshape, tshape, cStrides(tshape), bytes*8, false, false, false))
+                            throw std::string("write: ") + R.get_errString();
+                        const auto b = chunkFiles(q);
+                        for (const bool fIn : {false, true}){
+                            std::filesystem::remove_all(p, ec);
+                            meta(p, shape, chunk, inner);
+                            json m = readJson(p + "/zarr.json");
+                            const json tr = {{"name", "transpose"}, {"configuration", {{"order", {0, 4, 1, 2, 3}}}}};
+                            json& codecs = sharded ? m["codecs"][0]["configuration"]["codecs"] : m["codecs"];
+                            codecs.insert(codecs.begin(), tr);
+                            std::ofstream(p + "/zarr.json") << m.dump();
+                            zarr W(p);
+                            W.set_chunkInfo(zeros, shape);
+                            ok = ok && W.get_chunkAxisOrder() == V({0, 4, 1, 2, 3});
+                            if (parallelWriteZarr(W, fIn ? fdata.data() : data.data(), zeros, shape, shape, fIn ? fStrides(shape) : cStrides(shape),
+                                                  bytes*8, false, false, false))
+                                throw std::string("write: ") + W.get_errString();
+                            // (the same chunk files: TZYXC keys c/t/z/y/x/0, TCZYX ones c/t/0/z/y/x)
+                            const auto a = chunkFiles(p);
+                            bool same = a.size() == b.size() && !a.empty();
+                            for (size_t i = 0; same && i < a.size(); i++){
+                                const std::string ka = a[i].first.substr(p.size() + 1);
+                                std::vector<std::string> parts;
+                                for (size_t s0 = 0, s1; s0 <= ka.size(); s0 = s1 + 1){ s1 = ka.find('/', s0); if (s1 == std::string::npos) s1 = ka.size(); parts.push_back(ka.substr(s0, s1 - s0)); }
+                                const std::string kb = q + "/" + parts[0] + "/" + parts[1] + "/0/" + parts[2] + "/" + parts[3] + "/" + parts[4];
+                                const auto it = std::find_if(b.begin(), b.end(), [&](const std::pair<std::string, std::string>& f){ return f.first == kb; });
+                                same = it != b.end() && it->second == a[i].second;
+                            }
+                            if (!same) std::fprintf(stderr, "    %s: chunk files written from %s order differ from the TCZYX array's\n", name.c_str(), fIn ? "F" : "C");
+                            ok = ok && same;
+                            // read back whole and in regions, in C and in F order
+                            for (int k = 0; k < 6 && ok; k++){
+                                V s(5, 0), e = shape;
+                                if (k >= 2) for (int d = 0; d < 5; d++){ s[d] = trng() % shape[d]; e[d] = s[d] + 1 + trng() % (shape[d] - s[d]); }
+                                const bool cOrder = k % 2 == 0;
+                                V rs(5);
+                                for (int d = 0; d < 5; d++) rs[d] = e[d] - s[d];
+                                uint64_t rn = 1;
+                                for (uint64_t v : rs) rn *= v;
+                                std::vector<uint8_t> got(rn*bytes, 0xEE);
+                                zarr Z(p);
+                                Z.set_chunkInfo(s, e);
+                                if (parallelReadZarr(Z, got.data(), s, e, rs, bytes*8, true, false, cOrder)){ ok = false; break; }
+                                for (uint64_t t = 0; t < rs[0] && ok; t++) for (uint64_t z = 0; z < rs[1] && ok; z++) for (uint64_t y = 0; y < rs[2] && ok; y++)
+                                    for (uint64_t x = 0; x < rs[3] && ok; x++) for (uint64_t c = 0; c < rs[4] && ok; c++){
+                                        const uint64_t g = cOrder ? (((t*rs[1] + z)*rs[2] + y)*rs[3] + x)*rs[4] + c
+                                                                  : t + rs[0]*(z + rs[1]*(y + rs[2]*(x + rs[3]*c)));
+                                        const uint64_t w = (((((s[0]+t)*20 + s[1]+z)*18 + s[2]+y)*22 + s[3]+x)*nc + s[4]+c);
+                                        ok = memcmp(&got[g*bytes], &data[w*bytes], bytes) == 0;
+                                    }
+                                if (!ok) std::fprintf(stderr, "    %s: read %d (%s order) of the array written from %s order wrong\n",
+                                                      name.c_str(), k, cOrder ? "C" : "F", fIn ? "F" : "C");
+                            }
+                        }
+                        std::filesystem::remove_all(p, ec);
+                        std::filesystem::remove_all(q, ec);
+                    }
+                }
+            }
+            return ok;
+        });
     }
 
     // How the reader hands out and decodes chunks, and how the writer adds inner chunks
