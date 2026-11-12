@@ -80,17 +80,17 @@ jobs:
       # Compiles the extension straight against the library built above, then
       # runs the same test file cibuildwheel runs against the release wheels.
       # On Linux and macOS it links like python/setup.py does (static libstdc++
-      # after the library).
+      # after the library, kept private to the module).
       - name: Python tests
         run: |
           EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
           case "$RUNNER_OS" in
             Linux)
               python -m pip install numpy pybind11 ml_dtypes
-              FLAGS="-fPIC $(python -m pybind11 --includes) -Wl,-rpath,$PWD/install/lib -static-libstdc++" ;;
+              FLAGS="-fPIC $(python -m pybind11 --includes) -Wl,-rpath,$PWD/install/lib -static-libstdc++ -Wl,--exclude-libs,ALL" ;;
             macOS)
               python -m pip install numpy pybind11 ml_dtypes
-              FLAGS="-fPIC $(python -m pybind11 --includes) -isysroot $(xcrun --show-sdk-path) -undefined dynamic_lookup -Wl,-rpath,$PWD/install/lib -static-libstdc++" ;;
+              FLAGS="-fPIC $(python -m pybind11 --includes) -isysroot $(xcrun --show-sdk-path) -undefined dynamic_lookup -Wl,-rpath,$PWD/install/lib -static-libstdc++ -Wl,-exported_symbol,_PyInit_cppzarr" ;;
             Windows)
               PYINC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
               PYVER=$(python -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")

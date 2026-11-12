@@ -61,8 +61,12 @@ ext_modules = [
         library_dirs=['build/install/lib64','build/install/lib'],
         libraries=['cppZarr'],
         sources=["cppzarr.cpp"],
-        # (the static C++ runtime kept private, as in the library: see CMakeLists.txt)
-        extra_link_args=['-static-libstdc++'] + (['-Wl,--exclude-libs,ALL'] if system == "Linux" else [])
+        # (the static C++ runtime kept private, as in the library: see CMakeLists.txt. On macOS the module exports
+        # its entry point alone: the loader merges the exported weak definitions of one name across every image a
+        # process loads, so that with cpp-tiff's module loaded first, this module's std::call_once in pybind11 ran
+        # cpp-tiff's copy of its code, on cpp-tiff's runtime's state, and the first write crashed)
+        extra_link_args=['-static-libstdc++'] + (['-Wl,--exclude-libs,ALL'] if system == "Linux" else
+                                                 ['-Wl,-exported_symbol,_PyInit_cppzarr'] if system == "Darwin" else [])
     ),
 ]
 
