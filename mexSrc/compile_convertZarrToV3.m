@@ -1,14 +1,18 @@
+% Builds against the cpp-zarr install in ../jenkinsBuild/install, where the release builds install it (cmake
+% --install into jenkinsBuild/install), and is run from this folder (mexSrc): -outdir and the other paths below
+% are relative to it
 % ADD --disable-new-dtags
 if isunix && ~ismac
     releaseFolder = '../linux';
     if ~exist(releaseFolder, 'dir')
         mkdir(releaseFolder);
     end
-    mex -outdir ../linux -output convertZarrToV3.mexa64 -v CXXOPTIMFLAGS="-O2 -DNDEBUG" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O2 -fopenmp' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'/clusterfs/fiona/matthewmueller/cppZarrTest/c-zarr/jenkinsBuild/install/include' -L'/clusterfs/fiona/matthewmueller/cppZarrTest/c-zarr/jenkinsBuild/install/lib64' -lcppZarr convertzarrtov3mex.cpp
+    mex -outdir ../linux -output convertZarrToV3.mexa64 -v CXXOPTIMFLAGS="-O2 -DNDEBUG" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O2 -fopenmp' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lcppZarr convertzarrtov3mex.cpp
     % Need to change the library name because matlab preloads their own version
     % of libstdc++
     % Setting it to libstdc++.so.6.0.30 as of MATLAB R2022b
     system(['patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 ' releaseFolder '/convertZarrToV3.mexa64']);
+    system(['patchelf --force-rpath --set-rpath ''$ORIGIN'' ' releaseFolder '/convertZarrToV3.mexa64']);
     %system('export LD_LIBRARY_PATH="";patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 convertZarrToV3.mexa64');
 elseif ismac
     % Might have to do this part in terminal. First change the library
@@ -19,7 +23,7 @@ elseif ismac
         if ~exist(releaseFolder, 'dir')
             mkdir(releaseFolder);
         end
-        mex -outdir ../mac -output convertZarrToV3.mexmaci64 -v CXX="/usr/local/bin/g++-13" CXXOPTIMFLAGS='-O2 -DNDEBUG' LDOPTIMFLAGS='-O2 -DNDEBUG' CXXFLAGS='-fno-common -arch arm64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O2 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'/Users/abcx86mac/c-zarr/jenkinsBuild/install/include/' -L'/Users/abcx86mac/c-zarr/jenkinsBuild/install/lib' /usr/local/opt/gcc/lib/gcc/current/libstdc++.a -lcppZarr convertzarrtov3mex.cpp
+        mex -outdir ../mac -output convertZarrToV3.mexmaci64 -v CXX="/usr/local/bin/g++-13" CXXOPTIMFLAGS='-O2 -DNDEBUG' LDOPTIMFLAGS='-O2 -DNDEBUG' CXXFLAGS='-fno-common -arch arm64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O2 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'../jenkinsBuild/install/include/' -L'../jenkinsBuild/install/lib' /usr/local/opt/gcc/lib/gcc/current/libstdc++.a -lcppZarr convertzarrtov3mex.cpp
     
         % We need to change all the current paths to be relative to the mex file
         %system('install_name_tool -change /usr/local/opt/gcc/lib/gcc/current/libstdc++.6.dylib @loader_path/libstdc++.6.0.32.dylib ../mac/convertZarrToV3.mexmaci64');
@@ -33,7 +37,7 @@ elseif ismac
         if ~exist(releaseFolder, 'dir')
             mkdir(releaseFolder);
         end
-        mex -outdir ../macArm -output convertZarrToV3.mexmaca64 -v CXX="/opt/homebrew/bin/g++-13" CXXOPTIMFLAGS='-O2 -DNDEBUG' LDOPTIMFLAGS='-O2 -DNDEBUG' CXXFLAGS='-fno-common -arch arm64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O2 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'/Users/abcarmmac/cpp-zarr/jenkinsBuild/install/include/' -L'/Users/abcarmmac/cpp-zarr/jenkinsBuild/install/lib' /opt/homebrew/opt/gcc@13/lib/gcc/13/libstdc++.a -lcppZarr convertzarrtov3mex.cpp
+        mex -outdir ../macArm -output convertZarrToV3.mexmaca64 -v CXX="/opt/homebrew/bin/g++-13" CXXOPTIMFLAGS='-O2 -DNDEBUG' LDOPTIMFLAGS='-O2 -DNDEBUG' CXXFLAGS='-fno-common -arch arm64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O2 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'../jenkinsBuild/install/include/' -L'../jenkinsBuild/install/lib' /opt/homebrew/opt/gcc@13/lib/gcc/13/libstdc++.a -lcppZarr convertzarrtov3mex.cpp
     
         % We need to change all the current paths to be relative to the mex file
         %system('install_name_tool -change /usr/local/opt/gcc/lib/gcc/current/libstdc++.6.dylib @loader_path/libstdc++.6.0.32.dylib ../mac/convertZarrToV3.mexmaci64');
@@ -49,5 +53,5 @@ elseif ispc
     if ~exist(releaseFolder, 'dir')
         mkdir(releaseFolder);
     end
-    mex -outdir ../windows -output convertZarrToV3.mexa64 -v CXX="C:/mingw64/bin/g++" CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2' -I'C:/Users/matt/Documents/GitHub/c-zarr/jenkinsBuild/install/include' -L'C:/Users/matt/Documents/GitHub/c-zarr/jenkinsBuild/install/lib' C:\mingw64\lib\gcc\x86_64-w64-mingw32\12.2.0\libgcc_eh.a -lcppZarr.dll convertzarrtov3mex.cpp
+    mex -outdir ../windows -output convertZarrToV3.mexa64 -v CXX="C:/mingw64/bin/g++" CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib' C:\mingw64\lib\gcc\x86_64-w64-mingw32\12.2.0\libgcc_eh.a -lcppZarr.dll convertzarrtov3mex.cpp
 end

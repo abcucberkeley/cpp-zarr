@@ -37,6 +37,30 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Set the RPATH to $ORIGIN when installing if applicable
 set(CMAKE_INSTALL_RPATH $ORIGIN)
+# and only that: entries the toolchain itself adds when linking (a Spack-built GCC adds its own lib64) are left
+# out of installed libraries (CMake 3.16 and later), which find the GCC runtime next to them, as MATLAB's
+# release folders ship it, or as the system has it (libcppZarr needs nothing newer than GCC 6's)
+set(CMAKE_INSTALL_REMOVE_ENVIRONMENT_RPATH TRUE)
+
+# No absolute path of the machine that builds it in the library: __FILE__ (c-blosc2's error messages use it)
+# and debug information name the source files relative to the source and build folders, and to dependencies'
+# sources given with FETCHCONTENT_SOURCE_DIR_* (for every target, the dependencies' too, so set before they
+# are added). With GCC the last option that matches wins, so the more specific folders come later.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=." CPPZARR_HAS_FILE_PREFIX_MAP)
+if(CPPZARR_HAS_FILE_PREFIX_MAP)
+    set(CPPZARR_PREFIX_MAPS "${CMAKE_SOURCE_DIR}=." "${CMAKE_BINARY_DIR}=.")
+    foreach(dep CBLOSC CBLOSC2 NLOHMANN_JSON ZLIB)
+        if(FETCHCONTENT_SOURCE_DIR_${dep})
+            get_filename_component(depDir "${FETCHCONTENT_SOURCE_DIR_${dep}}" ABSOLUTE)
+            string(TOLOWER ${dep} depName)
+            list(APPEND CPPZARR_PREFIX_MAPS "${depDir}=./_deps/${depName}-src")
+        endif()
+    endforeach()
+    foreach(map ${CPPZARR_PREFIX_MAPS})
+        add_compile_options("-ffile-prefix-map=${map}")
+    endforeach()
+endif()
 
 # OpenMP is required for C++ only. (Requiring it for C too would break toolchains
 # whose C compiler lacks OpenMP -- e.g. Apple Clang on macOS -- and the C sources
