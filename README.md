@@ -162,6 +162,12 @@ cppzarr.read_zarr('filename.zarr', [0, 0, 0], [128, 128, 128], out=batch[0])
 planes = np.empty((2, 2, 128, 1024, 1024), dtype=np.uint16)                        # (t, c, z, y, x)
 cppzarr.read_zarr('tzyxc.zarr', [0] * 5, [2, 128, 1024, 1024, 2], out=np.moveaxis(planes, 1, -1))
 
+# New arrays of 32 MiB or more that reads make are asked to be backed by huge pages on Linux, as
+# NumPy asks for its own (CPPZARR_MADVISE_HUGEPAGE=0, set before the first read, leaves them as they
+# are): where the system gives huge pages only to memory that asks for them (as Ubuntu does), or has
+# run short of free 2 MB blocks, an output otherwise takes a page fault for every 4 KB, and reads and
+# frees slower. Arrays given as out= are left as they are.
+
 # Reads and writes release the GIL, so several Python threads can read at once: give each
 # a share of the CPUs with num_threads. The same goes for several processes reading at once
 # (a multiprocessing pool, a data loader's workers): give each process a share with

@@ -2669,12 +2669,17 @@ void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
     // The output starts as the fill value, which is what missing chunks read as
     uint8_t fillElem[16];
     fillValueElement(Zarr.get_fill_value(), dtype, fillElem);
+    // (in huge pages where the system has them: see adviseHugePages)
     void* zarrArr = nullptr;
     if(std::any_of(fillElem, fillElem+bytes, [](uint8_t b){ return b != 0; })){
         zarrArr = malloc(readSize*bytes);
+        adviseHugePages(zarrArr, readSize*bytes);
         if(zarrArr) fillElements(bytes, zarrArr, readSize, fillElem);
     }
-    else zarrArr = calloc(readSize,bytes);
+    else{
+        zarrArr = calloc(readSize,bytes);
+        adviseHugePages(zarrArr, readSize*bytes);
+    }
     if(!zarrArr) return NULL;
     uint8_t err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,true,false,cOrder);
     if(err){
@@ -2716,6 +2721,11 @@ void* readZarrParallelHelper(const char* folderName, uint64_t startX, uint64_t s
         const uint64_t rz = endZ-startZ;
         const uint64_t es = Zarr.dtypeBytes();
         void* zarrArrC = malloc(rx*ry*rz*es);
+        if(!zarrArrC){
+            free(zarrArr);
+            return NULL;
+        }
+        adviseHugePages(zarrArrC, rx*ry*rz*es);
 		#pragma omp parallel for
         for(uint64_t k = 0; k < rz; k++){
             for(uint64_t j = 0; j < ry; j++){

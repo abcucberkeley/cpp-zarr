@@ -16,6 +16,7 @@ bundles its native library. Exits non-zero on any failure.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1086,6 +1087,50 @@ def main():
     print(f"buffers kept between calls, and release_buffers  {'OK' if good else 'FAIL'}"
           f"{'' if good else f' (kept {kept} of {cap}, after {after}, again {again})'}")
     ok = ok and good
+
+    # On Linux, the outputs a read makes of 32 MiB or more (those of batches too) are asked to be backed
+    # by huge pages, as NumPy asks for its arrays (MADV_HUGEPAGE: hg among the VmFlags of the mapping
+    # that holds them), unless CPPZARR_MADVISE_HUGEPAGE=0, and smaller ones are not; the values read
+    # are the same (each setting in a process of its own, as the library reads it once)
+    if sys.platform.startswith('linux'):
+        import hashlib
+        hp = os.path.join(tmp, "hugepages.zarr")
+        hv = rng.integers(0, 60000, size=(20, 1024, 1024), dtype=np.uint16)
+        cppzarr.write_zarr(hp, hv, chunks=(5, 1024, 1024), cname='zstd')
+        code = (
+            "import hashlib, sys, cppzarr\n"
+            "def hint(a):\n"
+            "    addr, inside = a.ctypes.data + a.nbytes // 2, False\n"
+            "    for line in open('/proc/self/smaps'):\n"
+            "        p = line.split()\n"
+            "        if p and '-' in p[0] and ':' not in p[0]:\n"
+            "            lo, hi = (int(x, 16) for x in p[0].split('-'))\n"
+            "            inside = lo <= addr < hi\n"
+            "        elif inside and p[0] == 'VmFlags:':\n"
+            "            return 'hg' in p[1:]\n"
+            "small = cppzarr.read_zarr(sys.argv[1], [0, 0, 0], [8, 1024, 1024])\n"
+            "s = hint(small)\n"
+            "big = cppzarr.read_zarr(sys.argv[1])\n"
+            "batch = cppzarr.read_zarr_batch([(sys.argv[1], None, None)] * 2, num_threads=2)\n"
+            "print(s, hint(big), [hint(b) for b in batch] == [hint(big)] * 2,\n"
+            "      len({hashlib.sha256(a.tobytes()).hexdigest() for a in [big] + batch}) == 1 and\n"
+            "      hashlib.sha256(big.tobytes()).hexdigest())\n")
+        m = re.match(r'(\d+)\.(\d+)', os.uname().release)
+        release = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        thp = os.path.isdir('/sys/kernel/mm/transparent_hugepage')
+        want = hashlib.sha256(hv.tobytes()).hexdigest()
+        good, seen = True, []
+        for setting, hinted in ((None, thp and release >= (4, 6)), ('0', False), ('1', thp)):
+            env = {k: v for k, v in os.environ.items() if k != 'CPPZARR_MADVISE_HUGEPAGE'}
+            if setting is not None:
+                env['CPPZARR_MADVISE_HUGEPAGE'] = setting
+            child = subprocess.run([sys.executable, '-c', code, hp], env=env, capture_output=True, text=True)
+            seen.append(child.stdout.strip() or child.stderr.strip()[-300:])
+            good = good and child.stdout.split() == ['False', str(hinted), 'True', want]
+        shutil.rmtree(hp, ignore_errors=True)
+        print(f"outputs of 32 MiB or more asked to be backed by huge pages, unless CPPZARR_MADVISE_HUGEPAGE=0  "
+              f"{'OK' if good else 'FAIL'}{'' if good else f' ({seen})'}")
+        ok = ok and good
 
     # Reading into GPU memory (with an NVIDIA GPU, nvCOMP, and CuPy or PyTorch): the same
     # values as reading into host memory, for every data type and codec, sharded or not,

@@ -24,6 +24,7 @@
 #include <iterator>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,6 +34,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
+#include <sys/utsname.h>
 #endif
 #ifndef _WIN32
 #include <pwd.h>
@@ -116,6 +118,47 @@ static int64_t lazyFreeBytes(){
     }
 #endif
     return -1;
+}
+
+// Whether the mapping that holds addr carries the huge-page hint (MADV_HUGEPAGE: hg among its
+// VmFlags in /proc/self/smaps, Linux 3.8); -1 where that cannot be found
+static int hugePageHint(const void* addr){
+#ifdef __linux__
+    std::ifstream f("/proc/self/smaps");
+    std::string line;
+    const uintptr_t a = (uintptr_t)addr;
+    bool in = false;
+    while (std::getline(f, line)){
+        unsigned long long lo = 0, hi = 0;
+        if (std::sscanf(line.c_str(), "%llx-%llx", &lo, &hi) == 2) in = lo <= a && a < hi;
+        else if (in && line.rfind("VmFlags:", 0) == 0){
+            std::istringstream flags(line.substr(8));
+            std::string flag;
+            while (flags >> flag) if (flag == "hg") return 1;
+            return 0;
+        }
+    }
+#else
+    (void)addr;
+#endif
+    return -1;
+}
+
+// Whether the library asks for huge pages for the outputs it makes (its rule, restated):
+// CPPZARR_MADVISE_HUGEPAGE=0 no, another number yes, unset yes on Linux 4.6 and later, where
+// the kernel has transparent huge pages
+static bool hugePagesWanted(){
+#ifdef __linux__
+    if (!std::filesystem::exists("/sys/kernel/mm/transparent_hugepage")) return false;
+    const char* v = std::getenv("CPPZARR_MADVISE_HUGEPAGE");
+    if (v && *v) return std::atoi(v) != 0;
+    struct utsname u;
+    int major = 0, minor = 0;
+    if (uname(&u) != 0 || std::sscanf(u.release, "%d.%d", &major, &minor) != 2) return false;
+    return major > 4 || (major == 4 && minor >= 6);
+#else
+    return false;
+#endif
 }
 
 static void step(const char* name, const char* comp, const char* order, const char* what){
@@ -1659,6 +1702,33 @@ int main(int argc, char** argv){
                                   (unsigned long long)after, (unsigned long long)again);
             std::error_code ec;
             std::filesystem::remove_all(b.path, ec);
+            return ok;
+        });
+
+        check("outputs a read makes of 32 MiB or more, filled with zeros or with another fill value, are asked to be backed by huge pages on Linux (MADV_HUGEPAGE, as NumPy asks for its arrays) unless CPPZARR_MADVISE_HUGEPAGE=0, smaller ones are not, and they read the same values", [&](){
+            const bool want = hugePagesWanted();
+            bool ok = true;
+            for (const char* fill : {"0", "7"}){
+                // (40 MiB, in chunks of 10 MiB; and a region of 16 MiB of it)
+                Made a = make(std::string("hugepages_") + fill, 3, {1024, 1024, 20}, {1024, 1024, 5}, {}, "F", "zstd", "/", "<u2", fill);
+                zarr Z(a.path);
+                void* d = parallelReadZarrWriteWrapper(Z, false, V(3, 0), a.shape);
+                const int hint = d ? hugePageHint((const uint8_t*)d + a.data.size()/2) : -1;
+                bool same = d && !std::memcmp(d, a.data.data(), a.data.size());
+                free(d);
+                zarr R(a.path);
+                const V part{1024, 1024, 8};
+                void* r = parallelReadZarrWriteWrapper(R, true, V(3, 0), part);
+                const int small = r ? hugePageHint((const uint8_t*)r + (uint64_t(16) << 19)) : -1;
+                same = same && r && !std::memcmp(r, a.data.data(), uint64_t(16) << 20);
+                free(r);
+                std::printf("    (fill value %s: the output's mapping %s the hint, which is %s; the 16 MiB region's %s)\n", fill,
+                            hint < 0 ? "not found: not known whether it carries" : hint ? "carries" : "does not carry",
+                            want ? "wanted" : "not wanted", small < 0 ? "not known" : small ? "carries it" : "does not");
+                ok = ok && same && (hint < 0 || (hint == 1) == want) && small <= 0;
+                std::error_code ec;
+                std::filesystem::remove_all(a.path, ec);
+            }
             return ok;
         });
 

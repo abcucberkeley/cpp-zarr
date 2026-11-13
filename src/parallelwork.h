@@ -19,8 +19,11 @@
 #include <pthread.h>
 #endif
 #ifdef __linux__
+#include <cstdio>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 // (Linux 4.5; older headers lack it, and an older kernel refuses it, which leaves the memory as it was)
 #ifndef MADV_FREE
@@ -40,6 +43,63 @@ inline void freeLazily(void* p, const uint64_t n){
     static const uintptr_t page = (uintptr_t)std::max(4096L, sysconf(_SC_PAGESIZE));
     const uintptr_t a = ((uintptr_t)p+page-1) & ~(page-1), b = ((uintptr_t)p+n) & ~(page-1);
     if(p && b > a) madvise(reinterpret_cast<void*>(a), b-a, MADV_FREE);
+#else
+    (void)p;
+    (void)n;
+#endif
+}
+
+// The size of the huge pages outputs the library makes are asked to be backed by (Linux's transparent
+// huge pages: 2 MB on x86-64), or 0 when they are not asked: CPPZARR_MADVISE_HUGEPAGE=0 says no, any
+// other number yes; unset, yes on Linux 4.6 and later (NumPy's rule for its NUMPY_MADVISE_HUGEPAGE:
+// older kernels were slow to make huge pages)
+inline uint64_t hugePageAdvice(){
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    static const uint64_t size = []() -> uint64_t {
+        const char* v = std::getenv("CPPZARR_MADVISE_HUGEPAGE");
+        if(v && *v){
+            if(!std::atoi(v)) return 0;
+        }
+        else{
+            struct utsname u;
+            int major = 0, minor = 0;
+            if(uname(&u) != 0 || std::sscanf(u.release, "%d.%d", &major, &minor) != 2) return 0;
+            if(major < 4 || (major == 4 && minor < 6)) return 0;
+        }
+        unsigned long long huge = 0;
+        if(FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", "r")){
+            if(std::fscanf(f, "%llu", &huge) != 1) huge = 0;
+            std::fclose(f);
+        }
+        // (a power of two of at least a page)
+        return huge >= 4096 && !(huge & (huge-1)) ? (uint64_t)huge : uint64_t(2) << 20;
+    }();
+    return size;
+#else
+    return 0;
+#endif
+}
+
+// Memory a read is about to fill, of an output of 32 MiB or more that the library makes (not one
+// the caller gives), asked to be backed by huge pages (Linux's MADV_HUGEPAGE, on the whole huge
+// pages in it), as NumPy asks for its arrays. Transparent huge pages back memory not so asked only
+// while the faulting thread's NUMA node has free 2 MB blocks at hand (enabled "always", defrag
+// "madvise", as on RHEL 8), or not at all (enabled "madvise", as on Ubuntu): on a node short of
+// them, outputs of 5 GB read with 24 threads were faulted in 4 KB pages in part (95,000-145,000
+// faults a read, against 9,000-12,000) and took 2.1-2.9 times as long to free, and outputs all in
+// 4 KB pages read 2-49% slower than in huge pages (5 GB ones 8-49%). Only outputs of 32 MiB or
+// more, which glibc's malloc always maps on their own (its mmap threshold rises to at most 32 MiB),
+// and only whole huge pages: smaller outputs come from its heaps once it has freed some, where a
+// hint on an output's pages split the heap's mapping within huge pages, which then lost them
+// (batches of 16 reads of 8 MiB took 1.4-1.6 times the page faults and 2-3.5% longer with 4 and 12
+// threads). Memory already faulted in is left as it is.
+inline void adviseHugePages(void* p, const uint64_t n){
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if(!p || n < (uint64_t(32) << 20)) return;
+    const uint64_t huge = hugePageAdvice();
+    if(!huge) return;
+    const uintptr_t a = ((uintptr_t)p+huge-1) & ~(uintptr_t)(huge-1), b = ((uintptr_t)p+n) & ~(uintptr_t)(huge-1);
+    if(b > a) madvise(reinterpret_cast<void*>(a), b-a, MADV_HUGEPAGE);
 #else
     (void)p;
     (void)n;
