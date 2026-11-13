@@ -17,6 +17,7 @@
 #include "gpu/gpucommon.h"
 #include "helperfunctions.h"
 #include "parallelreadzarr.h"
+#include "pathutil.h"
 #ifdef _WIN32
 // (without windows.h's min and max macros, which the std::min and std::max calls would expand)
 #ifndef NOMINMAX
@@ -52,8 +53,11 @@ public:
     ~File(){ close(); }
     bool open(const std::string &path){
     #ifdef _WIN32
-        h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        // (by its wide-character name: see pathutil.h)
+        const std::wstring wide = widePath(path);
+        h = wide.empty() ? INVALID_HANDLE_VALUE
+                         : CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         return h != INVALID_HANDLE_VALUE;
     #else
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);

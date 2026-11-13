@@ -24,6 +24,7 @@
 #include "helperfunctions.h"
 #include "parallelreadzarr.h"
 #include "parallelwork.h"
+#include "pathutil.h"
 #include "parallelwritezarr.h"
 #include "storedchunks.h"
 
@@ -199,7 +200,8 @@ bool readShardIndex(const std::string &path, const uint64_t perShard, const bool
     const uint64_t emptyEntry = ~uint64_t(0);
     const uint64_t entryBytes = 2*perShard*sizeof(uint64_t), indexBytes = entryBytes+(checksum ? 4 : 0);
     index.assign(2*perShard, emptyEntry);
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f;
+    openPath(f, path, std::ios::binary);
     if(!f.is_open()) return true;
     f.seekg(0, std::ios::end);
     const uint64_t len = (uint64_t)f.tellg();
@@ -270,12 +272,12 @@ struct ShardFile {
     // Opens its file (making its folder first if it is missing), with room for an index at the start
     bool open(const uint64_t room){
 #ifdef _WIN32
-        f.open(writePath, std::ios::binary | std::ios::trunc);
+        openPath(f, writePath, std::ios::binary | std::ios::trunc);
         if(!f.is_open()){
             const size_t slash = writePath.find_last_of("/\\");
             if(slash != std::string::npos) mkdirRecursive(writePath.substr(0, slash).c_str());
             f.clear();
-            f.open(writePath, std::ios::binary | std::ios::trunc);
+            openPath(f, writePath, std::ios::binary | std::ios::trunc);
         }
         if(!f.is_open()) return false;
 #else
@@ -370,7 +372,7 @@ struct ShardFile {
         if(fd >= 0) ::close(fd);
         fd = -1;
 #endif
-        if(opened && tmp) remove(writePath.c_str());
+        if(opened && tmp) removePath(writePath);
         opened = false;
     }
 };
@@ -796,7 +798,8 @@ uint8_t gpuWriteZarr(zarr &Zarr, const void* data, const std::vector<uint64_t> &
                                 len = index[2*pos+1];
                             }
                             else path = fileName+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(name))+"/"+Zarr.chunkKey(name);
-                            std::ifstream file(path, std::ios::binary);
+                            std::ifstream file;
+                            openPath(file, path, std::ios::binary);
                             if(!file.is_open()){
                                 if(sharded) errs[k] = "Could not read the shard "+path;
                                 continue;
@@ -1129,7 +1132,7 @@ uint8_t gpuWriteZarr(zarr &Zarr, const void* data, const std::vector<uint64_t> &
                             continue;
                         }
                         if(useUuid && !renameReplace(sf.writePath, sf.path)){
-                            remove(sf.writePath.c_str());
+                            removePath(sf.writePath);
                             errs[r] = "Cannot move the temporary file into place: "+sf.path;
                             continue;
                         }

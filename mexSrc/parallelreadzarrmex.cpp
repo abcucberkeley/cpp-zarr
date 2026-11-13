@@ -26,7 +26,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     bool useCtx = true;
     bool sparse = false;
     int threads = 0;
-    std::string folderName(mxArrayToString(prhs[0]));
+    std::string folderName(mxArrayToUTF8String(prhs[0]));
 
     for(int i = 1; i < nrhs; i+=2){
         if(i+1 == nrhs) mexErrMsgIdAndTxt("zarr:inputError","Mismatched argument pair for input number %d\n",i+1);

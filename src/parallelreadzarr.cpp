@@ -15,6 +15,7 @@
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "parallelwork.h"
+#include "pathutil.h"
 #include "zlib.h"
 #include "zstd.h"
 #ifndef _WIN32
@@ -66,7 +67,7 @@ public:
     bool open(const std::string &path){
         close();
     #ifdef _WIN32
-        f.open(path, std::ios::binary);
+        openPath(f, path, std::ios::binary);
         return f.is_open();
     #else
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -1070,7 +1071,8 @@ static uint8_t readZarrInto(zarr &Zarr, void* zarrArr,
         int64_t fileLen = 0;
         if(!Zarr.get_shard()){
             fileName = Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkKey(name);
-            std::ifstream file(fileName, std::ios::binary);
+            std::ifstream file;
+            openPath(file, fileName, std::ios::binary);
             if(!file.is_open()) return -1;
             file.seekg(0, std::ios::end);
             fileLen = (int64_t)file.tellg();

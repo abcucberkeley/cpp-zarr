@@ -27,6 +27,7 @@
 #include "parallelwritezarr.h"
 #include "helperfunctions.h"
 #include "parallelwork.h"
+#include "pathutil.h"
 #include "storedchunks.h"
 #include "zarr.h"
 #include "zlib.h"
@@ -35,13 +36,13 @@
 // Open a chunk or shard file for writing, making its folder first if it is missing
 // (an array whose metadata another program wrote may not have its folders yet)
 static bool openForWrite(std::ofstream &file, const std::string &path, const std::ios::openmode mode){
-    file.open(path, std::ios::binary | mode);
+    openPath(file, path, std::ios::binary | mode);
     if(file.is_open()) return true;
     const size_t slash = path.find_last_of("/\\");
     if(slash == std::string::npos) return false;
     mkdirRecursive(path.substr(0, slash).c_str());
     file.clear();
-    file.open(path, std::ios::binary | mode);
+    openPath(file, path, std::ios::binary | mode);
     return file.is_open();
 }
 
@@ -544,7 +545,7 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
         sh.ready.assign(perShard, 0);
         sh.waiting.resize(perShard);
         sh.oldIndex.assign(2*perShard, emptyEntry);
-        if(crop) sh.old.open(sh.path, std::ios::binary);
+        if(crop) openPath(sh.old, sh.path, std::ios::binary);
         if(sh.old.is_open()){
             sh.old.seekg(0, std::ios::end);
             const uint64_t len = (uint64_t)sh.old.tellg();
@@ -685,12 +686,12 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
         if(indexChecksum) sh.file.write(reinterpret_cast<const char*>(&crc), sizeof(crc));
         sh.file.close();
         if(!sh.file){
-            if(shardTmpFile) remove(sh.writePath.c_str());
+            if(shardTmpFile) removePath(sh.writePath);
             reportError("Could not write all of "+sh.writePath+" (is the disk full?)\n");
             return false;
         }
         if(shardTmpFile && !renameReplace(sh.writePath, sh.path)){
-            remove(sh.writePath.c_str());
+            removePath(sh.writePath);
             reportError("Cannot move the temporary file into place: "+sh.path+"\n");
             return false;
         }
@@ -945,7 +946,8 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
                 // The chunk's current contents, decoded (the fill value if it has none),
                 // and the fill value past the array's edge
                 const std::string path = Zarr.get_fileName()+"/"+subfolderName+"/"+Zarr.chunkKey(name);
-                std::ifstream file(path, std::ios::binary);
+                std::ifstream file;
+                openPath(file, path, std::ios::binary);
                 if(file.is_open()){
                     file.seekg(0, std::ios::end);
                     const std::streamoff len = file.tellg();
@@ -1135,7 +1137,7 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
                     const std::string fileName(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(cAV)+"/"+Zarr.chunkKey(name));
                     // An all-zero chunk is not written, and any earlier copy of it removed
                     if(c.zero){
-                        remove(fileName.c_str());
+                        removePath(fileName);
                         continue;
                     }
                     const std::string tmpName = useUuid ? fileName+uuid : fileName;
@@ -1143,7 +1145,7 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
                     if(c.pieces){
                         const int wErr = writePieces(tmpName, *c.pieces);
                         if(wErr){
-                            if(wErr == 2 && useUuid) remove(tmpName.c_str());
+                            if(wErr == 2 && useUuid) removePath(tmpName);
                             reportError(wErr == 1 ? "Check permissions or filepath. Cannot write to path: "+tmpName+"\n" :
                                                     "Could not write all of "+tmpName+" (is the disk full?)\n");
                             break;
@@ -1161,13 +1163,13 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
                         if(c.hasCrc) file.write(reinterpret_cast<const char*>(&c.crc), sizeof(c.crc));
                         file.close();
                         if(!file){
-                            if(useUuid) remove(tmpName.c_str());
+                            if(useUuid) removePath(tmpName);
                             reportError("Could not write all of "+tmpName+" (is the disk full?)\n");
                             break;
                         }
                     }
                     if(useUuid && !renameReplace(tmpName, fileName)){
-                        remove(tmpName.c_str());
+                        removePath(tmpName);
                         reportError("Cannot move the temporary file into place: "+fileName+"\n");
                         break;
                     }
@@ -1247,7 +1249,7 @@ static uint8_t writeZarr(zarr &Zarr, void* zarrArr,
         if(sh.old.is_open()) sh.old.close();
         if(sh.opened){
             sh.file.close();
-            if(shardTmpFile) remove(sh.writePath.c_str());
+            if(shardTmpFile) removePath(sh.writePath);
         }
     }
 

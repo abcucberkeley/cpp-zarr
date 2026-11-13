@@ -72,6 +72,11 @@ cppzarr.write_zarr('outputFilename.zarr', im, zarr_format=3)
 # On Linux and macOS a path that starts with ~ or ~name is in that home folder (as a shell expands it);
 # nothing else in a path is expanded: spaces, parentheses, $ and a ~ further on are kept as they are
 im = cppzarr.read_zarr('~/data/run (2).zarr')
+
+# Paths are UTF-8 on every platform, so folders named in any script work on Windows too
+# (the C++ functions take UTF-8 as well; there, a path whose bytes are not valid UTF-8 is read in
+# Windows' ANSI code page, as before)
+im = cppzarr.read_zarr('C:/data/café µm/a.zarr')
 ````
 
 #### Read a region of a Zarr file

@@ -11,6 +11,7 @@
 #include <fstream>
 #include "zarr.h"
 #include "helperfunctions.h"
+#include "pathutil.h"
 #include "parallelwork.h"
 
 // A metadata fill_value as the zarr class keeps it: integers in decimal, other
@@ -385,7 +386,8 @@ zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
     if(!fileExists(this->fileName+"/.zarray")){
         if(fileExists(this->fileName+"/zarr.json")){
             try{
-                std::ifstream f(this->fileName+"/zarr.json");
+                std::ifstream f;
+                openPath(f, this->fileName+"/zarr.json");
                 zarray = json::parse(f);
             }
             catch(...){
@@ -398,7 +400,8 @@ zarr_format(2), subfolders({0,0,0}), shard(false), chunk_shape({1,1,1})
         //mexErrMsgIdAndTxt("zarr:zarrayError","Metadata file in \"%s\" is missing. Does the file exist?",fileName.c_str());
     }
     try{
-        std::ifstream f(this->fileName+"/.zarray");
+        std::ifstream f;
+        openPath(f, this->fileName+"/.zarray");
         zarray = json::parse(f);
     }
     catch(...){
@@ -518,12 +521,13 @@ static void writeJsonFile(const std::string &folder, const std::string &name, co
     const std::string final(folder+"/"+name);
     if(!fileExists(final)) mkdirRecursive(folder.c_str());
     const std::string tmp(final+generateUUID());
-    std::ofstream o(tmp);
+    std::ofstream o;
+    openPath(o, tmp);
     if(!o.good()) throw std::string("cannotOpenZarray:"+tmp);
     o << std::setw(4) << meta << std::endl;
     o.close();
     if(!o || !renameReplace(tmp, final)){
-        remove(tmp.c_str());
+        removePath(tmp);
         throw std::string("cannotOpenZarray:"+final);
     }
 }
@@ -531,7 +535,8 @@ static void writeJsonFile(const std::string &folder, const std::string &name, co
 // Whether a file holds a JSON object (a .zattrs whose attributes can be moved)
 static bool isJsonObjectFile(const std::string &path){
     try{
-        std::ifstream f(path);
+        std::ifstream f;
+        openPath(f, path);
         return json::parse(f).is_object();
     }
     catch(...){
@@ -542,8 +547,8 @@ static bool isJsonObjectFile(const std::string &path){
 // Once a v2 array's folder has its zarr.json: remove its .zarray, and its .zattrs
 // when its attributes were moved into the zarr.json
 static void removeV2Metadata(const std::string &folder, const bool movedZattrs){
-    remove((folder+"/.zarray").c_str());
-    if(movedZattrs) remove((folder+"/.zattrs").c_str());
+    removePath(folder+"/.zarray");
+    if(movedZattrs) removePath(folder+"/.zattrs");
 }
 
 // Write the current Metadata to the .zarray and create subfolders if needed
@@ -697,7 +702,8 @@ json zarr::v3Metadata(const bool existingChunks) const{
     json attributes = json::object(), dimensionNames;
     auto readJson = [](const std::string &path){
         try{
-            std::ifstream f(path);
+            std::ifstream f;
+            openPath(f, path);
             return json::parse(f);
         }
         catch(...){
@@ -920,13 +926,14 @@ void zarr::write_jsonValues(){
     const std::string uuid = generateUUID();
     const std::string fnFull(fileName+"/.zarray"+uuid);
 
-    std::ofstream o(fnFull);
+    std::ofstream o;
+    openPath(o, fnFull);
     if(!o.good()) throw std::string("cannotOpenZarray:"+fnFull);
     o << std::setw(4) << zarray << std::endl;
     o.close();
 
     if(!renameReplace(fnFull, fileNameFinal)){
-        remove(fnFull.c_str());
+        removePath(fnFull);
         throw std::string("cannotOpenZarray:"+fileNameFinal);
     }
 }

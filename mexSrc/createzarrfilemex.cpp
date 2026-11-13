@@ -22,7 +22,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(nrhs == 2) mexErrMsgIdAndTxt("zarr:inputError","This functions does not accept only 2 arguments\n");
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string\n");
     zarr Zarr;
-    Zarr.set_fileName(mxArrayToString(prhs[0]));
+    Zarr.set_fileName(mxArrayToUTF8String(prhs[0]));
     // Per-axis options are fit to the number of dimensions after all options are read
     std::vector<uint64_t> chunksVals, subfoldersVals, chunkShapeVals;
     bool hasChunks = false, hasSubfolders = false, hasChunkShape = false;

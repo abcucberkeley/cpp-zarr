@@ -186,7 +186,7 @@ target_include_directories(zlibstaticCPPZARR PUBLIC ${zlib_SOURCE_DIR} ${ZLIB_GE
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # (GPU reads and writes: the CUDA driver and nvCOMP are loaded at run time, so they need nothing to build)
-add_library(cppZarr_shared SHARED ${SRC_DIR}/zarr.cpp ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/parallelreadzarr.cpp ${SRC_DIR}/parallelwritezarr.cpp
+add_library(cppZarr_shared SHARED ${SRC_DIR}/zarr.cpp ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/pathutil.cpp ${SRC_DIR}/parallelreadzarr.cpp ${SRC_DIR}/parallelwritezarr.cpp
             ${SRC_DIR}/gpureadzarr.cpp ${SRC_DIR}/gpuwritezarr.cpp ${SRC_DIR}/gpu/cudaapi.cpp ${SRC_DIR}/gpu/gpucommon.cpp)
 set_target_properties(cppZarr_shared PROPERTIES OUTPUT_NAME cppZarr)
 set_target_properties(cppZarr_shared PROPERTIES PUBLIC_HEADER "${SRC_DIR}/zarr.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/parallelreadzarr.h;${SRC_DIR}/parallelwritezarr.h;${SRC_DIR}/gpureadzarr.h;${SRC_DIR}/gpuwritezarr.h")

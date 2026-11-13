@@ -759,6 +759,51 @@ def main():
     print(f"paths with a ~, spaces and parentheses, and under ~  {'OK' if good else 'FAIL'}" + ('' if good else f" ({'; '.join(bad)})"))
     ok = ok and good
 
+    # Folders named in other scripts: paths are UTF-8 (on Windows the library opened them in the ANSI code page):
+    # arrays written there (v2, v3 and sharded), found where named as Python sees them (and no folder of another name
+    # made), read (alone and in a batch), written into, converted to Zarr v3 and created
+    good, bad = True, []
+    ud = os.path.join(tmp, 'utf8')
+    names = ('caf\u00e9 \u00b5m', '\u65e5\u672c')
+    for nm in names:
+        for k, (zf, shards) in enumerate([(2, None), (3, None), (3, [4, 4, 4])]):
+            given = os.path.join(ud, nm, f'a{k}.zarr')
+            try:
+                cppzarr.write_zarr(given, d6, chunks=[2, 2, 2] if shards else [4, 4, 4], zarr_format=zf, shards=shards)
+                good_p = os.path.isfile(os.path.join(given, 'zarr.json' if zf == 3 else '.zarray')) and \
+                    np.array_equal(cppzarr.read_zarr(given), d6) and \
+                    np.array_equal(cppzarr.read_zarr_batch([(given, [0, 0, 0], [6, 5, 4]), (given, None, None)])[1], d6)
+                e6 = d6.copy()
+                e6[1:3, 1:4] += 7
+                cppzarr.write_zarr(given, e6[1:3, 1:4], start_coords=[1, 1, 0], end_coords=[3, 4, 4])
+                good_p = good_p and np.array_equal(cppzarr.read_zarr(given), e6)
+                if zf == 2:
+                    cppzarr.convert_to_v3(given)
+                    good_p = good_p and os.path.isfile(os.path.join(given, 'zarr.json')) and \
+                        not os.path.exists(os.path.join(given, '.zarray')) and np.array_equal(cppzarr.read_zarr(given), e6)
+            except Exception as e:
+                good_p = False
+                print(f"  {given!r}: {e}")
+            if not good_p:
+                bad.append(repr(given))
+            good = good and good_p
+        created = os.path.join(ud, nm, 'created.zarr')
+        try:
+            cppzarr.create_zarr(created, d6.shape, np.uint16, chunks=[4, 4, 4])
+            cppzarr.write_zarr(created, d6, start_coords=[0, 0, 0], end_coords=list(d6.shape))
+            if not (os.path.isfile(os.path.join(created, '.zarray')) and np.array_equal(cppzarr.read_zarr(created), d6)):
+                bad.append(repr(created))
+                good = False
+        except Exception as e:
+            print(f"  {created!r}: {e}")
+            bad.append(repr(created))
+            good = False
+    if sorted(os.listdir(ud)) != sorted(names):
+        bad.append(f"folders {sorted(os.listdir(ud))!r}")
+        good = False
+    print(f"paths in other scripts (UTF-8)  {'OK' if good else 'FAIL'}" + ('' if good else f" ({'; '.join(bad)})"))
+    ok = ok and good
+
     # Batches of reads: the same values as reading each region on its own, in the
     # requests' order, into new arrays or into given ones (one batch buffer), from
     # several arrays; and other Python threads run while cpp-zarr reads (the GIL is

@@ -587,6 +587,38 @@ function test_matlab(mexDir)
     clear homeBack
     fprintf('PASS  paths with a ~, spaces and parentheses, and under ~\n');
 
+    % folders named in other scripts: paths are UTF-8 (on Windows the library opened them in the ANSI code page,
+    % and the mex files passed MATLAB's names in it): arrays written, found where named as MATLAB sees them (and no
+    % folder of another name made), read, written into, converted to Zarr v3 and created there. (The names are made
+    % from character codes, so that this file is the same in any encoding MATLAB reads it in.)
+    ud = fullfile(tmp, 'utf8');
+    names = {['caf' char(233) ' ' char(181) 'm'], char([26085 26412])};
+    for k = 1:numel(names)
+        fu = fullfile(ud, names{k}, 'a.zarr');
+        parallelWriteZarr(fu, tv, 'chunks', [4 4 4]);
+        assert(isfile(fullfile(fu, '.zarray')) && isequal(parallelReadZarr(fu), tv), ...
+            'the array in the folder "%s" was not written and read there', names{k});
+        tv2 = tv;
+        tv2(2:3, 2:4, :) = tv2(2:3, 2:4, :) + 7;
+        parallelWriteZarr(fu, tv2(2:3, 2:4, :), 'bbox', [2 2 1 3 4 4]);
+        assert(isequal(parallelReadZarr(fu, 'bbox', [2 2 1 3 4 4]), tv2(2:3, 2:4, :)), ...
+            'a region of the array in "%s" differs', names{k});
+        convertZarrToV3(fu);
+        assert(isfile(fullfile(fu, 'zarr.json')) && ~isfile(fullfile(fu, '.zarray')) && isequal(parallelReadZarr(fu), tv2), ...
+            'the array in "%s" differs after its conversion to Zarr v3', names{k});
+        fs = fullfile(ud, names{k}, 's.zarr');
+        parallelWriteZarr(fs, tv, 'zarr_format', 3, 'chunk_shape', [2 2 2], 'chunks', [4 4 4]);
+        assert(isfile(fullfile(fs, 'zarr.json')) && isequal(parallelReadZarr(fs), tv), ...
+            'the sharded array in "%s" was not written and read there', names{k});
+        fc = fullfile(ud, names{k}, 'created.zarr');
+        createZarrFile(fc, 'shape', [6 5 4], 'dtype', 'uint16', 'chunks', [4 4 4]);
+        assert(isfile(fullfile(fc, '.zarray')), 'createZarrFile wrote no array in "%s"', names{k});
+    end
+    listed = dir(ud);
+    listed = sort({listed(~ismember({listed.name}, {'.', '..'})).name});
+    assert(isequal(listed, sort(names)), 'folders made in %s: %s', ud, strjoin(listed, ', '));
+    fprintf('PASS  paths in other scripts (UTF-8)\n');
+
     % clear mex frees the buffers reads and writes keep between calls (writes keep those of
     % chunks over 1 MB; on Linux the library itself stays loaded): reads and writes after it
     % give the same data

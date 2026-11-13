@@ -38,12 +38,32 @@
 #include <pwd.h>
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#include <codecvt>
+#include <locale>
+// (declared here rather than with windows.h, whose macros the test keeps out)
+extern "C" __declspec(dllimport) unsigned int __stdcall GetACP(void);
+#endif
 #include "zarr.h"
 #include "helperfunctions.h"
 #include "parallelreadzarr.h"
 #include "parallelwritezarr.h"
 
 struct Case { const char* name; const char* dtype; uint64_t bits; };
+
+// The test's own path for a UTF-8 path, independent of the library's conversion of it: on Windows its UTF-16
+// name, so that a file the library wrote in a folder named in another script is found only where that name says
+static std::filesystem::path utf8Path(const std::string &p){
+#ifdef _WIN32
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> utf16;
+    return std::filesystem::path(utf16.from_bytes(p));
+#pragma GCC diagnostic pop
+#else
+    return std::filesystem::path(p);
+#endif
+}
 
 // Two elements of a data type are the same: equal bytes, or NaN in both (each part
 // of a complex number on its own)
@@ -2072,6 +2092,105 @@ int main(int argc, char** argv){
             return ok;
         });
 #endif
+
+        // Paths are UTF-8 on every platform: on Windows the library opens them with the wide-character API (its
+        // narrow functions read a path's bytes in the ANSI code page, so that an array in a folder named with an
+        // accented or a CJK letter could not be read or written from Python, Java or C++, which pass UTF-8)
+        check("arrays in folders named \"caf\xc3\xa9 \xc2\xb5m\" and \"\xe6\x97\xa5\xe6\x9c\xac\" (paths are UTF-8): v2, v3 and "
+              "sharded ones written and found where named (no other folder made), read, written into by region, "
+              "converted to v3, and created; on Windows a path whose bytes are not valid UTF-8 read in the ANSI code page", [&](){
+            bool ok = true;
+            auto fail = [&](const std::string &what, const std::string &where){
+                std::fprintf(stderr, "    %s: %s\n", where.c_str(), what.c_str());
+                ok = false;
+            };
+            const std::string t = dir + "/rt_utf8";
+            std::error_code ec;
+            std::filesystem::remove_all(utf8Path(t), ec);
+            const V shp = {6, 5, 4};
+            std::vector<uint16_t> data(6*5*4);
+            for (size_t i = 0; i < data.size(); i++) data[i] = (uint16_t)(i*29 + 7);
+            // a region written into the array, and the array as it is then
+            const V s0 = {1, 1, 1}, e0 = {5, 4, 3}, rs = {4, 3, 2};
+            std::vector<uint16_t> part(4*3*2), after = data;
+            for (size_t i = 0; i < part.size(); i++) part[i] = (uint16_t)(60000 - i);
+            for (uint64_t z = 0; z < 2; z++) for (uint64_t y = 0; y < 3; y++) for (uint64_t x = 0; x < 4; x++)
+                after[(x+1) + (y+1)*6 + (z+1)*30] = part[x + y*4 + z*12];
+            auto readsAs = [&](const std::string &a, const std::vector<uint16_t> &want){
+                std::vector<uint16_t> back(want.size(), 0);
+                zarr R(a);
+                R.set_chunkInfo({0, 0, 0}, shp);
+                return parallelReadZarr(R, back.data(), {0, 0, 0}, shp, shp, 16) == 0 && back == want;
+            };
+            const std::vector<std::string> names = {"caf\xc3\xa9 \xc2\xb5m", "\xe6\x97\xa5\xe6\x9c\xac"};
+            for (const std::string &nm : names){
+                for (int kind = 0; kind < 3; kind++){
+                    // v2, v3, and v3 sharded (whose shards go through temporary files)
+                    const std::string a = t + "/" + nm + "/a" + std::to_string(kind) + ".zarr";
+                    try {
+                        zarr W;
+                        W.set_fileName(a);
+                        if (kind) W.set_zarr_format(3);
+                        W.set_dtype("<u2"); W.set_chunks({4, 4, 4}); W.set_shape(shp);
+                        if (kind == 2){ W.set_shard(true); W.set_chunk_shape({2, 2, 2}); }
+                        W.write_zarray();
+                        W.set_chunkInfo({0, 0, 0}, shp);
+                        if (parallelWriteZarr(W, data.data(), {0, 0, 0}, shp, shp, 16, true, false)){ fail("not written", a); continue; }
+                        if (!std::filesystem::exists(utf8Path(a + (kind ? "/zarr.json" : "/.zarray")))){ fail("not where named", a); continue; }
+                        if (!readsAs(a, data)){ fail("not read back", a); continue; }
+                        zarr P(a);
+                        P.set_chunkInfo(s0, e0);
+                        if (parallelWriteZarr(P, part.data(), s0, e0, rs, 16, true, true, false) || !readsAs(a, after)){
+                            fail("not written into by region", a);
+                            continue;
+                        }
+                        if (!kind){
+                            zarr(a).convert_to_v3();
+                            if (!std::filesystem::exists(utf8Path(a + "/zarr.json")) || std::filesystem::exists(utf8Path(a + "/.zarray")) ||
+                                !readsAs(a, after)) fail("not converted to v3", a);
+                        }
+                    }
+                    catch (const std::string &e){ fail("threw " + e, a); }
+                }
+                // created (metadata only, as createZarrFile does), then written
+                const std::string c = t + "/" + nm + "/created.zarr";
+                try {
+                    zarr Z;
+                    Z.set_fileName(c); Z.set_dtype("<u2"); Z.set_chunks({4, 4, 4}); Z.set_shape(shp);
+                    Z.write_zarray();
+                    zarr W(c);
+                    W.set_chunkInfo({0, 0, 0}, shp);
+                    if (!std::filesystem::exists(utf8Path(c + "/.zarray")) || parallelWriteZarr(W, data.data(), {0, 0, 0}, shp, shp, 16, true, false) ||
+                        !readsAs(c, data)) fail("not created where named", c);
+                }
+                catch (const std::string &e){ fail("threw " + e, c); }
+            }
+#ifdef _WIN32
+            // a path whose bytes are not valid UTF-8 is read in the ANSI code page, as the library read every path
+            // before: "caf\xe9 \xb5m" is "caf\xc3\xa9 \xc2\xb5m" in Windows-1252
+            if (GetACP() == 1252){
+                const std::string ansi = t + "/caf\xe9 \xb5m/ansi.zarr", same = t + "/" + names[0] + "/ansi.zarr";
+                try {
+                    zarr W;
+                    W.set_fileName(ansi); W.set_dtype("<u2"); W.set_chunks({4, 4, 4}); W.set_shape(shp);
+                    W.write_zarray();
+                    W.set_chunkInfo({0, 0, 0}, shp);
+                    if (parallelWriteZarr(W, data.data(), {0, 0, 0}, shp, shp, 16, true, false) ||
+                        !std::filesystem::exists(utf8Path(same + "/.zarray")) || !readsAs(same, data) || !readsAs(ansi, data))
+                        fail("not written and read in the ANSI code page", ansi);
+                }
+                catch (const std::string &e){ fail("threw " + e, ansi); }
+            }
+            else std::fprintf(stderr, "    (ANSI code page %u, not Windows-1252: its paths not checked)\n", GetACP());
+#endif
+            // and no folder of any other name made (the narrow functions made "caf\xc3\x83\xc2\xa9 \xc3\x82\xc2\xb5m")
+            std::set<std::filesystem::path> want, got;
+            for (const std::string &nm : names) want.insert(utf8Path(t + "/" + nm).filename());
+            for (const auto &e : std::filesystem::directory_iterator(utf8Path(t), ec)) got.insert(e.path().filename());
+            if (got != want) fail(std::to_string(got.size()) + " folders, not the " + std::to_string(want.size()) + " named", t);
+            std::filesystem::remove_all(utf8Path(t), ec);
+            return ok;
+        });
     }
 
     // How the reader hands out and decodes chunks, and how the writer adds inner chunks

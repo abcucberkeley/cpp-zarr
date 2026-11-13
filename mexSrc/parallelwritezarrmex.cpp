@@ -99,7 +99,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     const std::vector<uint64_t> dataDims(dataDimsT, dataDimsT+nDataDims);
 #endif
 
-    std::string folderName(mxArrayToString(prhs[0]));
+    std::string folderName(mxArrayToUTF8String(prhs[0]));
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
     folderName = expandTilde(folderName);

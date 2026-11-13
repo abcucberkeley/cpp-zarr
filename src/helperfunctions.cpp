@@ -19,6 +19,7 @@
 #include <limits>
 #include "helperfunctions.h"
 #include "convertvalues.h"
+#include "pathutil.h"
 #include "parallelwork.h"
 #include "zarr.h"
 
@@ -123,6 +124,17 @@ std::string generateUUID(){
 }
 
 bool folderExists(const std::string &folderName){
+#ifdef _WIN32
+    // (by the wide-character path, as pathutil.h opens files, and without trailing separators, which the
+    // C runtime's stat refuses, but for a drive's root)
+    std::string name = folderName;
+    while(name.size() > 1 && (name.back() == '/' || name.back() == '\\') && !(name.size() == 3 && name[1] == ':'))
+        name.pop_back();
+    const std::wstring wide = widePath(name);
+    struct _stat64 info;
+    if((wide.empty() ? _stat64(name.c_str(), &info) : _wstat64(wide.c_str(), &info)) != 0) return false;
+    return (info.st_mode & _S_IFDIR) != 0;
+#else
     struct stat info;
 
     if(stat(folderName.c_str(), &info) != 0)
@@ -131,15 +143,12 @@ bool folderExists(const std::string &folderName){
         return true;
     else
         return false;
+#endif
 }
 
 // Make one directory (its parent has to exist)
 static int makeOneDir(const std::string &dir){
-    #ifdef _WIN32
-    return mkdir(dir.c_str());
-    #else
-    return mkdir(dir.c_str(), 0777);
-    #endif
+    return mkdirPath(dir);
 }
 
 // Make a directory and any of its parents that are missing ("mkdir -p"). The
@@ -168,7 +177,7 @@ void mkdirRecursive(const char *dir) {
 }
 
 bool fileExists(const std::string &fileName){
-    if (FILE *file = fopen(fileName.c_str(), "r")){
+    if (FILE *file = fopenPath(fileName, "r")){
         fclose(file);
         return true;
     }
@@ -1104,8 +1113,11 @@ void fillOutsideBoxND(const uint64_t bytes, void* buf,
 bool renameReplace(const std::string &src, const std::string &dst){
 #ifdef _WIN32
     // rename() on Windows fails when dst exists, which silently kept the old
-    // chunk/.zarray whenever an existing array was rewritten
-    return MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    // chunk/.zarray whenever an existing array was rewritten (and the paths by
+    // their wide-character names: see pathutil.h)
+    const std::wstring wideSrc = widePath(src), wideDst = widePath(dst);
+    if(wideSrc.empty() || wideDst.empty()) return MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    return MoveFileExW(wideSrc.c_str(), wideDst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
 #else
     return rename(src.c_str(), dst.c_str()) == 0;
 #endif
