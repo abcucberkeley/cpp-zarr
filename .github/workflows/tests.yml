@@ -85,6 +85,17 @@ jobs:
           esac
           bash .github/scripts/check_build_paths.sh "$PWD" "$LIB" "$PWD/build"
 
+      # The installed library exports none of its static C++ runtime or nlohmann/json's code, and
+      # still its API (see the script)
+      - name: No C++ runtime in the library's exports
+        if: runner.os != 'Windows'
+        run: |
+          case "$RUNNER_OS" in
+            macOS) LIB=install/lib/libcppZarr.dylib ;;
+            *)     LIB=install/lib/libcppZarr.so ;;
+          esac
+          bash .github/scripts/check_exports.sh "$LIB"
+
       - name: C++ tests
         run: ctest --test-dir build --output-on-failure
 
@@ -110,6 +121,9 @@ jobs:
           esac
           "${CXX:-g++}" -O2 -std=c++17 -shared python/cppzarr.cpp -o "python/cppzarr/cppzarr$EXT" \
             -Iinstall/include -Linstall/lib -lcppZarr $FLAGS
+          if [ "$RUNNER_OS" = macOS ]; then
+            bash .github/scripts/check_exports.sh install/lib/libcppZarr.dylib "python/cppzarr/cppzarr$EXT"
+          fi
           PYTHONPATH=python python python/tests/test_python.py
 
   matlab:

@@ -57,9 +57,12 @@ function build_mex(installDir, outDir)
                        ['LDFLAGS=-bundle -Wl,-twolevel_namespace -fopenmp -isysroot ' sdk ' -Wl,-rpath,' lib], ...
                        ['LINKLIBS=-L"' fullfile(matlabroot, 'bin', 'maca64') '" -lmx -lmex -lmat -L"' lib '" -lcppZarr']}];
     else
-        % The rpath lets the mex files find libcppZarr at run time.
+        % The rpath lets the mex files find libcppZarr at run time. The library keeps its C++ runtime
+        % to itself (CMakeLists.txt's CPPZARR_PRIVATE_RUNTIME), and a static libstdc++ keeps the mex
+        % files independent of the older libstdc++ that MATLAB loads itself (as cpp-tiff's are built
+        % here; the release builds ship the libstdc++ they link next to the mex files instead).
         args = [args, {'CXXFLAGS=$CXXFLAGS -fopenmp', ...
-                       ['LDFLAGS=$LDFLAGS -fopenmp -Wl,-rpath,' lib], '-lcppZarr'}];
+                       ['LDFLAGS=$LDFLAGS -fopenmp -static-libstdc++ -Wl,-rpath,' lib], '-lcppZarr'}];
     end
 
     for i = 1:size(mexes, 1)

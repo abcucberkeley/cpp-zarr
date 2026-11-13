@@ -221,49 +221,67 @@ target_link_libraries(cppZarr_shared PRIVATE
 if(MINGW)
     target_link_options(cppZarr_shared PRIVATE -Wl,--allow-multiple-definition)
 endif()
-# CPPZARR_PRIVATE_RUNTIME (Linux): keep the static C++ runtime (and the other static libraries)
-# private to the library. Exported, programs that load another C++ runtime after cpp-zarr (Python
-# with PyTorch, for one) bound some of its symbols to this copy and crashed, so the Python wheel
-# turns it on. Off by default: programs built against the library's exported runtime (Parallel
-# Imaris Writer) need it.
+# CPPZARR_PRIVATE_RUNTIME (Linux and macOS, on by default, as cpp-tiff's CPPTIFF_PRIVATE_RUNTIME is): keep the
+# library's static C++ runtime, and the nlohmann/json code it builds in, out of its exports. Exported, programs and
+# modules with a C++ runtime of their own bound some of its symbols to this copy, two runtimes in one process: Python
+# crashed when PyTorch was imported after cpp-zarr had been used (Linux), std::filesystem::copy aborted in a program
+# with Homebrew's libstdc++ (macOS), and on macOS the loader merges the exported weak definitions of one name across
+# every image a process loads (the first one loaded wins), so that with cpp-tiff's Python module loaded first,
+# cpp-zarr's first write crashed, running the other module's copy of the runtime's template code on that copy's
+# state. The library exports its API, the zarr class and the functions of its installed headers, and the programs,
+# modules and MEX files that link it bring their own C++ runtime. Turn it off for a program built to take its runtime
+# from the library's exports (as Parallel Imaris Writer's releases before its own runtime were), and in a build that
+# gives this target a version script of its own: GNU ld takes one anonymous version script ("anonymous version tag
+# cannot be combined with other version tags"). Linux: no symbol of the static libraries exported (--exclude-libs:
+# the C++ runtime, blosc, zstd, LZ4, zlib and libuuid, none of whose headers the library installs), and a version
+# script for the template code of std and nlohmann/json that the library's own objects instantiate (it keeps default
+# visibility); macOS: an unexported-symbols list. The patterns are mangled names: std's, its short forms (Sa, Sb, Ss,
+# Si, So, Sd), its typeinfo, vtables, guards, thunks and TLS functions, __gnu_cxx's, __cxxabiv1's, the typeinfo of
+# built-in types, operator new and delete and the C++ ABI's C functions (cpp-tiff's list), thunks to the short forms'
+# members (on macOS the library exported eight, of std::basic_iostream's, basic_istream's and basic_ostream's
+# destructors: _ZThn16_NSdD1Ev and the like), and nlohmann's.
 #
 # On Linux the library's own calls are bound to its own static blosc, zstd, LZ4, zlib and C++
-# runtime (-Bsymbolic; the symbols stay exported). Otherwise, once the host has loaded another
-# zstd into its global scope (MATLAB loads its own at startup), the library's zstd calls went to
-# that one: writes of zstd arrays from MATLAB took 1.25 times as long. The unwinder is the shared
-# libgcc_s every C++ program uses: a private static copy could not unwind the library's
-# exceptions through its callers' code. (macOS and Windows already bind a library's calls to its
-# own definitions, all but the weak ones on macOS: see below.)
-option(CPPZARR_PRIVATE_RUNTIME "Keep the library's static C++ runtime private (Linux and macOS)" OFF)
+# runtime (-Bsymbolic; with CPPZARR_PRIVATE_RUNTIME off, those symbols stay exported). Otherwise,
+# once the host has loaded another zstd into its global scope (MATLAB loads its own at startup), the
+# library's zstd calls went to that one: writes of zstd arrays from MATLAB took 1.25 times as long.
+# The unwinder is the shared libgcc_s every C++ program uses: a private static copy could not unwind
+# the library's exceptions through its callers' code. (macOS and Windows already bind a library's
+# calls to its own definitions, all but the weak ones on macOS.)
+option(CPPZARR_PRIVATE_RUNTIME "Keep the library's static C++ runtime private (Linux and macOS)" ON)
+set(CPPZARR_RUNTIME_SYMBOLS
+    "_ZNSt*" "_ZNKSt*" "_ZSt*" "_ZTISt*" "_ZTSSt*" "_ZTVSt*" "_ZTTSt*" "_ZGVZNSt*" "_ZGVNSt*" "_ZGVZNKSt*"
+    "_ZTINSt*" "_ZTSNSt*" "_ZTVNSt*" "_ZTTNSt*" "_ZTHSt*" "_ZTWSt*" "_ZTHNSt*" "_ZTWNSt*"
+    "_ZNSa*" "_ZNKSa*" "_ZNSb*" "_ZNKSb*" "_ZNSs*" "_ZNKSs*" "_ZNSi*" "_ZNKSi*" "_ZNSo*" "_ZNKSo*" "_ZNSd*" "_ZNKSd*"
+    "_ZTISa*" "_ZTISb*" "_ZTISs*" "_ZTISi*" "_ZTISo*" "_ZTISd*" "_ZTSSa*" "_ZTSSb*" "_ZTSSs*" "_ZTSSi*" "_ZTSSo*" "_ZTSSd*"
+    "_ZTVSa*" "_ZTVSb*" "_ZTVSs*" "_ZTVSi*" "_ZTVSo*" "_ZTVSd*" "_ZTTSi*" "_ZTTSo*" "_ZTTSd*"
+    "_ZThn*St*" "_ZTv*St*" "_ZTch*St*" "_ZTh*_NS[abdios]*" "_ZTv*_NS[abdios]*" "_ZTc*_NS[abdios]*"
+    "_ZN9__gnu_cxx*" "_ZNK9__gnu_cxx*" "_ZTIN9__gnu_cxx*" "_ZTSN9__gnu_cxx*" "_ZTVN9__gnu_cxx*" "_ZGVZN9__gnu_cxx*"
+    "_ZN10__cxxabiv1*" "_ZNK10__cxxabiv1*" "_ZTIN10__cxxabiv1*" "_ZTSN10__cxxabiv1*" "_ZTVN10__cxxabiv1*"
+    "_ZTI?" "_ZTS?" "_ZTIP?" "_ZTSP?" "_ZTIPK?" "_ZTSPK?" "_ZTID?" "_ZTSD?" "_ZTIPD?" "_ZTSPD?" "_ZTIPKD?" "_ZTSPKD?"
+    "_ZZNSt*" "_ZZNKSt*" "__cxa_*" "__gxx_personality*" "__dynamic_cast" "_Znw*" "_Zna*" "_Zdl*" "_Zda*"
+    "_ZN8nlohmann*" "_ZNK8nlohmann*" "_ZZN8nlohmann*" "_ZZNK8nlohmann*" "_ZGVZN8nlohmann*"
+    "_ZTIN8nlohmann*" "_ZTSN8nlohmann*" "_ZTVN8nlohmann*")
 if(UNIX AND NOT APPLE)
     if(CPPZARR_PRIVATE_RUNTIME)
-        target_link_options(cppZarr_shared PRIVATE -Wl,--exclude-libs,ALL)
+        string(REPLACE ";" ";\n    " CPPZARR_RUNTIME_LOCAL "${CPPZARR_RUNTIME_SYMBOLS}")
+        set(CPPZARR_RUNTIME_MAP "${CMAKE_CURRENT_BINARY_DIR}/cppzarr_private_runtime.map")
+        file(WRITE "${CPPZARR_RUNTIME_MAP}" "{\n  local:\n    ${CPPZARR_RUNTIME_LOCAL};\n};\n")
+        target_link_options(cppZarr_shared PRIVATE -Wl,--exclude-libs,ALL "LINKER:--version-script,${CPPZARR_RUNTIME_MAP}")
+        set_property(TARGET cppZarr_shared APPEND PROPERTY LINK_DEPENDS "${CPPZARR_RUNTIME_MAP}")
     endif()
     target_link_options(cppZarr_shared PRIVATE -Wl,-Bsymbolic)
 else()
     target_link_libraries(cppZarr_shared PRIVATE -static-libgcc)
-endif()
-# (macOS) CPPZARR_PRIVATE_RUNTIME leaves the static C++ runtime's symbols out of the library's exports:
-# the loader merges exported weak definitions of one name across every image a process has loaded
-# (the first one loaded wins), so that the library's template code from the runtime could run another
-# library's or module's copy of it, on that copy's state (cpp-tiff's Python module loaded first made
-# cpp-zarr's first write crash, in pybind11's std::call_once in the module, which hides its own too)
-if(APPLE AND CPPZARR_PRIVATE_RUNTIME)
-    set(CPPZARR_RUNTIME_SYMBOLS
-        "__ZNSt*" "__ZNKSt*" "__ZSt*" "__ZTISt*" "__ZTSSt*" "__ZTVSt*" "__ZTTSt*" "__ZGVZNSt*" "__ZGVNSt*" "__ZGVZNKSt*"
-        "__ZTINSt*" "__ZTSNSt*" "__ZTVNSt*" "__ZTTNSt*" "__ZTHSt*" "__ZTWSt*" "__ZTHNSt*" "__ZTWNSt*"
-        "__ZNSa*" "__ZNKSa*" "__ZNSb*" "__ZNKSb*" "__ZNSs*" "__ZNKSs*" "__ZNSi*" "__ZNKSi*" "__ZNSo*" "__ZNKSo*" "__ZNSd*" "__ZNKSd*"
-        "__ZTISa*" "__ZTISb*" "__ZTISs*" "__ZTISi*" "__ZTISo*" "__ZTISd*" "__ZTSSa*" "__ZTSSb*" "__ZTSSs*" "__ZTSSi*" "__ZTSSo*" "__ZTSSd*"
-        "__ZTVSa*" "__ZTVSb*" "__ZTVSs*" "__ZTVSi*" "__ZTVSo*" "__ZTVSd*" "__ZTTSi*" "__ZTTSo*" "__ZTTSd*"
-        "__ZN9__gnu_cxx*" "__ZNK9__gnu_cxx*" "__ZTIN9__gnu_cxx*" "__ZTSN9__gnu_cxx*" "__ZTVN9__gnu_cxx*" "__ZGVZN9__gnu_cxx*"
-        "__ZN10__cxxabiv1*" "__ZNK10__cxxabiv1*" "__ZTIN10__cxxabiv1*" "__ZTSN10__cxxabiv1*" "__ZTVN10__cxxabiv1*"
-        "__ZZNSt*" "__ZZNKSt*" "___cxa_*" "___gxx_personality*" "___dynamic_cast" "__Znw*" "__Zna*" "__Zdl*" "__Zda*"
-        # (and nlohmann/json's, which the library builds in too)
-        "__ZN8nlohmann*" "__ZNK8nlohmann*" "__ZZN8nlohmann*" "__ZZNK8nlohmann*" "__ZGVZN8nlohmann*"
-        "__ZTIN8nlohmann*" "__ZTSN8nlohmann*" "__ZTVN8nlohmann*")
-    string(REPLACE ";" "\n" CPPZARR_RUNTIME_SYMBOLS_TEXT "${CPPZARR_RUNTIME_SYMBOLS}")
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cppzarr_private_runtime.txt" "${CPPZARR_RUNTIME_SYMBOLS_TEXT}\n")
-    target_link_options(cppZarr_shared PRIVATE "LINKER:-unexported_symbols_list,${CMAKE_CURRENT_BINARY_DIR}/cppzarr_private_runtime.txt")
+    if(APPLE AND CPPZARR_PRIVATE_RUNTIME)
+        # (Mach-O names start with one more _)
+        list(TRANSFORM CPPZARR_RUNTIME_SYMBOLS PREPEND "_" OUTPUT_VARIABLE CPPZARR_RUNTIME_MACHO)
+        string(REPLACE ";" "\n" CPPZARR_RUNTIME_TEXT "${CPPZARR_RUNTIME_MACHO}")
+        set(CPPZARR_RUNTIME_LIST "${CMAKE_CURRENT_BINARY_DIR}/cppzarr_private_runtime.txt")
+        file(WRITE "${CPPZARR_RUNTIME_LIST}" "${CPPZARR_RUNTIME_TEXT}\n")
+        target_link_options(cppZarr_shared PRIVATE "LINKER:-unexported_symbols_list,${CPPZARR_RUNTIME_LIST}")
+        set_property(TARGET cppZarr_shared APPEND PROPERTY LINK_DEPENDS "${CPPZARR_RUNTIME_LIST}")
+    endif()
 endif()
 
 install(TARGETS cppZarr_shared
