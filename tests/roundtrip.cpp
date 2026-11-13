@@ -1961,6 +1961,120 @@ int main(int argc, char** argv){
             return ok;
         });
 
+        // Chunks of one channel each read into channels-last output: a thread takes the chunks side by side along
+        // the channel axis at once and copies a row of each in turn (copyBoxGroup)
+        check("chunks of one channel each read into channels-last output a group at a time: 2, 3 and 8 channels and regions "
+              "of some of them (and 9, a chunk at a time), every element size, plain and sharded (shards of every channel, "
+              "and of one channel each, read a chunk at a time), chunks of 1 MB (a part of each at a time, and whole) and "
+              "small ones, missing chunks (a group's others a chunk at a time) and all-zero ones in sparse reads, regions "
+              "that cut chunks, padded output rows and C order, 1, 4 and 16 threads; nothing outside the output written", [&](){
+            bool ok = true;
+            std::mt19937 grng(57);
+            const int threadsWere = omp_get_max_threads();
+            struct G { const char* dtype; V shape, inner, shard; };
+            std::vector<G> cases;
+            for (const char* dt : {"<u1", "<u2", "<u4", "<u8", "<c16"})
+                for (uint64_t nc : {2, 3, 8, 9}) cases.push_back({dt, {2, 9, 10, 40, nc}, {1, 4, 4, 16, 1}, {}});
+            for (uint64_t nc : {2, 3}){
+                cases.push_back({"<u2", {2, 9, 10, 40, nc}, {1, 4, 4, 16, 1}, {2, 8, 8, 32, nc}});
+                cases.push_back({"<u2", {2, 9, 10, 40, nc}, {1, 4, 4, 16, 1}, {2, 8, 8, 32, 1}});
+            }
+            // (chunks of 1 MB, z 8 by y 32 by x 2048 of uint16: those of a time point decoded a part at a time,
+            // those of both time points whole)
+            cases.push_back({"<u2", {2, 16, 64, 2048, 2}, {1, 8, 32, 2048, 1}, {}});
+            cases.push_back({"<u2", {2, 16, 64, 2048, 3}, {1, 8, 32, 2048, 1}, {1, 16, 64, 2048, 3}});
+            for (const G& c : cases){
+                const uint64_t bytes = dtypeInfo(c.dtype).bytes, nc = c.shape[4];
+                const std::string name = std::string(c.dtype+1) + "_c" + std::to_string(nc) +
+                                         (c.shard.empty() ? "" : "_sh" + std::to_string(c.shard[4])) + (c.inner[3] > 16 ? "_big" : "");
+                const std::string p = dir + "/rt_grp_" + name + ".zarr";
+                std::error_code ec;
+                std::filesystem::remove_all(p, ec);
+                {
+                    zarr Z;
+                    Z.set_fileName(p); Z.set_zarr_format(3); Z.set_cname("lz4"); Z.set_clevel(1); Z.set_order("C");
+                    Z.set_dtype(c.dtype); Z.set_shape(c.shape);
+                    if (c.shard.empty()) Z.set_chunks(c.inner);
+                    else { Z.set_chunks(c.shard); Z.set_shard(true); Z.set_chunk_shape(c.inner); }
+                    Z.write_zarray();
+                }
+                // C-order data, and a chunk's worth of zeros: of channel 0 alone at time 0 (a group with one chunk
+                // missing, or all zeros) and of every channel at time 1 (a group of them)
+                uint64_t n = 1;
+                for (const uint64_t v : c.shape) n *= v;
+                std::vector<uint8_t> data(n*bytes);
+                for (auto& v : data) v = (uint8_t)(1 + grng() % 250);
+                V cst(5);
+                for (uint64_t a = 1, d = 5; d-- > 0;){ cst[d] = a; a *= c.shape[d]; }
+                auto at = [&](uint64_t t, uint64_t z, uint64_t y, uint64_t x, uint64_t ch){
+                    return (t*cst[0] + z*cst[1] + y*cst[2] + x*cst[3] + ch*cst[4])*bytes;
+                };
+                for (uint64_t z = 0; z < c.inner[1]; z++) for (uint64_t y = 0; y < c.inner[2]; y++) for (uint64_t x = 0; x < c.inner[3]; x++){
+                    memset(&data[at(0, z, y, x, 0)], 0, bytes);
+                    for (uint64_t ch = 0; ch < nc; ch++) memset(&data[at(1, z, y, x, ch)], 0, bytes);
+                }
+                const V zeros(5, 0);
+                const uint8_t fillElem[16] = {0};
+                // (written sparse: the all-zero chunks missing; and not: stored, and read sparse)
+                for (const bool sparseWrite : {true, false}){
+                    {
+                        zarr W(p);
+                        W.set_chunkInfo(zeros, c.shape);
+                        if (parallelWriteZarr(W, data.data(), zeros, c.shape, c.shape, cst, bytes*8, false, false, sparseWrite))
+                            throw std::string("write: ") + W.get_errString();
+                    }
+                    for (const int threads : {1, 4, 16}){
+                        omp_set_num_threads(threads);
+                        for (int k = 0; k < 6 && ok; k++){
+                            // (whole; a time point; a region that cuts chunks; channels 1 and 2; a random box; and
+                            // whole in C order, into an output that holds the fill value)
+                            V s(5, 0), e = c.shape;
+                            if (k == 1) e[0] = 1;
+                            if (k == 2){ s = {0, 1, 3, 5, 0}; e = {2, c.shape[1]-1, c.shape[2]-2, c.shape[3]-3, nc}; }
+                            if (k == 3){ s[4] = 1; e[4] = std::min<uint64_t>(nc, 3); }
+                            if (k == 4) for (int d = 0; d < 4; d++){ s[d] = grng() % c.shape[d]; e[d] = s[d] + 1 + grng() % (c.shape[d] - s[d]); }
+                            V rs(5);
+                            uint64_t rn = 1;
+                            for (int d = 0; d < 5; d++){ rs[d] = e[d] - s[d]; rn *= rs[d]; }
+                            // channels-last: x and c together, 5 elements more between rows (but in C order)
+                            V st(5);
+                            st[4] = 1; st[3] = rs[4]; st[2] = rs[3]*rs[4] + (k == 5 ? 0 : 5); st[1] = st[2]*rs[2]; st[0] = st[1]*rs[1];
+                            const uint64_t span = st[0]*rs[0];
+                            std::vector<uint8_t> out((span + 16)*bytes, 0xEE);
+                            uint8_t* o = out.data() + 8*bytes;
+                            auto place = [&](uint64_t t, uint64_t z, uint64_t y, uint64_t x, uint64_t ch){
+                                return (t*st[0] + z*st[1] + y*st[2] + x*st[3] + ch*st[4])*bytes;
+                            };
+                            if (k == 5) memset(o, 0, rn*bytes);
+                            zarr R(p);
+                            R.set_chunkInfo(s, e);
+                            const uint8_t got = k == 5 ? parallelReadZarr(R, o, s, e, rs, bytes*8, true, !sparseWrite, true, nullptr)
+                                                       : parallelReadZarr(R, o, s, e, rs, bytes*8, true, false, st, fillElem);
+                            if (got){
+                                std::fprintf(stderr, "    %s: read %d: %s", name.c_str(), k, R.get_errString().c_str());
+                                ok = false;
+                                break;
+                            }
+                            std::vector<uint8_t> mine(out.size(), 0);
+                            for (uint64_t t = 0; t < rs[0] && ok; t++) for (uint64_t z = 0; z < rs[1] && ok; z++)
+                                for (uint64_t y = 0; y < rs[2] && ok; y++) for (uint64_t x = 0; x < rs[3] && ok; x++)
+                                    for (uint64_t ch = 0; ch < rs[4] && ok; ch++){
+                                        const uint64_t g = place(t, z, y, x, ch);
+                                        ok = memcmp(o + g, &data[at(s[0]+t, s[1]+z, s[2]+y, s[3]+x, s[4]+ch)], bytes) == 0;
+                                        memset(&mine[8*bytes + g], 1, bytes);
+                                    }
+                            for (size_t b = 0; b < out.size() && ok; b++) ok = mine[b] || out[b] == 0xEE;
+                            if (!ok) std::fprintf(stderr, "    %s: read %d with %d threads (sparse write %d) wrong\n", name.c_str(), k,
+                                                  threads, (int)sparseWrite);
+                        }
+                    }
+                }
+                std::filesystem::remove_all(p, ec);
+            }
+            omp_set_num_threads(threadsWere);
+            return ok;
+        });
+
         check("values converted between data types as MATLAB converts between classes (convertValues, for data written into "
               "an array of another type): integers rounded to the nearest, halves away from zero, saturated, NaN to 0; any "
               "nonzero value true; float16 directly from double and bfloat16 through float; only MATLAB's types as sources", [&](){

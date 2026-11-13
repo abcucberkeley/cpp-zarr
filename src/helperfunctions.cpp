@@ -896,6 +896,47 @@ static void copyBoxRows(const uint64_t bytes, const uint8_t* src, uint8_t* dst, 
     }
 }
 
+void copyBoxGroup(const uint64_t bytes, const uint8_t* const* srcs, uint8_t* const* dsts, const uint64_t k,
+                  const std::vector<uint64_t> &extents, const std::vector<uint64_t> &srcStrides,
+                  const std::vector<uint64_t> &dstStrides, const uint64_t r){
+    const uint64_t n = extents.size();
+    for(uint64_t d = 0; d < n; d++) if(extents[d] == 0) return;
+    CzScratch scratch;
+    uint64_t* buf = scratch.get(n, 4);
+    uint64_t *idx = buf, *oe = buf+n, *os = buf+2*n, *od = buf+3*n;
+    // The other axes that move, the smallest destination stride innermost
+    uint64_t m = 0;
+    for(uint64_t d = 0; d < n; d++){
+        if(d == r || extents[d] == 1) continue;
+        uint64_t p = m++;
+        while(p > 0 && od[p-1] > dstStrides[d]){ oe[p] = oe[p-1]; os[p] = os[p-1]; od[p] = od[p-1]; p--; }
+        oe[p] = extents[d]; os[p] = srcStrides[d]; od[p] = dstStrides[d];
+    }
+    const uint64_t len = extents[r], sr = srcStrides[r], dr = dstStrides[r];
+    uint64_t sOff = 0, dOff = 0;
+    while(true){
+        for(uint64_t j = 0; j < k; j++){
+            const uint8_t* s = srcs[j];
+            uint8_t* t = dsts[j];
+            switch(bytes){
+                case 1: copyRowStrided(s+sOff, t+dOff, len, sr, dr); break;
+                case 2: copyRowStrided((const uint16_t*)s+sOff, (uint16_t*)t+dOff, len, sr, dr); break;
+                case 4: copyRowStrided((const uint32_t*)s+sOff, (uint32_t*)t+dOff, len, sr, dr); break;
+                case 8: copyRowStrided((const uint64_t*)s+sOff, (uint64_t*)t+dOff, len, sr, dr); break;
+                case 16: copyRowStrided((const CzElem16*)s+sOff, (CzElem16*)t+dOff, len, sr, dr); break;
+                default: for(uint64_t e = 0; e < len; e++) memcpy(t+(dOff+e*dr)*bytes, s+(sOff+e*sr)*bytes, bytes);
+            }
+        }
+        uint64_t l = 0;
+        for(; l < m; l++){
+            idx[l]++; sOff += os[l]; dOff += od[l];
+            if(idx[l] < oe[l]) break;
+            sOff -= oe[l]*os[l]; dOff -= oe[l]*od[l]; idx[l] = 0;
+        }
+        if(l == m) return;
+    }
+}
+
 void copyBoxND(const uint64_t bytes, const void* src, void* dst,
                const std::vector<uint64_t> &extents,
                const std::vector<uint64_t> &srcStrides,

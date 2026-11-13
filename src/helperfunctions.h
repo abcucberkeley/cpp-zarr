@@ -168,6 +168,15 @@ void copyBoxND(const uint64_t bytes, const void* src, void* dst,
                const std::vector<uint64_t> &dstStrides,
                const bool spreadWrites = false);
 
+// Copy k boxes of the same extents, from k sources of the same strides into k destinations of the same strides
+// (strides in elements), a row along axis r of each in turn: for boxes whose destinations interleave (chunks of
+// one channel each read into channels-last output, side by side along the channel axis), each row of the
+// destination is written whole while it is in the cache, where copied a box at a time every box's pass wrote all
+// of the destination's cache lines again
+void copyBoxGroup(const uint64_t bytes, const uint8_t* const* srcs, uint8_t* const* dsts, const uint64_t k,
+                  const std::vector<uint64_t> &extents, const std::vector<uint64_t> &srcStrides,
+                  const std::vector<uint64_t> &dstStrides, const uint64_t r);
+
 // Set every element of an N-dimensional box (extents, strides in elements) of dst
 // to the element whose bytes are at `elem`
 void fillBoxND(const uint64_t bytes, void* dst,

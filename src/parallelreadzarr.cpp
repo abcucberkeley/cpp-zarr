@@ -484,6 +484,24 @@ struct ReadScratch {
         }
         return part.get();
     }
+    // A group's chunks (chunks copied together: see the main reads): room for at least n bytes in
+    // buffer slot (3 a chunk: its stored bytes, its bytes decoded, a part of it decoded on its own);
+    // when it has to grow it takes least at once
+    std::vector<std::unique_ptr<uint8_t[]>> group;
+    std::vector<uint64_t> groupCap;
+    uint8_t* groupBuffer(const size_t slot, const uint64_t n, const uint64_t least){
+        if(group.size() <= slot){
+            group.resize(slot+1);
+            groupCap.resize(slot+1, 0);
+        }
+        if(groupCap[slot] < n || !group[slot]){
+            const uint64_t cap = std::max<uint64_t>(std::max(n, least), 1);
+            group[slot].reset();
+            group[slot].reset(new uint8_t[cap]);
+            groupCap[slot] = cap;
+        }
+        return group[slot].get();
+    }
     void shrink(){
         const uint64_t keep = 1 << 20;
         if(storedCap > keep){
@@ -498,6 +516,12 @@ struct ReadScratch {
             dctx = nullptr;
         }
         largestBlock = 0;
+        for(size_t i = 0; i < group.size(); i++){
+            if(groupCap[i] > keep){
+                group[i].reset();
+                groupCap[i] = 0;
+            }
+        }
         if(shardIndex.capacity()*sizeof(uint64_t) > keep) std::vector<uint64_t>().swap(shardIndex);
         // Chunk files read ahead: buffers of up to 1 MB, as many as a run has files, and bigger
         // ones while all kept buffers stay within keptBufferCap() (writes' first: see
@@ -673,6 +697,11 @@ static uint8_t readZarrInto(zarr &Zarr, void* zarrArr,
     std::vector<uint64_t> outOrder(nDims);
     for(uint64_t d = 0; d < nDims; d++) outOrder[d] = nDims-1-d;
     std::stable_sort(outOrder.begin(), outOrder.end(), [&](uint64_t a, uint64_t b){ return outStrides[a] < outStrides[b]; });
+    // The chunks a thread of the main reads takes at once, side by side along axis groupAxis, and copies a row
+    // (along groupRow) of each in turn: 1 but for chunks of one channel each read into channels-last output (see
+    // the main reads)
+    int64_t groupK = 1;
+    uint64_t groupAxis = 0, groupRow = 0;
 
     // Sparse reads skip all-zero chunks, which the output already holds when the
     // fill value is zero
@@ -1388,6 +1417,76 @@ static uint8_t readZarrInto(zarr &Zarr, void* zarrArr,
             const uint64_t za = std::max(ga, ra), zb = std::min(ge, rb);
             if(zeroChunkUnc && !memcmp(zeroChunkUnc, buf+(za-ga), zb-za)) continue;
             copyChunkAt(buf, ga, cAV, boxExt, sliceAxis, b+za/sliceBytes-startCoords[sliceAxis], b+zb/sliceBytes-startCoords[sliceAxis]);
+        }
+        return true;
+    };
+
+    // Copy a group's chunks (groupK of them, side by side along groupAxis: decoded bytes from byte offset
+    // on, at indices cAVs) into the output, a row of each in turn (and inside [lo, hi) of the output's axis
+    // sAxis, when given)
+    auto copyGroupAt = [&](const uint8_t* const* data, const uint64_t offset, const std::vector<uint64_t>* cAVs,
+                           std::vector<uint64_t> &boxExt, const int64_t sAxis, const uint64_t sLo, const uint64_t sHi){
+        const uint8_t* srcs[8];
+        uint8_t* dsts[8];
+        for(int64_t j = 0; j < groupK; j++){
+            uint64_t srcOff = 0, dstOff = 0;
+            for(uint64_t d = 0; d < nDims; d++){
+                const uint64_t b = cAVs[j][d]*Zarr.get_chunks(d);
+                uint64_t lo = std::max(b, startCoords[d]);
+                uint64_t hi = std::min(b+Zarr.get_chunks(d), endCoords[d]);
+                if((int64_t)d == sAxis){
+                    lo = std::max(lo, startCoords[d]+sLo);
+                    hi = std::min(hi, startCoords[d]+sHi);
+                }
+                if(hi <= lo) return;
+                // (the same for each chunk of the group: they differ only along groupAxis, one element thick)
+                boxExt[d] = hi-lo;
+                srcOff += (lo-b)*chunkStrides[d];
+                dstOff += (lo-startCoords[d])*outStrides[d];
+            }
+            srcs[j] = data[j]+(srcOff*bytes-offset);
+            dsts[j] = (uint8_t*)zarrArr+dstOff*bytes;
+        }
+        copyBoxGroup(bytes, srcs, dsts, (uint64_t)groupK, boxExt, chunkStrides, outStrides, groupRow);
+    };
+    // A group of fusable chunks (stored bytes src, len of them, all decoded in units of unit bytes with
+    // item size typesize), as copyFused copies one: the same part of each decoded in turn, then the parts
+    // copied together
+    auto copyFusedGroup = [&](ReadScratch &sc, const uint8_t* const* src, const int64_t* len, const uint64_t unit,
+                              const uint64_t typesize, const std::vector<uint64_t>* cAVs, std::vector<uint64_t> &boxExt,
+                              const uint64_t s0, const uint64_t s1, const uint64_t spread, const std::string* subs,
+                              const std::string* const* names) -> bool {
+        const uint64_t partBytes = std::max<uint64_t>(1, (256 << 10)/unit)*unit;
+        const uint8_t* parts[8];
+        uint8_t* bufs[8];
+        for(int64_t j = 0; j < groupK; j++){
+            bufs[j] = sc.groupBuffer(3*(size_t)j+2, partBytes, partBytes);
+            parts[j] = bufs[j];
+            int32_t nbytes = 0, blocksize = 0;
+            blosc2_cbuffer_sizes(src[j], &nbytes, nullptr, &blocksize);
+            sc.largestBlock = std::max<uint64_t>(sc.largestBlock, (uint64_t)blocksize);
+        }
+        const uint64_t ra = s0*sliceBytes, rb = s1*sliceBytes;
+        const uint64_t pa = (ra/unit)*unit, pb = std::min(sB, ((rb+unit-1)/unit)*unit);
+        const uint64_t nParts = (pb-pa+partBytes-1)/partBytes;
+        const uint64_t first = (((spread*0x9E3779B97F4A7C15ULL) >> 32)*nParts) >> 32;
+        const uint64_t b = cAVs[0][sliceAxis]*Zarr.get_chunks(sliceAxis);
+        for(uint64_t q = 0; q < nParts; q++){
+            const uint64_t ga = pa+((first+q)%nParts)*partBytes, ge = std::min(pb, ga+partBytes);
+            const uint64_t za = std::max(ga, ra), zb = std::min(ge, rb);
+            bool allZero = zeroChunkUnc != nullptr;
+            for(int64_t j = 0; j < groupK; j++){
+                const int n = blosc2_getitem_ctx(sc.dctx, src[j], (int32_t)len[j], (int)(ga/typesize), (int)((ge-ga)/typesize),
+                                                 bufs[j], (int32_t)(ge-ga));
+                if(n != (int)(ge-ga)){
+                    fail("Decompression error. Error code: "+std::to_string(n)+" ChunkName: "+
+                         Zarr.get_fileName()+"/"+subs[j]+"/"+*names[j]+"\n");
+                    return false;
+                }
+                if(allZero && memcmp(zeroChunkUnc, bufs[j]+(za-ga), zb-za)) allZero = false;
+            }
+            if(allZero) continue;
+            copyGroupAt(parts, ga, cAVs, boxExt, sliceAxis, b+za/sliceBytes-startCoords[sliceAxis], b+zb/sliceBytes-startCoords[sliceAxis]);
         }
         return true;
     };
@@ -2174,10 +2273,33 @@ static uint8_t readZarrInto(zarr &Zarr, void* zarrArr,
     // thread need (22 for 65 chunks on 24 threads): more would take as long, and fault in
     // more fresh buffers of their size (which the pool does not keep), which made reads
     // without huge pages up to 11% slower.
+    //
+    // Chunks one element thick along the output's fastest axis, side by side along it, fill each of
+    // its rows together: chunks of one channel each read into channels-last output, 2 to 8 channels.
+    // There a thread takes the chunks side by side at once (the next ones in the output's order: in
+    // a sharded array those of one shard), reads and decodes each, and copies a row of each in turn
+    // (copyBoxGroup), so that each row of the output is written whole while it is in the cache; fusable
+    // ones a part at a time, the same part of each. Copied a chunk at a time, each chunk's pass wrote
+    // all of the output's cache lines again.
     else{
-        const int32_t team = (int32_t)std::max<int64_t>(1, sB >= bigChunk && !fusable && !zstdFusable && perThread > 0 ?
-                                                           (nItems+perThread-1)/perThread : std::min<int64_t>(numWorkers, nItems));
-        WorkRanges work(team, nItems);
+        if(nDims >= 2 && readThreads == 0 && aheadBudget == 0 && regular){
+            const uint64_t a0 = outOrder[0], a1 = outOrder[1], k = readShape[a0];
+            bool together = k >= 2 && k <= 8 && Zarr.get_chunks(a0) == 1 && outStrides[a0] == 1 && outStrides[a1] == k &&
+                            chunkStrides[a1] == 1 && readShape[a1] > 1 && nItems%(int64_t)k == 0;
+            if(together && Zarr.get_shard()){
+                const uint64_t shardExtent = innerCount[a0]*Zarr.get_chunks(a0);
+                together = startCoords[a0]/shardExtent == (endCoords[a0]-1)/shardExtent;
+            }
+            if(together){
+                groupK = (int64_t)k;
+                groupAxis = a0;
+                groupRow = a1;
+            }
+        }
+        const int64_t nWork = nItems/groupK, perWork = nWork > 0 ? (nWork+numWorkers-1)/numWorkers : 0;
+        const int32_t team = (int32_t)std::max<int64_t>(1, sB >= bigChunk && !fusable && !zstdFusable && perWork > 0 ?
+                                                           (nWork+perWork-1)/perWork : std::min<int64_t>(numWorkers, nWork));
+        WorkRanges work(team, nWork);
         // (in a region of all of the threads, those past the team doing nothing: OpenMP ends
         // the threads a smaller region leaves out, and starts them again for the next bigger
         // one, which made reads of small regions of changing sizes up to 8 times slower)
@@ -2203,63 +2325,145 @@ static uint8_t readZarrInto(zarr &Zarr, void* zarrArr,
                 catch(const std::exception &e){
                     fail(std::string("Read error: ")+e.what()+"\n");
                 }
+                // A chunk's stored bytes (len of them) decoded and copied into the output; false after an error
+                auto finishChunk = [&](const uint8_t* stored, const int64_t fileLen, const std::vector<uint64_t> &cAV,
+                                       const std::string &subfolderName, const std::string &name, const int64_t it) -> bool {
+                    // A fusable chunk a part at a time, from a part that depends on its place
+                    // in the list
+                    uint64_t from = 0, to = sB, typesize = 0;
+                    bytesInRegion(cAV, from, to);
+                    const uint64_t unit = fusable ? fusedUnit(stored, fileLen, typesize) : 0;
+                    if(unit) return copyFused(*scratch, stored, fileLen, unit, typesize, cAV, boxExt, from/sliceBytes, to/sliceBytes,
+                                              (uint64_t)it, subfolderName, name);
+                    const int streamed = zstdFusable ? zstdStreamed(stored, fileLen) : 0;
+                    if(streamed) return copyZstdStream(*scratch, stored, fileLen, streamed == 2, cAV, boxExt, from/sliceBytes,
+                                                       to/sliceBytes, subfolderName, name);
+                    // Otherwise decompressed (a blosc chunk only for its slices inside the
+                    // region); uncompressed chunks are used straight from the file buffer
+                    const uint8_t* chunkData = stored;
+                    if(compressor != "none"){
+                        if(!decoded) decoded = scratch->decodedBuffer(sB);
+                        if(!decodeChunkRange(*scratch, scratch->dctx, stored, fileLen, decoded, from, to, subfolderName, name)) return false;
+                        chunkData = decoded;
+                    }
+
+                    // If the chunk is all zeros (in the region's slices), skip it
+                    if(zeroChunkUnc && !memcmp(zeroChunkUnc, chunkData+from, to-from)) return true;
+
+                    copyChunk(chunkData, cAV, boxExt, -1, 0, 0);
+                    return true;
+                };
+                // Chunk it (its place in the output's order) read, decoded and copied; false after an error
+                auto oneChunk = [&](const int64_t it) -> bool {
+                    const int64_t f = Zarr.get_shard() ? items[it] : listIndex(it);
+                    const std::string &name = Zarr.get_chunkNames(f);
+                    const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(name);
+                    // (a shard's subfolder comes from the shard's own indices)
+                    const std::string subfolderName = Zarr.get_subfoldersString(Zarr.get_shard() ? Zarr.chunkToShard(cAV) : cAV);
+                    uint8_t* stored = nullptr;
+                    const int64_t fileLen = readChunk(ss, name, cAV, subfolderName, [&](const uint64_t n){
+                        return scratch->storedBuffer(n, storedRoom);
+                    }, stored, w, it);
+                    if(fileLen == -2) return false;
+                    // On an NVMe drive, the thread's next chunk file is read ahead while this one
+                    // is decoded, which keeps more reads in flight: cold whole-array reads took
+                    // up to 6% longer without it
+                    if(!Zarr.get_shard() && groupK == 1){
+                        const int64_t nx = work.peek(w);
+                        if(nx >= 0 && disk() == 2){
+                            const std::string &nextName = Zarr.get_chunkNames(listIndex(nx));
+                            readAheadFile(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(nextName))+"/"+Zarr.chunkKey(nextName));
+                        }
+                    }
+                    if(fileLen == -1){
+                        noteMissing(cAV);
+                        return true;
+                    }
+                    return finishChunk(stored, fileLen, cAV, subfolderName, name, it);
+                };
+                // Group g's chunks (groupK of them, side by side along groupAxis) read, decoded and copied
+                // together; false after an error. Chunks that are not side by side are copied one at a
+                // time, and so are a group's chunks when one of them was never written.
+                auto oneGroup = [&](const int64_t g) -> bool {
+                    std::vector<uint64_t> cAVs[8];
+                    const std::string* names[8];
+                    std::string subs[8];
+                    const uint8_t* stored[8];
+                    int64_t lens[8];
+                    bool sideBySide = true;
+                    for(int64_t j = 0; j < groupK; j++){
+                        const int64_t f = Zarr.get_shard() ? items[g*groupK+j] : listIndex(g*groupK+j);
+                        names[j] = &Zarr.get_chunkNames(f);
+                        cAVs[j] = Zarr.get_chunkAxisVals(*names[j]);
+                        for(uint64_t d = 0; d < nDims && j > 0 && sideBySide; d++){
+                            sideBySide = cAVs[j].size() == nDims && cAVs[j][d] == cAVs[0][d]+(d == groupAxis ? (uint64_t)j : 0);
+                        }
+                    }
+                    if(!sideBySide){
+                        for(int64_t j = 0; j < groupK; j++) if(!oneChunk(g*groupK+j)) return false;
+                        return true;
+                    }
+                    bool anyMissing = false;
+                    for(int64_t j = 0; j < groupK; j++){
+                        subs[j] = Zarr.get_subfoldersString(Zarr.get_shard() ? Zarr.chunkToShard(cAVs[j]) : cAVs[j]);
+                        uint8_t* got = nullptr;
+                        lens[j] = readChunk(ss, *names[j], cAVs[j], subs[j], [&](const uint64_t n){
+                            return scratch->groupBuffer(3*(size_t)j, n, storedRoom);
+                        }, got, w, g*groupK+j);
+                        if(lens[j] == -2) return false;
+                        stored[j] = got;
+                        if(lens[j] == -1) anyMissing = true;
+                    }
+                    // (a chunk that was never written reads as the fill value)
+                    if(anyMissing){
+                        for(int64_t j = 0; j < groupK; j++){
+                            if(lens[j] == -1) noteMissing(cAVs[j]);
+                            else if(!finishChunk(stored[j], lens[j], cAVs[j], subs[j], *names[j], g*groupK+j)) return false;
+                        }
+                        return true;
+                    }
+                    // (the same slices of each: they differ only along groupAxis)
+                    uint64_t from = 0, to = sB;
+                    bytesInRegion(cAVs[0], from, to);
+                    if(fusable){
+                        uint64_t unit = 0, typesize = 0;
+                        bool same = true;
+                        for(int64_t j = 0; j < groupK && same; j++){
+                            uint64_t ts = 0;
+                            const uint64_t u = fusedUnit(stored[j], lens[j], ts);
+                            if(j == 0){
+                                unit = u;
+                                typesize = ts;
+                            }
+                            same = u && u == unit && ts == typesize;
+                        }
+                        if(same) return copyFusedGroup(*scratch, stored, lens, unit, typesize, cAVs, boxExt, from/sliceBytes,
+                                                       to/sliceBytes, (uint64_t)g, subs, names);
+                    }
+                    // (the zstd codec's chunks are decoded whole here: decoded a part at a time, each would be
+                    // copied on its own)
+                    const uint8_t* data[8];
+                    for(int64_t j = 0; j < groupK; j++){
+                        if(compressor == "none") data[j] = stored[j];
+                        else{
+                            uint8_t* d = scratch->groupBuffer(3*(size_t)j+1, sB, sB);
+                            if(!decodeChunkRange(*scratch, scratch->dctx, stored[j], lens[j], d, from, to, subs[j], *names[j])) return false;
+                            data[j] = d;
+                        }
+                    }
+                    // (all zeros in the region's slices, in a sparse read: the output holds them already)
+                    if(zeroChunkUnc){
+                        bool allZero = true;
+                        for(int64_t j = 0; j < groupK && allZero; j++) allZero = !memcmp(zeroChunkUnc, data[j]+from, to-from);
+                        if(allZero) return true;
+                    }
+                    copyGroupAt(data, 0, cAVs, boxExt, -1, 0, 0);
+                    return true;
+                };
                 // An exception cannot leave the parallel region: report it as an error
                 for(int64_t it = (err || !scratch) ? -1 : work.next(w); it >= 0; it = err ? -1 : work.next(w)){
-                    const int64_t f = Zarr.get_shard() ? items[it] : listIndex(it);
                     try{
-                        const std::string &name = Zarr.get_chunkNames(f);
-                        const std::vector<uint64_t> cAV = Zarr.get_chunkAxisVals(name);
-                        // (a shard's subfolder comes from the shard's own indices)
-                        const std::string subfolderName = Zarr.get_subfoldersString(Zarr.get_shard() ? Zarr.chunkToShard(cAV) : cAV);
-                        uint8_t* stored = nullptr;
-                        const int64_t fileLen = readChunk(ss, name, cAV, subfolderName, [&](const uint64_t n){
-                            return scratch->storedBuffer(n, storedRoom);
-                        }, stored, w, it);
-                        if(fileLen == -2) break;
-                        // On an NVMe drive, the thread's next chunk file is read ahead while this one
-                        // is decoded, which keeps more reads in flight: cold whole-array reads took
-                        // up to 6% longer without it
-                        if(!Zarr.get_shard()){
-                            const int64_t nx = work.peek(w);
-                            if(nx >= 0 && disk() == 2){
-                                const std::string &nextName = Zarr.get_chunkNames(listIndex(nx));
-                                readAheadFile(Zarr.get_fileName()+"/"+Zarr.get_subfoldersString(Zarr.get_chunkAxisVals(nextName))+"/"+Zarr.chunkKey(nextName));
-                            }
-                        }
-                        if(fileLen == -1){
-                            noteMissing(cAV);
-                            continue;
-                        }
-
-                        // A fusable chunk a part at a time, from a part that depends on its place
-                        // in the list
-                        uint64_t from = 0, to = sB, typesize = 0;
-                        bytesInRegion(cAV, from, to);
-                        const uint64_t unit = fusable ? fusedUnit(stored, fileLen, typesize) : 0;
-                        if(unit){
-                            if(!copyFused(*scratch, stored, fileLen, unit, typesize, cAV, boxExt, from/sliceBytes, to/sliceBytes, (uint64_t)it,
-                                          subfolderName, name)) break;
-                            continue;
-                        }
-                        const int streamed = zstdFusable ? zstdStreamed(stored, fileLen) : 0;
-                        if(streamed){
-                            if(!copyZstdStream(*scratch, stored, fileLen, streamed == 2, cAV, boxExt, from/sliceBytes, to/sliceBytes,
-                                               subfolderName, name)) break;
-                            continue;
-                        }
-                        // Otherwise decompressed (a blosc chunk only for its slices inside the
-                        // region); uncompressed chunks are used straight from the file buffer
-                        const uint8_t* chunkData = stored;
-                        if(compressor != "none"){
-                            if(!decoded) decoded = scratch->decodedBuffer(sB);
-                            if(!decodeChunkRange(*scratch, scratch->dctx, stored, fileLen, decoded, from, to, subfolderName, name)) break;
-                            chunkData = decoded;
-                        }
-
-                        // If the chunk is all zeros (in the region's slices), skip it
-                        if(zeroChunkUnc && !memcmp(zeroChunkUnc, chunkData+from, to-from)) continue;
-
-                        copyChunk(chunkData, cAV, boxExt, -1, 0, 0);
+                        if(!(groupK > 1 ? oneGroup(it) : oneChunk(it))) break;
                     }
                     catch(const std::exception &e){
                         fail(std::string("Read error: ")+e.what()+"\n");
