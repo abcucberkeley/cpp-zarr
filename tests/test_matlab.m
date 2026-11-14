@@ -635,6 +635,40 @@ function test_matlab(mexDir)
     rmdir(fk, 's');
     fprintf('PASS  clear mex, and reads and writes after it\n');
 
+    % On Windows clear mex unloads the mex files, so that they can be replaced, also after a write
+    % that converts its data and a read that widens float16 values: their conversions run on the
+    % library's threads (each Windows mex file has an OpenMP runtime of its own, whose threads, once
+    % its own loops had started them, kept it loaded after clear mex, and hung MATLAB as it exited).
+    % The library stays loaded until MATLAB exits (see helperfunctions.cpp)
+    if ispc
+        fw = fullfile(tmp, 'unload_convert.zarr');
+        fh = fullfile(tmp, 'unload_half.zarr');
+        wv = single(rand(256, 256, 64) * 60000);
+        parallelWriteZarr(fw, zeros(256, 256, 64, 'uint16'), 'chunks', [128 128 32]);
+        % (a region written into an existing array of another class is converted to the array's)
+        parallelWriteZarr(fw, wv, 'bbox', [1 1 1 256 256 64], 'threads', 4);
+        parallelWriteZarr(fh, double(wv) / 3, 'dtype', 'float16', 'chunks', [128 128 32]);
+        assert(isa(parallelReadZarr(fh, 'threads', 4), 'single'), 'a float16 array was read as another class');
+        mexes = {'parallelWriteZarr', 'parallelReadZarr'};
+        copies = cell(size(mexes));
+        for k = 1:numel(mexes)
+            copies{k} = [tempname '.mexw64'];
+            copyfile(fullfile(mexDir, [mexes{k} '.mexw64']), copies{k});
+        end
+        clear mex
+        for k = 1:numel(mexes)
+            [ok, msg] = copyfile(copies{k}, fullfile(mexDir, [mexes{k} '.mexw64']), 'f');
+            assert(ok, '%s stayed loaded after clear mex: %s', mexes{k}, msg);
+            delete(copies{k});
+        end
+        [~, out] = system(sprintf('tasklist /m libcppZarr.dll /fi "PID eq %d" /nh', feature('getpid')));
+        assert(contains(lower(out), 'matlab.exe'), 'libcppZarr.dll was unloaded at clear mex: %s', strtrim(out));
+        assert(isequal(parallelReadZarr(fw), uint16(wv)), 'a read after clear mex differs from the converted write');
+        rmdir(fw, 's');
+        rmdir(fh, 's');
+        fprintf('PASS  clear mex unloads the mex files on Windows, after conversions, and keeps the library\n');
+    end
+
     % Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
     % arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
     % Full and region reads match what zarr-python reads, arrays cpp-zarr cannot read

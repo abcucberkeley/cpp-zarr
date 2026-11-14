@@ -106,6 +106,27 @@ float bfloat16ToFloat(uint16_t b);
 // types MATLAB has: bool, integers of 1 to 8 bytes, float32 and float64. Returns false for other types.
 bool convertValues(const void* src, const std::string &srcDtype, void* dst, const std::string &dstDtype, const uint64_t n);
 
+// convertValues for n values held as their real parts at re and their imaginary parts at im (NULL for real
+// values), each stride values of the parts' type partDtype (a source type of convertValues) after the one
+// before: 1 for parts kept apart, as MATLAB's separate complex API keeps them, and 2 for complex numbers kept
+// whole, as Zarr and MATLAB's interleaved complex API keep them (im then one part after re). Values with
+// imaginary parts convert only into complex types. Returns false for other types.
+bool convertValueParts(const void* re, const void* im, const uint64_t stride, const std::string &partDtype,
+                       void* dst, const std::string &dstDtype, const uint64_t n);
+
+// n float16 values at src (bfloat16 ones, when bfloat16 is true), as their bits, as float32 values at dst
+// (exactly), as MATLAB reads arrays of those types
+void widenToFloat(const uint16_t* src, const bool bfloat16, float* dst, const uint64_t n);
+
+// n complex numbers at src (each its real part, then its imaginary part) as their real parts at re and their
+// imaginary parts at im, as MATLAB's separate complex API keeps them
+void splitComplex(const float* src, float* re, float* im, const uint64_t n);
+void splitComplex(const double* src, double* re, double* im, const uint64_t n);
+// (These and convertValues run on the calling thread's OpenMP threads, as setCallThreads sets them. The mex
+// files call them rather than converting with OpenMP of their own: on Windows each mex file has a private
+// OpenMP runtime, whose threads, once started, kept the mex file loaded after MATLAB released it, and the last
+// of them to end unloaded it, holding the loader lock, which hung MATLAB as it exited.)
+
 // Parse a zarr fill_value string for memset-style fills. Returns 0 for anything
 // unparsable or outside int range (e.g. the int64 min/max strings that
 // Infinity/-Infinity fill values normalize to), instead of throwing like stoi.

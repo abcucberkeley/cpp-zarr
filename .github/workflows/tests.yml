@@ -212,3 +212,18 @@ jobs:
       - name: Check MATLAB tests passed
         shell: bash
         run: test -f matlab-tests-passed || { echo "::error::MATLAB tests did not finish, see the previous step's log"; exit 1; }
+
+      # The mex files run no OpenMP loops of their own (see the script)
+      - name: No OpenMP in the mex files
+        run: bash .github/scripts/check_mex_openmp.sh mex/*.mex*
+
+      # The Windows mex files, with the DLLs they load (build_mex copies them next to the mex files),
+      # for testing them in other projects' workflows
+      - name: Upload the Windows mex files
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mex-windows
+          path: mex/
+          if-no-files-found: error
+          retention-days: 14

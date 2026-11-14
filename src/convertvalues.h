@@ -1,7 +1,9 @@
 #ifndef CPPZARR_CONVERTVALUES_H
 #define CPPZARR_CONVERTVALUES_H
 // Values converted between data types as MATLAB converts between classes, for data written into an array of
-// another data type: the MATLAB writer converts a MATLAB array with these, and Python's write_zarr its data
+// another data type: the library converts with these the MATLAB writer's data (convertValueParts) and Python's
+// write_zarr's (convertValues). Only the library compiles them: the mex files call those functions, so that
+// they run no OpenMP of their own (see helperfunctions.h).
 #include <cmath>
 #include <cstdint>
 #include <limits>

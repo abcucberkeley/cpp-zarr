@@ -443,8 +443,9 @@ public:
 // blocked while there is nothing to read (not spinning, which would take the CPU from
 // other threads and processes). They end, once the jobs given are done, when the pool does:
 // when the process ends, or when the library is unloaded, as their code goes with it. (On
-// Linux glibc does not unload the library MATLAB's mex files load: the unique symbols of its
-// static C++ runtime keep it loaded, so clear mex unloads the mex files only.)
+// Linux glibc does not unload the library MATLAB's mex files load: the statics of its inline
+// functions, such as ioPool's, are unique symbols, which keep it loaded, so clear mex unloads
+// the mex files only. Windows keeps it loaded too: see helperfunctions.cpp.)
 class IoPool {
     std::mutex m;
     std::condition_variable cv;

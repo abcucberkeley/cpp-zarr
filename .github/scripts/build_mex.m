@@ -16,8 +16,9 @@ function build_mex(installDir, outDir)
              'parallelwritezarrmex.cpp', 'parallelWriteZarr'
              'createzarrfilemex.cpp',    'createZarrFile'
              'convertzarrtov3mex.cpp',   'convertZarrToV3'};
-    % Same optimization and OpenMP flags as the release compile scripts
-    % (parallelWriteZarr has an OpenMP loop of its own)
+    % Same optimization and OpenMP flags as the release compile scripts (the mex files
+    % run no OpenMP loops of their own: their conversions are the library's, and
+    % check_mex_openmp.sh checks that none is compiled into them)
     args = {'-outdir', outDir, ['-I' inc], ['-L' lib], 'CXXOPTIMFLAGS=-O2 -DNDEBUG'};
 
     if ispc

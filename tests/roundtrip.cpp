@@ -2186,6 +2186,69 @@ int main(int argc, char** argv){
             return ok;
         });
 
+        check("values held as real and imaginary parts converted as convertValues converts (convertValueParts, which converts "
+              "the MATLAB writer's data: parts kept apart and interleaved, real values, every second value, complex values "
+              "only into complex types), and float16 and bfloat16 values widened exactly to float32 and complex numbers split "
+              "into their parts, as the MATLAB reader returns them (widenToFloat, splitComplex), alike with 1 and 4 threads", [&](){
+            bool ok = true;
+            const int threadsWere = omp_get_max_threads();
+            for (const int threads : {1, 4}) {
+                omp_set_num_threads(threads);
+                // (parts kept apart: double parts into complex64, each rounded to float)
+                const double re[] = {1.0/3, -2.5, 1e30, 0};
+                const double im[] = {0.1, NAN, -3e38, -0.0};
+                float c8[8];
+                ok = ok && convertValueParts(re, im, 1, "<f8", c8, "<c8", 4);
+                for (int i = 0; i < 4 && ok; i++)
+                    ok = c8[2*i] == (float)re[i] && (std::isnan(im[i]) ? std::isnan(c8[2*i+1]) : c8[2*i+1] == (float)im[i]);
+                ok = ok && std::signbit(c8[7]);
+                // (interleaved: complex64 into complex128, the parts one after the other)
+                const float il[] = {1.5f, -2.0f, 3.25f, 0.5f};
+                double c16[4];
+                ok = ok && convertValueParts(il, il+1, 2, "<f4", c16, "<c16", 2) && c16[0] == 1.5 && c16[1] == -2.0 && c16[2] == 3.25 && c16[3] == 0.5;
+                // (real values into a complex type: imaginary parts 0)
+                const int16_t ints[] = {-3, 7};
+                ok = ok && convertValueParts(ints, nullptr, 1, "<i2", c8, "<c8", 2) && c8[0] == -3.0f && c8[1] == 0.0f && c8[2] == 7.0f && c8[3] == 0.0f;
+                // (every second value, converted as convertValues converts each)
+                const double every[] = {2.5, 99, -1, 99, 70000, 99, NAN, 99};
+                uint16_t o4[4];
+                ok = ok && convertValueParts(every, nullptr, 2, "<f8", o4, "<u2", 4) && o4[0] == 3 && o4[1] == 0 && o4[2] == 65535 && o4[3] == 0;
+                // (complex values only into complex types, no complex part type, and stride 0: false)
+                uint16_t ou[4];
+                uint8_t ob[4];
+                ok = ok && !convertValueParts(re, im, 1, "<f8", ou, "<u2", 4) && !convertValueParts(re, im, 1, "<f8", ob, "|b1", 4)
+                        && !convertValueParts(il, nullptr, 1, "<c8", c16, "<c16", 1) && !convertValueParts(re, nullptr, 0, "<f8", ou, "<u2", 4);
+                // (every float16 and bfloat16 value: bfloat16 is a float's upper half; float16 against halfToFloat, and
+                // some values exactly: 1, the largest, the smallest subnormal, -0 and infinity)
+                std::vector<uint16_t> bits(65536);
+                for (uint32_t b = 0; b < 65536; b++) bits[b] = (uint16_t)b;
+                std::vector<float> wide(65536);
+                widenToFloat(bits.data(), true, wide.data(), 65536);
+                for (uint32_t b = 0; b < 65536 && ok; b++){
+                    const uint32_t f = b << 16;
+                    ok = memcmp(&wide[b], &f, 4) == 0;
+                }
+                widenToFloat(bits.data(), false, wide.data(), 65536);
+                for (uint32_t b = 0; b < 65536 && ok; b++){
+                    const float w = halfToFloat((uint16_t)b);
+                    ok = memcmp(&wide[b], &w, 4) == 0;
+                }
+                ok = ok && wide[0x3c00] == 1.0f && wide[0x7bff] == 65504.0f && wide[0x0001] == std::ldexp(1.0f, -24)
+                        && wide[0x8000] == 0.0f && std::signbit(wide[0x8000]) && std::isinf(wide[0x7c00]) && std::isnan(wide[0x7e00]);
+                // (complex numbers split into their parts)
+                const float cf[] = {1, 2, 3, 4, 5, 6};
+                float rf[3], imf[3];
+                splitComplex(cf, rf, imf, 3);
+                ok = ok && rf[0] == 1 && imf[0] == 2 && rf[1] == 3 && imf[1] == 4 && rf[2] == 5 && imf[2] == 6;
+                const double cd[] = {-1, -2, -3, -4};
+                double rd[2], imd[2];
+                splitComplex(cd, rd, imd, 2);
+                ok = ok && rd[0] == -1 && imd[0] == -2 && rd[1] == -3 && imd[1] == -4;
+            }
+            omp_set_num_threads(threadsWere);
+            return ok;
+        });
+
 #ifndef _WIN32
         check("a leading ~ or ~name expanded to that home folder and any other path kept as it is (expandTilde: a ~ "
               "elsewhere, spaces, parentheses, $ and backquotes left alone, nothing run), and arrays written and read "

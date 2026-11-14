@@ -280,22 +280,67 @@ uint16_t floatToHalf(float v){
 }
 
 bool convertValues(const void* src, const std::string &srcDtype, void* dst, const std::string &dstDtype, const uint64_t n){
-    const DtypeInfo s = dtypeInfo(srcDtype), t = dtypeInfo(dstDtype);
-    if(!s.kind || !t.kind || s.bigEndian || t.bigEndian) return false;
-    if(s.kind == 'b' && s.bytes == 1) czConvertValues((const uint8_t*)src, (const uint8_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'u' && s.bytes == 1) czConvertValues((const uint8_t*)src, (const uint8_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'u' && s.bytes == 2) czConvertValues((const uint16_t*)src, (const uint16_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'u' && s.bytes == 4) czConvertValues((const uint32_t*)src, (const uint32_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'u' && s.bytes == 8) czConvertValues((const uint64_t*)src, (const uint64_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'i' && s.bytes == 1) czConvertValues((const int8_t*)src, (const int8_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'i' && s.bytes == 2) czConvertValues((const int16_t*)src, (const int16_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'i' && s.bytes == 4) czConvertValues((const int32_t*)src, (const int32_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'i' && s.bytes == 8) czConvertValues((const int64_t*)src, (const int64_t*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'f' && s.bytes == 4 && !s.bfloat16) czConvertValues((const float*)src, (const float*)nullptr, 1, n, t, dst);
-    else if(s.kind == 'f' && s.bytes == 8) czConvertValues((const double*)src, (const double*)nullptr, 1, n, t, dst);
+    return convertValueParts(src, nullptr, 1, srcDtype, dst, dstDtype, n);
+}
+
+bool convertValueParts(const void* re, const void* im, const uint64_t stride, const std::string &partDtype,
+                       void* dst, const std::string &dstDtype, const uint64_t n){
+    const DtypeInfo s = dtypeInfo(partDtype), t = dtypeInfo(dstDtype);
+    if(!s.kind || !t.kind || s.bigEndian || t.bigEndian || !stride || (im && t.kind != 'c')) return false;
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        bool ok = false;
+        ForkSafety::get().onRegionThread([&]{ ok = convertValueParts(re, im, stride, partDtype, dst, dstDtype, n); });
+        return ok;
+    }
+    if(s.kind == 'b' && s.bytes == 1) czConvertValues((const uint8_t*)re, (const uint8_t*)im, stride, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 1) czConvertValues((const uint8_t*)re, (const uint8_t*)im, stride, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 2) czConvertValues((const uint16_t*)re, (const uint16_t*)im, stride, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 4) czConvertValues((const uint32_t*)re, (const uint32_t*)im, stride, n, t, dst);
+    else if(s.kind == 'u' && s.bytes == 8) czConvertValues((const uint64_t*)re, (const uint64_t*)im, stride, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 1) czConvertValues((const int8_t*)re, (const int8_t*)im, stride, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 2) czConvertValues((const int16_t*)re, (const int16_t*)im, stride, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 4) czConvertValues((const int32_t*)re, (const int32_t*)im, stride, n, t, dst);
+    else if(s.kind == 'i' && s.bytes == 8) czConvertValues((const int64_t*)re, (const int64_t*)im, stride, n, t, dst);
+    else if(s.kind == 'f' && s.bytes == 4 && !s.bfloat16) czConvertValues((const float*)re, (const float*)im, stride, n, t, dst);
+    else if(s.kind == 'f' && s.bytes == 8) czConvertValues((const double*)re, (const double*)im, stride, n, t, dst);
     else return false;
     return true;
 }
+
+void widenToFloat(const uint16_t* src, const bool bfloat16, float* dst, const uint64_t n){
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        ForkSafety::get().onRegionThread([&]{ widenToFloat(src, bfloat16, dst, n); });
+        return;
+    }
+    const int64_t N = (int64_t)n;
+    if(bfloat16){
+        #pragma omp parallel for
+        for(int64_t i = 0; i < N; i++) dst[i] = bfloat16ToFloat(src[i]);
+    }
+    else{
+        #pragma omp parallel for
+        for(int64_t i = 0; i < N; i++) dst[i] = halfToFloat(src[i]);
+    }
+}
+
+template <typename T>
+static void czSplitComplex(const T* src, T* re, T* im, const uint64_t n){
+    // (in a child made by fork(), on the thread that forked: see ForkSafety)
+    if(ForkSafety::get().needRegionThread()){
+        ForkSafety::get().onRegionThread([&]{ czSplitComplex(src, re, im, n); });
+        return;
+    }
+    const int64_t N = (int64_t)n;
+    #pragma omp parallel for
+    for(int64_t i = 0; i < N; i++){
+        re[i] = src[2*i];
+        im[i] = src[2*i+1];
+    }
+}
+void splitComplex(const float* src, float* re, float* im, const uint64_t n){ czSplitComplex(src, re, im, n); }
+void splitComplex(const double* src, double* re, double* im, const uint64_t n){ czSplitComplex(src, re, im, n); }
 
 // Double to float16 directly, as NumPy converts (npy_doublebits_to_halfbits), with
 // no rounding to float first
@@ -1149,6 +1194,25 @@ void fillOutsideBoxND(const uint64_t bytes, void* buf,
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+// The library stays loaded until the process ends, and with it the MinGW runtime DLLs it loads (libgomp-1.dll,
+// libgcc_s_seh-1.dll and libwinpthread-1.dll): GCC's emulated thread-local storage (the library's own, which its
+// static C++ runtime's exception state uses, and libgcc_s_seh-1.dll's, which libgomp-1.dll's uses) gives each
+// thread that uses it a destructor among libwinpthread-1.dll's keys, which outlive the DLL that holds the
+// destructor's code, so that once MATLAB had unloaded the mex files at exit, and with them the library and those
+// DLLs, a thread that ended after them called code no longer there (an access violation in libgcc_s_seh-1.dll's
+// emutls_destroy as MATLAB exited, in PetaKit5D's Windows tests). The mex files still unload at clear mex, and
+// can then be replaced.
+namespace {
+struct KeepLoaded {
+    KeepLoaded(){
+        // (the module that holds this object: the library)
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(this), &self);
+    }
+} keepLoaded;
+}
 #endif
 
 bool renameReplace(const std::string &src, const std::string &dst){

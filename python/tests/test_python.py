@@ -1132,6 +1132,40 @@ def main():
               f"{'OK' if good else 'FAIL'}{'' if good else f' ({seen})'}")
         ok = ok and good
 
+    # Data converted to an array's type in a child made by fork() after this process converted data with
+    # several threads (as PyTorch's DataLoader workers and multiprocessing pools fork): GCC's OpenMP keeps
+    # the forking thread's team, whose threads are not in the child, so there the conversion runs on a
+    # thread of the child's, as reads and writes do (the conversions hung there before)
+    if hasattr(os, 'fork'):
+        import signal
+        import warnings
+        fk = os.path.join(tmp, "fork_convert.zarr")
+        fd = rng.random((32, 256, 256)) * 1000
+        # (a region written into an existing array of another type is converted to it)
+        region = dict(start_coords=[0, 0, 0], end_coords=list(fd.shape))
+        cppzarr.write_zarr(fk, np.zeros(fd.shape, np.uint16), chunks=[16, 128, 128])
+        cppzarr.write_zarr(fk, fd, num_threads=4, **region)
+        with warnings.catch_warnings():
+            # (Python warns that a process with threads forks: that is the case tested)
+            warnings.simplefilter('ignore', DeprecationWarning)
+            pid = os.fork()
+        if pid == 0:
+            code = 3
+            try:
+                signal.alarm(120)
+                fk2 = fk + "_child"
+                cppzarr.write_zarr(fk2, np.zeros(fd.shape, np.uint16), chunks=[16, 128, 128])
+                cppzarr.write_zarr(fk2, fd, num_threads=4, **region)
+                code = 0 if np.array_equal(cppzarr.read_zarr(fk2), matlab_cast(fd, np.uint16)) else 1
+            except BaseException:
+                code = 2
+            os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        good = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 and np.array_equal(cppzarr.read_zarr(fk), matlab_cast(fd, np.uint16))
+        print(f"data converted in a child made by fork() after converting with several threads  {'OK' if good else 'FAIL'}"
+              + ('' if good else f" (child's status {status})"))
+        ok = ok and good
+
     # Reading into GPU memory (with an NVIDIA GPU, nvCOMP, and CuPy or PyTorch): the same
     # values as reading into host memory, for every data type and codec, sharded or not,
     # regions that cut chunks, missing chunks, both orders, CuPy arrays and PyTorch tensors,

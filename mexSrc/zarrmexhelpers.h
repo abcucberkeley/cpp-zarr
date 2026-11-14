@@ -12,12 +12,12 @@
 #include "mex.h"
 #include "../src/helperfunctions.h"
 #include "../src/parallelwritezarr.h"
-#include "../src/convertvalues.h"
 
 // At clear mex (or when MATLAB exits), the buffers reads and writes keep between calls are
-// freed (releaseBuffers): on Linux the library itself stays loaded, as the unique symbols of
-// its static C++ runtime keep it, so that writes' kept buffers (up to CPPZARR_KEEP_MB) were
-// never freed. (Not on macOS, where the mex files stay loaded until MATLAB exits.)
+// freed (releaseBuffers): the library itself stays loaded (on Linux the statics of its inline
+// functions are unique symbols, which keep it; on Windows it keeps itself loaded, see
+// helperfunctions.cpp), so that writes' kept buffers (up to CPPZARR_KEEP_MB) were never freed.
+// (Not on macOS, where the mex files stay loaded until MATLAB exits.)
 static inline void mexReleaseBuffersAtClear(){
 #if !defined(__APPLE__)
     static bool registered = false;
@@ -205,44 +205,51 @@ static std::string mexClassDtype(const mxArray* a){
     }
 }
 
-template <typename S>
-static void mexConvertArray(const mxArray* a, const uint64_t n, const DtypeInfo &t, void* out){
-    const S* re = (const S*)mxGetData(a);
-    const S* im = NULL;
+// A MATLAB array's n elements as the data type (a malloc'd buffer the caller
+// frees), converted as MATLAB converts between classes, by the library
+// (convertValueParts: the mex files run no OpenMP of their own, see
+// helperfunctions.h). NULL for classes Zarr has no type for.
+static void* mexConvertToDtype(const mxArray* a, const std::string &dtype, const uint64_t n){
+    const DtypeInfo t = dtypeInfo(dtype);
+    if(!t.kind) return NULL;
+    // (the type of the array's values, or of their real and imaginary parts)
+    std::string part;
+    uint64_t partBytes = 0;
+    switch(mxGetClassID(a)){
+        case mxLOGICAL_CLASS: part = "|b1"; partBytes = sizeof(mxLogical); break;
+        case mxUINT8_CLASS:   part = "<u1"; partBytes = 1; break;
+        case mxINT8_CLASS:    part = "<i1"; partBytes = 1; break;
+        case mxUINT16_CLASS:  part = "<u2"; partBytes = 2; break;
+        case mxINT16_CLASS:   part = "<i2"; partBytes = 2; break;
+        case mxUINT32_CLASS:  part = "<u4"; partBytes = 4; break;
+        case mxINT32_CLASS:   part = "<i4"; partBytes = 4; break;
+        case mxUINT64_CLASS:  part = "<u8"; partBytes = 8; break;
+        case mxINT64_CLASS:   part = "<i8"; partBytes = 8; break;
+        case mxSINGLE_CLASS:  part = "<f4"; partBytes = 4; break;
+        case mxDOUBLE_CLASS:  part = "<f8"; partBytes = 8; break;
+        default: return NULL;
+    }
+    const void* re = mxGetData(a);
+    const void* im = NULL;
     uint64_t stride = 1;
     if(mxIsComplex(a)){
 #if (MX_HAS_INTERLEAVED_COMPLEX)
         // (real and imaginary parts alternate)
-        im = re+1;
+        im = (const uint8_t*)re+partBytes;
         stride = 2;
 #else
-        im = (const S*)mxGetImagData(a);
+        im = mxGetImagData(a);
 #endif
     }
-    czConvertValues<S>(re, im, stride, n, t, out);
-}
-
-// A MATLAB array's n elements as the data type (a malloc'd buffer the caller
-// frees), converted as MATLAB converts between classes. NULL for classes Zarr has
-// no type for.
-static void* mexConvertToDtype(const mxArray* a, const std::string &dtype, const uint64_t n){
-    const DtypeInfo t = dtypeInfo(dtype);
-    if(!t.kind) return NULL;
+    // (into the type's values in little-endian order, as the mex files have always converted: a write into
+    // an array stored big-endian is then refused for its byte order)
+    std::string littleEndian = dtype;
+    if(!littleEndian.empty() && littleEndian[0] == '>') littleEndian[0] = '<';
     void* out = malloc(n*t.bytes ? n*t.bytes : 1);
     if(!out) return NULL;
-    switch(mxGetClassID(a)){
-        case mxLOGICAL_CLASS: mexConvertArray<mxLogical>(a, n, t, out); break;
-        case mxUINT8_CLASS:   mexConvertArray<uint8_t>(a, n, t, out); break;
-        case mxINT8_CLASS:    mexConvertArray<int8_t>(a, n, t, out); break;
-        case mxUINT16_CLASS:  mexConvertArray<uint16_t>(a, n, t, out); break;
-        case mxINT16_CLASS:   mexConvertArray<int16_t>(a, n, t, out); break;
-        case mxUINT32_CLASS:  mexConvertArray<uint32_t>(a, n, t, out); break;
-        case mxINT32_CLASS:   mexConvertArray<int32_t>(a, n, t, out); break;
-        case mxUINT64_CLASS:  mexConvertArray<uint64_t>(a, n, t, out); break;
-        case mxINT64_CLASS:   mexConvertArray<int64_t>(a, n, t, out); break;
-        case mxSINGLE_CLASS:  mexConvertArray<float>(a, n, t, out); break;
-        case mxDOUBLE_CLASS:  mexConvertArray<double>(a, n, t, out); break;
-        default: free(out); return NULL;
+    if(!convertValueParts(re, im, stride, part, out, littleEndian, n)){
+        free(out);
+        return NULL;
     }
     return out;
 }

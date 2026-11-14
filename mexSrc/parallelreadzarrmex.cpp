@@ -162,29 +162,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
         mexErrMsgIdAndTxt("zarr:readError",Zarr.get_errString().c_str());
     }
     if(viaBuffer){
-        const int64_t n = (int64_t)readSize;
-        if(t.kind == 'f'){
-            const uint16_t* src = (const uint16_t*)zarrArr;
-            float* out = (float*)mxGetData(plhs[0]);
-            const bool bf = t.bfloat16;
-            #pragma omp parallel for
-            for(int64_t i = 0; i < n; i++) out[i] = bf ? bfloat16ToFloat(src[i]) : halfToFloat(src[i]);
-        }
+        // (widened and split by the library: the mex files run no OpenMP of their own, see helperfunctions.h)
+        if(t.kind == 'f') widenToFloat((const uint16_t*)zarrArr, t.bfloat16, (float*)mxGetData(plhs[0]), readSize);
 #if !(MX_HAS_INTERLEAVED_COMPLEX)
-        else if(t.bytes == 8){
-            const float* src = (const float*)zarrArr;
-            float* re = (float*)mxGetData(plhs[0]);
-            float* im = (float*)mxGetImagData(plhs[0]);
-            #pragma omp parallel for
-            for(int64_t i = 0; i < n; i++){ re[i] = src[2*i]; im[i] = src[2*i+1]; }
-        }
-        else{
-            const double* src = (const double*)zarrArr;
-            double* re = (double*)mxGetData(plhs[0]);
-            double* im = (double*)mxGetImagData(plhs[0]);
-            #pragma omp parallel for
-            for(int64_t i = 0; i < n; i++){ re[i] = src[2*i]; im[i] = src[2*i+1]; }
-        }
+        else if(t.bytes == 8) splitComplex((const float*)zarrArr, (float*)mxGetData(plhs[0]), (float*)mxGetImagData(plhs[0]), readSize);
+        else splitComplex((const double*)zarrArr, (double*)mxGetData(plhs[0]), (double*)mxGetImagData(plhs[0]), readSize);
 #endif
         free(zarrArr);
     }
