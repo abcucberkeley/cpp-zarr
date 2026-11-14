@@ -21,6 +21,11 @@ test-command = "python {project}/tests/test_python.py"
 [tool.cibuildwheel.linux]
 skip = "pp* *musllinux*"
 environment = {CXX="g++", CC="gcc", LD_LIBRARY_PATH="/project/build/install/lib64:$LD_LIBRARY_PATH"}
+# The build image, pinned (the one that built 1.7.3), the same as cpp-tiff's: a wheel bundles the image's
+# libgomp under a name made from its hash (libgomp-e985bcbb.so.1.0.0 from this one), and programs that link
+# the one both projects' wheels bundle share one OpenMP runtime with them. A newer image renames it: change
+# it in both projects together, and tell those who link it.
+manylinux-x86_64-image = "quay.io/pypa/manylinux_2_28_x86_64:2026.06.04-1"
 
 [tool.cibuildwheel.macos]
 environment = {CXX="/opt/homebrew/bin/g++-13", CC="/opt/homebrew/bin/gcc-13", MACOSX_DEPLOYMENT_TARGET="13.0"}
