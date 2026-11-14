@@ -32,8 +32,10 @@ function build_mex(installDir, outDir)
         [status, gccEh] = system(['"' gxx '" -print-file-name=libgcc_eh.a']);
         assert(status == 0, 'build_mex:noGcc', 'Could not run %s', gxx);
         % -lcppZarr.dll makes the linker pick up the import library libcppZarr.dll.a.
+        % LDOPTIMFLAGS keeps the mex files' symbols, as the release compile scripts do
+        % (MATLAB's MinGW default, -s, strips them), so that check_mex_openmp.sh can read them.
         args = [args, {['CXX=' gxx], 'CXXFLAGS=$CXXFLAGS -fopenmp', 'LDFLAGS=$LDFLAGS -fopenmp', ...
-                       strtrim(gccEh), '-lcppZarr.dll'}];
+                       'LDOPTIMFLAGS=-O2', strtrim(gccEh), '-lcppZarr.dll'}];
         % The mex files load these at run time. MATLAB looks next to the mex first.
         copyfile(fullfile(installDir, 'bin', 'libcppZarr.dll'), outDir);
         runtime = {'libgomp-1.dll', 'libwinpthread-1.dll', 'libstdc++-6.dll', 'libgcc_s_seh-1.dll'};
