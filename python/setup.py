@@ -73,9 +73,12 @@ ext_modules = [
         # (the static C++ runtime kept private, as in the library: see CMakeLists.txt. On macOS the module exports
         # its entry point alone: the loader merges the exported weak definitions of one name across every image a
         # process loads, so that with cpp-tiff's module loaded first, this module's std::call_once in pybind11 ran
-        # cpp-tiff's copy of its code, on cpp-tiff's runtime's state, and the first write crashed)
+        # cpp-tiff's copy of its code, on cpp-tiff's runtime's state, and the first write crashed. On macOS it is linked
+        # without a debug map (-S), which names the build's object files by their absolute paths (the 1.7.3 wheels'
+        # modules named /Users/<user>/.../python/build/temp.macosx-.../cppzarr.o, and the static C++ runtime's objects
+        # in Homebrew's libstdc++.a), and is of no use once those files are gone, as cpp-tiff's module is linked)
         extra_link_args=['-static-libstdc++'] + (['-Wl,--exclude-libs,ALL'] if system == "Linux" else
-                                                 ['-Wl,-exported_symbol,_PyInit_cppzarr'] if system == "Darwin" else [])
+                                                 ['-Wl,-exported_symbol,_PyInit_cppzarr', '-Wl,-S'] if system == "Darwin" else [])
     ),
 ]
 

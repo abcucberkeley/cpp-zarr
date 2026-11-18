@@ -262,6 +262,14 @@ set(CPPZARR_RUNTIME_SYMBOLS
     "_ZZNSt*" "_ZZNKSt*" "__cxa_*" "__gxx_personality*" "__dynamic_cast" "_Znw*" "_Zna*" "_Zdl*" "_Zda*"
     "_ZN8nlohmann*" "_ZNK8nlohmann*" "_ZZN8nlohmann*" "_ZZNK8nlohmann*" "_ZGVZN8nlohmann*"
     "_ZTIN8nlohmann*" "_ZTSN8nlohmann*" "_ZTVN8nlohmann*")
+# No debug information in Release and MinSizeRel builds on Linux and macOS (the linker's -S: GNU ld's --strip-debug,
+# ld64's no debug map): the library's own objects have none there, but the static C++ runtime's objects do, and named
+# the folders they were built in, the GCC's own build folder on Linux (666 strings in a release build's library, and
+# with it its builder's account name), and on macOS each object in Homebrew's libstdc++.a by its absolute path (95 in
+# the map). Debug and RelWithDebInfo builds keep them, for the debugger.
+if(UNIX)
+    target_link_options(cppZarr_shared PRIVATE "$<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:LINKER:-S>")
+endif()
 if(UNIX AND NOT APPLE)
     if(CPPZARR_PRIVATE_RUNTIME)
         string(REPLACE ";" ";\n    " CPPZARR_RUNTIME_LOCAL "${CPPZARR_RUNTIME_SYMBOLS}")
