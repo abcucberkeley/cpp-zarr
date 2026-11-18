@@ -22,7 +22,7 @@ endif()
 
 project(
   cpp-zarr
-  VERSION 1.7.3
+  VERSION 1.8.0
   LANGUAGES CXX)
 
 # Warnings, added to the flags given on the command line or in CXXFLAGS
