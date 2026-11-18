@@ -62,10 +62,15 @@ function build_mex(installDir, outDir)
     else
         % The rpath lets the mex files find libcppZarr at run time. The library keeps its C++ runtime
         % to itself (CMakeLists.txt's CPPZARR_PRIVATE_RUNTIME), and a static libstdc++ keeps the mex
-        % files independent of the older libstdc++ that MATLAB loads itself (as cpp-tiff's are built
-        % here; the release builds ship the libstdc++ they link next to the mex files instead).
+        % files independent of the older libstdc++ that MATLAB loads itself, linked as the release
+        % compile scripts in mexSrc link them: LINKLIBS is MATLAB's own without its -lstdc++ (which
+        % bound the mex files to MATLAB's libstdc++ whatever LDFLAGS said) and -lMatlabDataArray, with
+        % the library in it, since a LINKLIBS given replaces the -l options; and -Wl,-S, which keeps
+        % libstdc++.a's debug information out.
+        linkLibs = ['-L"' lib '" -lcppZarr -Wl,--as-needed -Wl,-rpath-link,$MATLABROOT/bin/$ARCH ' ...
+                    '-L"$MATLABROOT/bin/$ARCH" -lmx -lmex -lm -lmat'];
         args = [args, {'CXXFLAGS=$CXXFLAGS -fopenmp', ...
-                       ['LDFLAGS=$LDFLAGS -fopenmp -static-libstdc++ -Wl,-rpath,' lib], '-lcppZarr'}];
+                       ['LDFLAGS=$LDFLAGS -fopenmp -static-libstdc++ -Wl,-S -Wl,-rpath,' lib], ['LINKLIBS=' linkLibs]}];
     end
 
     for i = 1:size(mexes, 1)
@@ -75,7 +80,9 @@ function build_mex(installDir, outDir)
     % Toolbox's GPU MEX API
     gpuInc = fullfile(matlabroot, 'toolbox', 'parallel', 'gpu', 'extern', 'include');
     if isunix && ~ismac && exist(gpuInc, 'dir')
-        mex(args{:}, ['-I' gpuInc], '-lmwgpu', '-output', 'parallelReadZarrGPU', fullfile(src, 'parallelreadzarrgpumex.cpp'));
-        mex(args{:}, ['-I' gpuInc], '-lmwgpu', '-output', 'parallelWriteZarrGPU', fullfile(src, 'parallelwritezarrgpumex.cpp'));
+        % (-lmwgpu in their LINKLIBS, which replaces the one in args)
+        gpuLibs = ['LINKLIBS=-lmwgpu ' linkLibs];
+        mex(args{:}, ['-I' gpuInc], gpuLibs, '-output', 'parallelReadZarrGPU', fullfile(src, 'parallelreadzarrgpumex.cpp'));
+        mex(args{:}, ['-I' gpuInc], gpuLibs, '-output', 'parallelWriteZarrGPU', fullfile(src, 'parallelwritezarrgpumex.cpp'));
     end
 end

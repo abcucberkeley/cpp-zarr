@@ -7,13 +7,15 @@ if isunix && ~ismac
     if ~exist(releaseFolder, 'dir')
         mkdir(releaseFolder);
     end
-    mex -outdir ../linux -output createZarrFile.mexa64 -v CXXOPTIMFLAGS="-O2 -DNDEBUG" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O2 -fopenmp' LDFLAGS='$LDFLAGS -O2 -fopenmp' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lcppZarr createzarrfilemex.cpp
-    % Need to change the library name because matlab preloads their own version
-    % of libstdc++
-    % Setting it to libstdc++.so.6.0.30 as of MATLAB R2022b
-    system(['patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 ' releaseFolder '/createZarrFile.mexa64']);
+    mex -outdir ../linux -output createZarrFile.mexa64 -v CXXOPTIMFLAGS="-O2 -DNDEBUG" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O2 -fopenmp' LDFLAGS='$LDFLAGS -O2 -fopenmp -static-libstdc++ -Wl,-S' LINKLIBS='-L../jenkinsBuild/install/lib64 -lcppZarr -Wl,--as-needed -Wl,-rpath-link,$MATLABROOT/bin/$ARCH -L"$MATLABROOT/bin/$ARCH" -lmx -lmex -lm -lmat' -I'../jenkinsBuild/install/include' createzarrfilemex.cpp
+    % libstdc++ is linked in statically (-static-libstdc++), so the MEX file needs no libstdc++ at run time, neither
+    % MATLAB's (the 6.0.28 of R2024a and older releases is too old for GCC 13's code) nor a copy next to it. LINKLIBS
+    % is MATLAB's own without its -lstdc++, which bound the MEX file to the libstdc++ MATLAB has loaded, and without
+    % -lMatlabDataArray (the MEX files use the C API); a LINKLIBS given replaces the -L and -l options as well, so
+    % the library is named in it. Release builds are linked with -Wl,-S: libstdc++.a's debug information names the
+    % GCC's build folder. The release folder ships libgomp alone with the library (libgcc_s is MATLAB's or the
+    % system's: none newer than GCC 4.2's is needed)
     system(['patchelf --force-rpath --set-rpath ''$ORIGIN'' ' releaseFolder '/createZarrFile.mexa64']);
-    %system('export LD_LIBRARY_PATH="";patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 createZarrFile.mexa64');
 elseif ismac
     % (-Wl,-S: no debug map, which named the objects of the static libstdc++.a linked in by their absolute paths
     % and is of no use without them, as the library is linked)

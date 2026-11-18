@@ -11,20 +11,21 @@ if isunix && ~ismac
     if debug
         fsanitize = false;
         if fsanitize
-            mex -outdir ../linux -output parallelReadZarr.mexa64 -v CXXOPTIMFLAGS="" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O0 -g" CXXFLAGS='$CXXFLAGS -fsanitize=address -fopenmp -O0 -g' LDFLAGS='$LDFLAGS -fsanitize=address -fopenmp -O0 -g' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lcppZarr parallelreadzarrmex.cpp
+            mex -outdir ../linux -output parallelReadZarr.mexa64 -v CXXOPTIMFLAGS="" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O0 -g" CXXFLAGS='$CXXFLAGS -fsanitize=address -fopenmp -O0 -g' LDFLAGS='$LDFLAGS -fsanitize=address -fopenmp -O0 -g -static-libstdc++' LINKLIBS='-L../jenkinsBuild/install/lib64 -lcppZarr -Wl,--as-needed -Wl,-rpath-link,$MATLABROOT/bin/$ARCH -L"$MATLABROOT/bin/$ARCH" -lmx -lmex -lm -lmat' -I'../jenkinsBuild/install/include' parallelreadzarrmex.cpp
         else
-            mex -outdir ../linux -output parallelReadZarr.mexa64 -v CXXOPTIMFLAGS="" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O0 -g" CXXFLAGS='$CXXFLAGS -fopenmp -O0 -g' LDFLAGS='$LDFLAGS -fopenmp -O0 -g' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lcppZarr parallelreadzarrmex.cpp
+            mex -outdir ../linux -output parallelReadZarr.mexa64 -v CXXOPTIMFLAGS="" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O0 -g" CXXFLAGS='$CXXFLAGS -fopenmp -O0 -g' LDFLAGS='$LDFLAGS -fopenmp -O0 -g -static-libstdc++' LINKLIBS='-L../jenkinsBuild/install/lib64 -lcppZarr -Wl,--as-needed -Wl,-rpath-link,$MATLABROOT/bin/$ARCH -L"$MATLABROOT/bin/$ARCH" -lmx -lmex -lm -lmat' -I'../jenkinsBuild/install/include' parallelreadzarrmex.cpp
         end
     else
-        mex -outdir ../linux -output parallelReadZarr.mexa64 -v CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lcppZarr parallelreadzarrmex.cpp
+        mex -outdir ../linux -output parallelReadZarr.mexa64 -v CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O2 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O2' LDFLAGS='$LDFLAGS -fopenmp -O2 -static-libstdc++ -Wl,-S' LINKLIBS='-L../jenkinsBuild/install/lib64 -lcppZarr -Wl,--as-needed -Wl,-rpath-link,$MATLABROOT/bin/$ARCH -L"$MATLABROOT/bin/$ARCH" -lmx -lmex -lm -lmat' -I'../jenkinsBuild/install/include' parallelreadzarrmex.cpp
     end
-    % Need to change the library name because matlab preloads their own version
-    % of libstdc++
-    % Setting it to libstdc++.so.6.0.32 as of MATLAB R2023a with gcc 13.2
-    %system('patchelf --replace-needed libc.so.6 libc.so.6.0.0 parallelreadzarr.mexa64');
-    system(['patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 ' releaseFolder '/parallelReadZarr.mexa64']);
+    % libstdc++ is linked in statically (-static-libstdc++), so the MEX file needs no libstdc++ at run time, neither
+    % MATLAB's (the 6.0.28 of R2024a and older releases is too old for GCC 13's code) nor a copy next to it. LINKLIBS
+    % is MATLAB's own without its -lstdc++, which bound the MEX file to the libstdc++ MATLAB has loaded, and without
+    % -lMatlabDataArray (the MEX files use the C API); a LINKLIBS given replaces the -L and -l options as well, so
+    % the library is named in it. Release builds are linked with -Wl,-S: libstdc++.a's debug information names the
+    % GCC's build folder. The release folder ships libgomp alone with the library (libgcc_s is MATLAB's or the
+    % system's: none newer than GCC 4.2's is needed)
     system(['patchelf --force-rpath --set-rpath ''$ORIGIN'' ' releaseFolder '/parallelReadZarr.mexa64']);
-    %system('export LD_LIBRARY_PATH="";patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 parallelReadZarr.mexa64');
 elseif ismac
     % (-Wl,-S: no debug map, which named the objects of the static libstdc++.a linked in by their absolute paths
     % and is of no use without them, as the library is linked)
