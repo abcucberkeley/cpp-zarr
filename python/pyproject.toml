@@ -32,4 +32,7 @@ environment = {CXX="/opt/homebrew/bin/g++-13", CC="/opt/homebrew/bin/gcc-13", MA
 
 [tool.cibuildwheel.windows]
 skip = "pp* cp*t-*"
-repair-wheel-command = "delvewheel repair --ignore-existing -w {dest_dir} {wheel}"
+# --no-diagnostic: the wheel's DELVEWHEEL record holds delvewheel's version alone, not also its command line, which
+# named the wheel by its path in the build machine's temp folder (cibuildwheel's cibw-run-<id> folder, in the user's
+# own temp folder in 1.7.3's wheels)
+repair-wheel-command = "delvewheel repair --ignore-existing --no-diagnostic -w {dest_dir} {wheel}"
