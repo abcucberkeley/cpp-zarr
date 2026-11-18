@@ -9,11 +9,19 @@
 #include <limits>
 #include "helperfunctions.h"
 
+// Rounded to the nearest integer, halves away from zero, as std::round rounds, but computed here (v - trunc(v)
+// is exact for every double): the C runtime of the release's MinGW-w64 (GCC 12.2) brings a round of its own,
+// which returns 1 for 0.49999999999999994, the largest double below 0.5
+static inline double czRound(const double v){
+    const double t = std::trunc(v);
+    return std::fabs(v - t) >= 0.5 ? t + std::copysign(1.0, v) : t;
+}
+
 // To an integer type: rounded to the nearest integer (halves away from zero) and saturated at the type's
 // limits, NaN to 0
 template <typename D> static inline D czRoundToInt(const double v){
     if(std::isnan(v)) return 0;
-    const double r = std::round(v);
+    const double r = czRound(v);
     if(r <= (double)std::numeric_limits<D>::min()) return std::numeric_limits<D>::min();
     if(r >= (double)std::numeric_limits<D>::max()) return std::numeric_limits<D>::max();
     return (D)r;

@@ -2161,6 +2161,13 @@ int main(int argc, char** argv){
             const int64_t i64[] = {INT64_MAX, INT64_MIN, 4611686018427387904LL, 0};
             int64_t o64[4];
             ok = ok && convertValues(big, "<f8", o64, "<i8", 4) && memcmp(o64, i64, sizeof i64) == 0;
+            // (rounding exact at every magnitude, whatever the C runtime's round does: the release's MinGW-w64,
+            // GCC 12.2, gave 1 for 0.49999999999999994; odd integers above 2^52, and halves just below it)
+            const double edge[] = {0.49999999999999994, -0.49999999999999994, 4503599627370497.0, 4503599627370495.5,
+                                   -4503599627370495.5, 9007199254740993.0, -2.5000000000000004};
+            const int64_t edgeExp[] = {0, 0, 4503599627370497LL, 4503599627370496LL, -4503599627370496LL, 9007199254740992LL, -3};
+            int64_t oe[7];
+            ok = ok && convertValues(edge, "<f8", oe, "<i8", 7) && memcmp(oe, edgeExp, sizeof edgeExp) == 0;
             const uint64_t u64in[] = {UINT64_MAX, 9223372036854775808ULL, 5};
             const int64_t u64to64[] = {INT64_MAX, INT64_MAX, 5};
             ok = ok && convertValues(u64in, "<u8", o64, "<i8", 3) && memcmp(o64, u64to64, sizeof u64to64) == 0;
