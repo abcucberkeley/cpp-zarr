@@ -121,6 +121,44 @@ def matlab_cast(a, dt):
     return a.astype(np.float64).astype(dt) if a.dtype.kind != 'c' else a.astype(dt)
 
 
+def cycle_garbage():
+    # Runs Python's garbage collector and returns how many of the objects it collected reference cycles kept
+    # (in a cycle, or held only by one), and how many it collected. With the GIL these are the same: reference
+    # counting frees every other object as its last reference goes. Free-threaded Python (3.13t, 3.14t) leaves
+    # some of the others to the collector: an object made on one thread whose last reference another thread
+    # drops is freed only once the thread that made it runs again (biased reference counting), so that what an
+    # idle pool thread made (a Future it submitted) waits for a collection, which merges the counts and frees it
+    import gc
+    debug, start = gc.get_debug(), len(gc.garbage)
+    gc.set_debug(debug | gc.DEBUG_SAVEALL)
+    try:
+        collected = gc.collect()
+    finally:
+        gc.set_debug(debug)
+    found = gc.garbage[start:]
+    del gc.garbage[start:]
+    # (an object no other collected object refers to is not kept by a cycle, nor, once those are set aside,
+    # one that only they referred to, and so on: what is left is in cycles or held by them)
+    held = {id(o): 0 for o in found}
+    for o in found:
+        for r in gc.get_referents(o):
+            if id(r) in held:
+                held[id(r)] += 1
+    free = [o for o in found if not held[id(o)]]
+    kept = len(found)
+    while free:
+        kept -= 1
+        for r in gc.get_referents(free.pop()):
+            if id(r) in held:
+                held[id(r)] -= 1
+                if not held[id(r)]:
+                    free.append(r)
+    # (and the cycles found freed, which the next call would find again)
+    del found
+    gc.collect()
+    return kept, collected
+
+
 def main():
     rng = np.random.default_rng(1234567)
     shape = (40, 24, 18)  # d0, d1, d2 (non-chunk-aligned -> exercises partial chunks)
@@ -992,11 +1030,16 @@ def main():
     cppzarr.write_zarr(again, second, chunks=[8, 8, 8], zarr_format=3)
     got = cppzarr.read_zarr_batch([(again, [0, 0, 0], [10, 10, 10])] * 5 + [(again, None, None)], num_threads=4)
     good = good and all(np.array_equal(g, second[:10, :10, :10]) for g in got[:5]) and np.array_equal(got[5], second)
-    # a batch leaves nothing for Python's garbage collector: its objects are freed as it returns (kept
-    # until a collection, they made the collector run often, and in a process of many objects a collection
-    # can take longer than a batch), here with readers added as reads end (the 2nd and 3rd batches: the
-    # 1st starts the pools' threads)
+    # a batch leaves no reference cycles for Python's garbage collector: its objects are freed as it returns
+    # (kept until a collection, they made the collector run often, and in a process of many objects a
+    # collection can take longer than a batch), here with readers added as reads end (the 2nd and 3rd
+    # batches: the 1st starts the pools' threads). With the GIL the collector then finds nothing at all;
+    # free-threaded Python also leaves it objects no cycle keeps, made on the batch's pool threads (the
+    # Futures of the openers that a read starts), see cycle_garbage
     import gc
+    import sysconfig
+    from concurrent.futures import ThreadPoolExecutor
+    free_threaded = bool(sysconfig.get_config_var('Py_GIL_DISABLED'))
     saved_rpt, saved_net, saved_wanted = wrappers._READS_PER_THREAD, wrappers.pybind11_on_network, wrappers._readers_wanted
     saved_share, saved_fetched = wrappers._wait_share[0], wrappers._process_read_bytes
     collecting = gc.isenabled()
@@ -1013,16 +1056,33 @@ def main():
         saved_allowed, saved_learn = wrappers._extras_allowed, wrappers._extras_learn
         wrappers._extras_allowed, wrappers._extras_learn = lambda size: True, lambda size, used, rate: None
         gc.disable()
-        found = []
+        # (the check finds a cycle made on a pool thread and dropped on this one, the list and the 3 lists only
+        # it holds, and none of the objects with it that no cycle keeps)
+        def made_there():
+            ring = [[0] for _ in range(3)]
+            ring.append(ring)
+            return [ring] + [{'plain': [k]} for k in range(8)]
+        with ThreadPoolExecutor(1) as pool:
+            gc.collect()
+            pool.submit(made_there).result()
+            check = [cycle_garbage()[0]]
+            pool.submit(lambda: [{'plain': [k]} for k in range(8)]).result()
+            check.append(cycle_garbage()[0])
+        good = good and check == [4, 0]
+        if check != [4, 0]:
+            print(f'  the check for reference cycles found {check} objects in them, not [4, 0]')
+        found, collected = [], []
         for k in range(3):
             gc.collect()
             got = cppzarr.read_zarr_batch(many_small, num_threads=4)
-            found.append(gc.collect())
+            kept, all_collected = cycle_garbage()
+            found.append(kept)
+            collected.append(all_collected)
             good = good and all(np.array_equal(g, x) for g, x in zip(got, want_small))
             good = good and (wrappers._last_batch[0] > 4 or not wrappers.pybind11_read_times_available())
-        good = good and found[1:] == [0, 0]
-        if found[1:] != [0, 0]:
-            print(f'  a batch left {found} objects for the garbage collector')
+        good = good and found[1:] == [0, 0] and (free_threaded or collected[1:] == [0, 0])
+        if found[1:] != [0, 0] or not (free_threaded or collected[1:] == [0, 0]):
+            print(f'  a batch left {found} objects in reference cycles for the garbage collector (of {collected} it collected)')
     finally:
         if collecting:
             gc.enable()
