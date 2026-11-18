@@ -54,6 +54,15 @@ class BuildExt(build_ext):
         super().run()
 
 
+class MinGWBuildExt(build_ext):
+    # (on Windows the library is built with MinGW-w64 and its API passes C++ types, so the module is compiled with
+    # that MinGW's gcc and g++, on PATH, as the released wheels' modules were, not with MSVC, setuptools' default
+    # there, which could not link the library either; an option or config file that names a compiler still wins)
+    def initialize_options(self):
+        super().initialize_options()
+        self.compiler = "mingw32"
+
+
 ext_modules = [
     Extension(
         "cppzarr.cppzarr",
@@ -81,7 +90,7 @@ setup(
     author_email='matthewmueller@berkeley.edu',
     packages=find_packages(),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": build_ext},
+    cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": MinGWBuildExt} if system=="Windows" else {"build_ext": build_ext},
     install_requires=['numpy>=1.20'],
     # (reads into GPU memory: nvCOMP, which the library loads when it first reads on a GPU)
     extras_require={'gpu': ['nvidia-libnvcomp-cu12; platform_system != "Darwin"']},
