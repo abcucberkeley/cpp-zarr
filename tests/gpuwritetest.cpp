@@ -5,7 +5,8 @@
 // writes into them that cut chunks and that leave a chunk all zero; inputs in F order, C order and
 // strided; sparse all-zero chunks and a nonzero fill value; writes in many parts; blosc block sizes
 // a Zarr v3 array asks for; and crop writes into arrays other Zarr writers made (tests/test_arrays:
-// checksums, transposed chunks, shard indexes at the start). Each pair of arrays must hold the same
+// checksums, transposed chunks, shard indexes at the start); writes after the buffers kept between
+// calls are freed and after the context is reset. Each pair of arrays must hold the same
 // files, each chunk decoding to the same bytes (padding included), and read the same. Exits 0 with
 // a message without an NVIDIA GPU, driver or nvCOMP. Usage: gpuWriteTest <scratch folder>
 #include <algorithm>
@@ -173,6 +174,37 @@ static bool sameArrays(const std::string &a, const std::string &b, const std::st
         return false;
     }
     return true;
+}
+
+// After the device's primary context is reset (as MATLAB's reset(gpuDevice) and cudaDeviceReset
+// reset it): the context retained and made current again, and GPU memory filled with 0x5a (n
+// allocations of each bytes, 1 GB), which takes the addresses the freed buffers had. unchanged:
+// whether every byte of it is still 0x5a (and frees it).
+static std::vector<CUdeviceptr> resetAndFill(CUdevice dev, CUcontext &ctx, uint64_t each, int n){
+    ck(A->cuDevicePrimaryCtxReset(dev), "cuDevicePrimaryCtxReset");
+    ck(A->cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
+    ck(A->cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
+    std::vector<CUdeviceptr> bufs;
+    for(int i = 0; i < n; i++){
+        CUdeviceptr p = 0;
+        if(A->cuMemAlloc(&p, each)) break;
+        ck(A->cuMemsetD8Async(p, 0x5a, each, nullptr), "cuMemsetD8Async");
+        bufs.push_back(p);
+    }
+    ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+    return bufs;
+}
+static bool unchanged(std::vector<CUdeviceptr> &bufs, uint64_t each){
+    bool same = true;
+    std::vector<uint8_t> h(each);
+    for(CUdeviceptr p : bufs){
+        ck(A->cuMemcpyDtoHAsync(h.data(), p, each, nullptr), "cuMemcpyDtoHAsync");
+        ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+        for(uint8_t b : h) if(b != 0x5a){ same = false; break; }
+        A->cuMemFree(p);
+    }
+    bufs.clear();
+    return same;
 }
 
 // The data's input layouts on the GPU: 0 F order, 1 C order, 2 strided (F order inside a bigger box)
@@ -531,6 +563,78 @@ int main(int argc, char** argv){
         printf("%d of %d checks of other writers' arrays matched\n", (total-before)-(failures-failedBefore), total-before);
     }
 #endif
+
+    // The buffers kept between writes freed (gpuReleaseBuffers), and the context reset (as MATLAB's
+    // reset(gpuDevice) resets it): the writes (and GPU reads) after make new kernels and buffers,
+    // and write nothing into memory allocated after the reset
+    {
+        const int before = total, failedBefore = failures;
+        struct Rc { const char* name; std::vector<uint64_t> shape, chunks, inner; bool sharded; const char* cname; const char* id;
+                    int fmt; const char* order; };
+        const Rc rcs[] = {
+            {"zstd_sh", {40, 24, 18}, {32, 16, 18}, {16, 8, 9}, true, "zstd", "blosc", 3, "C"},
+            {"lz4_v2", {40, 24, 18}, {16, 16, 16}, {}, false, "lz4", "blosc", 2, "F"},
+            {"zstdcodec_big", {256, 256, 128}, {128, 128, 64}, {}, false, "zstd", "zstd", 3, "C"},
+            {"gzip_host", {40, 24, 18}, {16, 16, 16}, {}, false, "gzip", "gzip", 3, "C"},
+        };
+        int round = 0;
+        auto writes = [&](const std::string &label, CUstream st){
+            for(const Rc &g : rcs){
+                const std::string l = label+" "+g.name;
+                const std::string a = dir+"/w_reset_"+g.name+"_cpu.zarr", b = dir+"/w_reset_"+g.name+"_gpu.zarr";
+                if(!makeArrays(a, b, g.shape, g.chunks, g.inner, g.sharded, 1, g.cname, g.id, 1, "<u2", g.fmt, g.order, "0")) continue;
+                const std::vector<uint64_t> cb = g.sharded ? g.inner : g.chunks;
+                const auto d1 = makeData(g.shape, cb, 2, rng, 20+round);
+                const std::vector<uint64_t> zero(g.shape.size(), 0);
+                if(!writeBoth(a, b, d1, zero, g.shape, false, round % 3, st, l+" whole") || !sameArrays(a, b, l+" whole")) continue;
+                std::vector<uint64_t> s(g.shape.size()), e(g.shape.size()), ws(g.shape.size());
+                for(size_t d = 0; d < g.shape.size(); d++){ s[d] = g.shape[d]/5; e[d] = g.shape[d]-g.shape[d]/7; ws[d] = e[d]-s[d]; }
+                const auto d2 = makeData(ws, cb, 2, rng, 30+round);
+                if(!writeBoth(a, b, d2, s, e, true, (round+1) % 3, nullptr, l+" crop") || !sameArrays(a, b, l+" crop")) continue;
+                // and read back on the GPU
+                total++;
+                zarr Z(b);
+                std::vector<uint64_t> shape = g.shape;
+                uint64_t bytes = 2;
+                for(auto v : shape) bytes *= v;
+                std::vector<uint8_t> cpu(bytes), gpu(bytes);
+                Z.set_chunkInfo(zero, shape);
+                parallelReadZarr(Z, cpu.data(), zero, shape, shape, 16, true, false, true);
+                CUdeviceptr d;
+                ck(A->cuMemAlloc(&d, bytes), "cuMemAlloc");
+                std::vector<GpuRegion> regions{{&Z, zero, shape, (void*)(uintptr_t)d}};
+                std::string err;
+                if(gpuReadZarr(regions, true, st, 4, err)) fail(l, "GPU read: "+err);
+                else{
+                    ck(A->cuMemcpyDtoHAsync(gpu.data(), d, bytes, nullptr), "cuMemcpyDtoHAsync");
+                    ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+                    if(cpu != gpu) fail(l, "reads differently on the GPU");
+                }
+                A->cuMemFree(d);
+            }
+            round++;
+        };
+        writes("before freeing the buffers:", stream);
+        gpuReleaseBuffers();
+        gpuReleaseBuffers();
+        writes("after freeing the buffers:", stream);
+        if(A->cuDevicePrimaryCtxReset){
+            const uint64_t each = (uint64_t)64 << 20;
+            std::vector<CUdeviceptr> fill = resetAndFill(dev, ctx, each, 16);
+            if(fill.size() < 16) printf("(only %zu of 16 allocations of 64 MiB after the reset)\n", fill.size());
+            // (the stream made before went with the reset: the default stream, then a new one)
+            writes("after a reset:", nullptr);
+            CUstream fresh = nullptr;
+            ck(A->cuStreamCreate(&fresh, 1 /* CU_STREAM_NON_BLOCKING */), "cuStreamCreate");
+            writes("after a reset, on a new stream:", fresh);
+            total++;
+            if(!unchanged(fill, each)) fail("after a reset", "a write wrote into memory allocated after it");
+            gpuReleaseBuffers();
+            writes("after a reset and freeing the buffers:", fresh);
+        }
+        else printf("(no cuDevicePrimaryCtxReset: the reset case is left out)\n");
+        printf("%d of %d checks around freeing the buffers and a reset matched\n", (total-before)-(failures-failedBefore), total-before);
+    }
 
     // errors: data that is not GPU memory
     {

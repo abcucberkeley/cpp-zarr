@@ -9,7 +9,7 @@ from .cppzarr import (pybind11_convert_to_v3, pybind11_default_threads, pybind11
                       pybind11_last_read_times, pybind11_on_network, pybind11_open_zarrs, pybind11_read_times_available,
                       pybind11_read_zarr, pybind11_read_zarr_gpu, pybind11_read_zarr_opened, pybind11_region_info,
                       pybind11_release_buffers, pybind11_write_zarr, pybind11_write_zarr_gpu, pybind11_create_zarr,
-                      pybind11_convert_values)
+                      pybind11_convert_values, pybind11_gpu_release_buffers)
 
 
 def _default_chunks(ndim):
@@ -1065,6 +1065,15 @@ def release_buffers():
     # calls' threads for their later use. For a long-lived process that is done reading and
     # writing for a while; the next call makes new buffers.
     pybind11_release_buffers()
+
+
+def gpu_release_buffers():
+    # Free the GPU memory (and pinned host memory) that reads into GPU memory and writes from it
+    # keep for the next call: the buffers of the parts a call has in flight, GB of GPU memory after
+    # big reads and writes. The next GPU read or write makes new ones; buffers of reads and writes
+    # running in other threads are left to them. (After a reset of the GPU's context, as
+    # cupy.cuda.runtime.deviceReset() resets it, the next call makes new ones by itself.)
+    pybind11_gpu_release_buffers()
 
 
 def convert_to_v3(file_name):

@@ -17,14 +17,23 @@
 // freed (releaseBuffers): the library itself stays loaded (on Linux the statics of its inline
 // functions are unique symbols, which keep it; on Windows it keeps itself loaded, see
 // helperfunctions.cpp), so that writes' kept buffers (up to CPPZARR_KEEP_MB) were never freed.
-// (Not on macOS, where the mex files stay loaded until MATLAB exits.)
-static inline void mexReleaseBuffersAtClear(){
+// (Not on macOS, where the mex files stay loaded until MATLAB exits.) also names what else to
+// free then: the GPU mex files free the GPU memory that GPU reads and writes keep
+// (gpuReleaseBuffers; after reset(gpuDevice), which freed it all, the next call makes new buffers).
+static void (*mexAlsoAtClear)() = nullptr;
+static inline void mexReleaseBuffersAtClear(void (*also)() = nullptr){
 #if !defined(__APPLE__)
     static bool registered = false;
     if(!registered){
-        mexAtExit([](){ releaseBuffers(); });
+        mexAlsoAtClear = also;
+        mexAtExit([](){
+            if(mexAlsoAtClear) mexAlsoAtClear();
+            releaseBuffers();
+        });
         registered = true;
     }
+#else
+    (void)also;
 #endif
 }
 

@@ -276,6 +276,12 @@ host memory. Several writes from as many threads at once overlap: the files of o
 the GPU compresses another's. CPPZARR_GPU_WRITE_PART_MB (256) sets the most of a write the GPU works
 on at once (a bigger write goes in parts, the files of one written while the GPU works on the next).
 
+GPU reads and writes keep their GPU buffers (and pinned host memory) for the next call: after big
+ones, GB of GPU memory. `cppzarr.gpu_release_buffers()` frees them (in C++ gpuReleaseBuffers(), in
+MATLAB clearing parallelReadZarrGPU and parallelWriteZarrGPU), and the next call makes new ones.
+After a reset of the GPU's context (MATLAB's reset(gpuDevice), cudaDeviceReset, CuPy's
+cupy.cuda.runtime.deviceReset()), which frees them itself, the next call makes new ones too.
+
 #### Write a region to an existing Zarr file
 ````
 import cppzarr

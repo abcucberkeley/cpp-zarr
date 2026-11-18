@@ -15,6 +15,8 @@
 void mexFunction(int nlhs, mxArray *plhs[],
         int nrhs, const mxArray *prhs[])
 {
+    // (at clear, the GPU memory GPU reads and writes keep for the next call freed too)
+    mexReleaseBuffersAtClear(gpuReleaseBuffers);
     if(!nrhs) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 1 argument");
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
 

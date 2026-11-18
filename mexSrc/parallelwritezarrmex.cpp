@@ -9,6 +9,7 @@
 #ifdef CPPZARR_MEX_GPU
 // (parallelWriteZarrGPU: this file built with CPPZARR_MEX_GPU, see parallelwritezarrgpumex.cpp)
 #include "gpu/mxGPUArray.h"
+#include "../src/gpureadzarr.h"
 #include "../src/gpuwritezarr.h"
 
 // A gpuArray to write: its dimensions, data type (as mexClassDtype names a class) and GPU memory
@@ -56,7 +57,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
         mexLock();
     }
 #endif
+#ifdef CPPZARR_MEX_GPU
+    mexReleaseBuffersAtClear(gpuReleaseBuffers);
+#else
     mexReleaseBuffersAtClear();
+#endif
     if(nrhs < 2) mexErrMsgIdAndTxt("zarr:inputError","This functions requires at least 2 arguments");
     if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("zarr:inputError","The first argument must be a string");
 #ifdef CPPZARR_MEX_GPU

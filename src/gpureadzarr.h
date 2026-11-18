@@ -42,6 +42,15 @@ void gpuSetNvcompLibrary(const std::string &path);
 // Where to load cuFile from (a libcufile file), before the first GPU read
 void gpuSetCufileLibrary(const std::string &path);
 
+// Frees the GPU memory and pinned host memory that GPU reads and writes (gpuwritezarr.h) keep for
+// the next call: the buffers of the parts a read or write has in flight (their stored and their
+// decompressed or uncompressed chunks: GB of GPU memory after big ones). The next call makes new
+// ones. Buffers of reads and writes running at the time are left to them. After a context is
+// reset (MATLAB's reset(gpuDevice), cudaDeviceReset) or destroyed, the next call sees that its
+// kernels and buffers went with it and makes new ones: nothing is to be freed then. Python's gpu_release_buffers() and MATLAB's clear of the GPU mex files (or clear mex) call
+// it; releaseBuffers (parallelwritezarr.h) frees the host buffers of CPU reads and writes.
+void gpuReleaseBuffers();
+
 // One region to read: an opened array, the region [start, end) (whole array when both are
 // empty) and the GPU memory it goes to (the region's shape, in the call's order), all regions'
 // on the GPU of one CUDA context (the device's primary context for memory that CUDA runtime

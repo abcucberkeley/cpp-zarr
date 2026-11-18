@@ -65,6 +65,7 @@ struct Api {
     CUresult (*cuEventQuery)(CUevent);
     CUresult (*cuEventDestroy)(CUevent);
     CUresult (*cuEventElapsedTime)(float*, CUevent, CUevent);
+    CUresult (*cuDevicePrimaryCtxReset)(CUdevice);   // (for tests; null when the driver lacks it)
     // nvCOMP, per codec (null for one the loaded nvCOMP does not have)
     int (*decompressAsync[NCodecs])(const void* const*, const size_t*, const size_t*, size_t*, size_t, void*, size_t,
                                     void* const*, NvcompOpts, int*, void*);
@@ -86,6 +87,9 @@ struct Api {
 
 // The loaded API, or nullptr with the reason in why (no NVIDIA driver, no nvCOMP, ...). Loads once.
 const Api* api(std::string* why);
+
+// The API if a GPU read or write has loaded it, without loading it
+const Api* apiIfLoaded();
 
 // Where to load nvCOMP from (a libnvcomp file), before the first GPU read: bindings that know
 // where a pip-installed nvCOMP is (the nvidia-libnvcomp-cu12 package) set it. Otherwise

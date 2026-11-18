@@ -861,6 +861,24 @@ function checkGpuWrites(tmp)
         checkSameArrays(fc, fg);
         n = n + 1;
     end
+    % reset(gpuDevice), which frees every GPU allocation (the buffers GPU reads and writes keep too),
+    % and clear of the GPU mex files, which frees those buffers: the reads and writes after them are
+    % right (they made new kernels and buffers)
+    if exist('parallelReadZarrGPU', 'file') == 3
+        data = uint16(randi([0 1000], sz));
+        f = @(i) fullfile(tmp, sprintf('gw_reset_%d.zarr', i));
+        parallelWriteZarrGPU(f(1), gpuArray(data), 'zarr_format', 3, 'chunks', [32 32 16], 'chunk_shape', [16 16 8]);
+        assert(isequal(gather(parallelReadZarrGPU(f(1))), data), 'GPU read before reset(gpuDevice)');
+        reset(gpuDevice);
+        assert(isequal(gather(parallelReadZarrGPU(f(1))), data), 'GPU read after reset(gpuDevice)');
+        parallelWriteZarrGPU(f(2), gpuArray(data+1), 'cname', 'lz4', 'chunks', [16 16 8]);
+        assert(isequal(parallelReadZarr(f(2)), data+1), 'GPU write after reset(gpuDevice)');
+        clear parallelReadZarrGPU parallelWriteZarrGPU
+        assert(isequal(gather(parallelReadZarrGPU(f(2))), data+1), 'GPU read after clear');
+        parallelWriteZarrGPU(f(3), gpuArray(data+2), 'zarr_format', 3);
+        assert(isequal(parallelReadZarr(f(3)), data+2), 'GPU write after clear');
+        n = n + 1;
+    end
     % refused: data that is not a gpuArray
     try
         parallelWriteZarrGPU(fullfile(tmp, 'gw_refused.zarr'), uint8(ones(4, 4)));

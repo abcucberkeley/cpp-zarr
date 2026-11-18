@@ -79,6 +79,7 @@ bool loadDriver(Api &a, std::string &why){
               get(lib, a.cuEventRecord, "cuEventRecord") && get(lib, a.cuEventSynchronize, "cuEventSynchronize") &&
               get(lib, a.cuEventQuery, "cuEventQuery") && get(lib, a.cuEventDestroy, "cuEventDestroy_v2") &&
               get(lib, a.cuEventElapsedTime, "cuEventElapsedTime");
+    if(ok && !get(lib, a.cuDevicePrimaryCtxReset, "cuDevicePrimaryCtxReset_v2")) a.cuDevicePrimaryCtxReset = nullptr;
     if(!ok){
         why = "the NVIDIA driver (libcuda) lacks functions cpp-zarr needs: it may be too old";
         return false;
@@ -167,6 +168,11 @@ const Api* api(std::string* why){
         }
     }
     if(!result && why) *why = failure;
+    return result;
+}
+
+const Api* apiIfLoaded(){
+    std::lock_guard<std::mutex> g(loadMutex);
     return result;
 }
 

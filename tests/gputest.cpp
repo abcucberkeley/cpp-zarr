@@ -2,7 +2,8 @@
 // (blosc's, with and without shuffle, bitshuffle and memcpyed chunks; gzip; none), order,
 // format, sharding, regions that cut chunks, missing chunks and fill values, batches of regions
 // from several arrays in one call, and the arrays other Zarr writers made (tests/test_arrays);
-// float16 and bfloat16 also read as float32s; and a damaged chunk, which must be reported. Exits 0 with a message when this machine has no
+// float16 and bfloat16 also read as float32s; reads after the buffers kept between calls are freed
+// and after the context is reset; and a damaged chunk, which must be reported. Exits 0 with a message when this machine has no
 // NVIDIA GPU, driver or nvCOMP. Usage: gpuTest <scratch folder>
 #include <cstdio>
 #include <cstring>
@@ -70,6 +71,37 @@ static bool compare(zarr &Z, const std::vector<uint64_t> &start, const std::vect
         return false;
     }
     return true;
+}
+
+// After the device's primary context is reset (as MATLAB's reset(gpuDevice) and cudaDeviceReset
+// reset it): the context retained and made current again, and GPU memory filled with 0x5a (n
+// allocations of each bytes, 1 GB), which takes the addresses the freed buffers had. unchanged:
+// whether every byte of it is still 0x5a (and frees it).
+static std::vector<CUdeviceptr> resetAndFill(CUdevice dev, CUcontext &ctx, uint64_t each, int n){
+    ck(A->cuDevicePrimaryCtxReset(dev), "cuDevicePrimaryCtxReset");
+    ck(A->cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
+    ck(A->cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
+    std::vector<CUdeviceptr> bufs;
+    for(int i = 0; i < n; i++){
+        CUdeviceptr p = 0;
+        if(A->cuMemAlloc(&p, each)) break;
+        ck(A->cuMemsetD8Async(p, 0x5a, each, nullptr), "cuMemsetD8Async");
+        bufs.push_back(p);
+    }
+    ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+    return bufs;
+}
+static bool unchanged(std::vector<CUdeviceptr> &bufs, uint64_t each){
+    bool same = true;
+    std::vector<uint8_t> h(each);
+    for(CUdeviceptr p : bufs){
+        ck(A->cuMemcpyDtoHAsync(h.data(), p, each, nullptr), "cuMemcpyDtoHAsync");
+        ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+        for(uint8_t b : h) if(b != 0x5a){ same = false; break; }
+        A->cuMemFree(p);
+    }
+    bufs.clear();
+    return same;
 }
 
 // A float16 or bfloat16 region read as float32s (float16AsFloat32), against the CPU read's values
@@ -326,6 +358,58 @@ int main(int argc, char** argv){
         }
         for(auto d : outs) A->cuMemFree(d);
         printf("batch of %zu regions from %zu arrays in one call\n", regions.size(), picks.size());
+    }
+    // The buffers kept between reads freed (gpuReleaseBuffers), and the context reset (as MATLAB's
+    // reset(gpuDevice) resets it): the reads after make new kernels and buffers, and write nothing
+    // into memory allocated after the reset
+    {
+        before = total;
+        failedBefore = failures;
+        const std::string big = dir+"/gpu_reset_big.zarr";
+        const std::vector<uint64_t> bs = {256, 256, 128};
+        std::error_code ec;
+        fs::remove_all(big, ec);
+        try{
+            zarr Zw(big, {128, 128, 64}, 0, 1, "zstd", "blosc", 1, "/", "<u2", "0", {}, "C", bs, 3, {0, 0, 0}, true, {32, 32, 32});
+            Zw.write_zarray();
+            std::vector<uint16_t> data(bs[0]*bs[1]*bs[2]);
+            for(size_t i = 0; i < data.size(); i++) data[i] = (uint16_t)((i/7) % 3000+(uint16_t)byte(rng) % 4);
+            Zw.set_chunkInfo({0, 0, 0}, bs);
+            if(parallelWriteZarr(Zw, data.data(), {0, 0, 0}, bs, bs, 16, false, false, false)) throw std::string("write: ")+Zw.get_errString();
+        }
+        catch(const std::string &e){ printf("FAIL  %s: %s\n", big.c_str(), e.c_str()); failures++; }
+        auto reads = [&](const std::string &label){
+            for(const std::string name : {"gpu_uint16_zstd1_1_C_v3_sh.zarr", "gpu_double_lz41_5_F.zarr", "gpu_int32_gzip0_5_C_v3.zarr"}){
+                zarr Z(dir+"/"+name);
+                compare(Z, {0, 0, 0}, {40, 24, 18}, true, label+" "+name);
+                compare(Z, {3, 2, 1}, {37, 23, 17}, false, label+" "+name+" region");
+            }
+            zarr Zb(big);
+            compare(Zb, {0, 0, 0}, bs, true, label+" big");
+            compare(Zb, {10, 20, 5}, {250, 200, 120}, false, label+" big region");
+        };
+        reads("before freeing the buffers:");
+        gpuReleaseBuffers();
+        gpuReleaseBuffers();
+        reads("after freeing the buffers:");
+        if(A->cuDevicePrimaryCtxReset){
+            const uint64_t each = (uint64_t)64 << 20;
+            std::vector<CUdeviceptr> fill = resetAndFill(dev, ctx, each, 16);
+            if(fill.size() < 16) printf("(only %zu of 16 allocations of 64 MiB after the reset)\n", fill.size());
+            reads("after a reset:");
+            total++;
+            if(!unchanged(fill, each)){ printf("FAIL  after a reset: a read wrote into memory allocated after it\n"); failures++; }
+            gpuReleaseBuffers();
+            reads("after a reset and freeing the buffers:");
+            // and a second reset, the first one's new kernels and buffers found stale in turn
+            fill = resetAndFill(dev, ctx, each, 16);
+            reads("after a second reset:");
+            total++;
+            if(!unchanged(fill, each)){ printf("FAIL  after a second reset: a read wrote into memory allocated after it\n"); failures++; }
+        }
+        else printf("(no cuDevicePrimaryCtxReset: the reset case is left out)\n");
+        fs::remove_all(big, ec);
+        printf("%d of %d reads around freeing the buffers and resets matched\n", (total-before)-(failures-failedBefore), total-before);
     }
     // damaged chunks: the GPU read fails where the CPU read does (a compressed stream that
     // cannot be decoded), and reads what the CPU does where neither can tell (a chunk blosc

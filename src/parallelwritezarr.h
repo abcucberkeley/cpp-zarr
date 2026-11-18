@@ -24,6 +24,7 @@ uint8_t parallelWriteZarr(zarr &Zarr, void* zarrArr,
 // Frees the buffers reads and writes keep between calls (those for chunks over 1 MB up to
 // CPPZARR_KEEP_MB in all: see keptBufferBytes in helperfunctions.h), and hands memory the C
 // library keeps back to the system (glibc's malloc_trim). For long-lived processes: MATLAB's
-// clear mex calls it, Python's release_buffers().
+// clear mex calls it, Python's release_buffers(). GPU reads' and writes' buffers are freed by
+// gpuReleaseBuffers (gpureadzarr.h).
 void releaseBuffers();
 #endif

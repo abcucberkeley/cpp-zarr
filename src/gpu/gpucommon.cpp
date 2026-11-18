@@ -86,11 +86,45 @@ void ck(const Api* a, CUresult r, const char* what){
     if(r) throw Fail(std::string(what)+": "+errorText(a, r));
 }
 
+// Whether the context's kernels and buffers are still its own: not after it was reset or
+// destroyed (its handle can come back for a new one), when its sentinel allocation is gone or
+// belongs to another allocation (buffer IDs are never reused in a process)
+static bool stillValid(const Api* a, const Ctx &x){
+    if(!x.sentinel) return true;
+    unsigned long long id = 0;
+    return !a->cuPointerGetAttribute(&id, 7 /* CU_POINTER_ATTRIBUTE_BUFFER_ID */, x.sentinel) && id == x.sentinelId;
+}
+
+// A context found reset: kept, not freed, in case a call still holds it (its kernels and buffers
+// went with the reset, and are never used again); the stored-bytes buffers its slots registered
+// with cuFile are deregistered, since new buffers can take their addresses
+static void markStale(Ctx &x){
+    x.stale = true;
+    const Cufile* cf = nullptr;
+    std::lock_guard<std::mutex> g(x.m);
+    for(auto &s : x.slots){
+        if(s->busy || !s->compRegistered) continue;
+        if(!cf) cf = cufile(nullptr);
+        if(cf) cf->bufDeregister((const void*)(uintptr_t)s->comp);
+        s->compRegistered = false;
+    }
+}
+
 Ctx& context(const Api* a, CUcontext c){
     std::lock_guard<std::mutex> g(ctxMutex);
-    for(auto &x : ctxs) if(x->ctx == c) return *x;
+    for(auto &x : ctxs){
+        if(x->ctx != c || x->stale) continue;
+        if(stillValid(a, *x)) return *x;
+        markStale(*x);
+    }
     auto x = std::unique_ptr<Ctx>(new Ctx());
     x->ctx = c;
+    // (without a sentinel, as when the query fails, a reset goes unseen, as before)
+    if(!a->cuMemAlloc(&x->sentinel, 256) &&
+       a->cuPointerGetAttribute(&x->sentinelId, 7 /* CU_POINTER_ATTRIBUTE_BUFFER_ID */, x->sentinel)){
+        a->cuMemFree(x->sentinel);
+        x->sentinel = 0;
+    }
     std::string ptx;
     for(const char* p : cppzarrKernelsPtx) ptx += p;
     char log[4096] = {0};
@@ -119,6 +153,38 @@ Ctx& context(const Api* a, CUcontext c){
     }
     ctxs.push_back(std::move(x));
     return *ctxs.back();
+}
+
+void releaseGpuBuffers(const Api* a){
+    std::lock_guard<std::mutex> g(ctxMutex);
+    for(auto &x : ctxs){
+        if(x->stale) continue;
+        if(!stillValid(a, *x)){
+            markStale(*x);
+            continue;
+        }
+        const CtxFor current(a, x->ctx);
+        std::lock_guard<std::mutex> gs(x->m);
+        // (a slot no call holds has finished its GPU work: slots are given back once it has, or
+        // marked lost)
+        for(auto &s : x->slots){
+            if(s->busy || s->lost) continue;
+            if(s->compRegistered){
+                if(const Cufile* cf = cufile(nullptr)) cf->bufDeregister((const void*)(uintptr_t)s->comp);
+                s->compRegistered = false;
+            }
+            for(CUdeviceptr* p : {&s->comp, &s->dec, &s->work, &s->temp}) if(*p){ a->cuMemFree(*p); *p = 0; }
+            for(uint8_t** p : {&s->host, &s->small}) if(*p){ a->cuMemFreeHost(*p); *p = nullptr; }
+            s->hostBytes = s->compBytes = s->decBytes = s->workBytes = s->tempBytes = 0;
+        }
+        for(auto &s : x->writeSlots){
+            if(s->busy) continue;
+            for(CUdeviceptr* p : {&s->din, &s->unc, &s->comp, &s->work, &s->temp, &s->dops, &s->packed}) if(*p){ a->cuMemFree(*p); *p = 0; }
+            for(uint8_t** p : {&s->hin, &s->hres, &s->hops, &s->hout}) if(*p){ a->cuMemFreeHost(*p); *p = nullptr; }
+            s->hinBytes = s->hresBytes = s->hopsBytes = s->houtBytes = 0;
+            s->dinBytes = s->uncBytes = s->compBytes = s->workBytes = s->tempBytes = s->dopsBytes = s->packedBytes = 0;
+        }
+    }
 }
 
 Slot& takeSlot(Ctx &c){

@@ -1245,6 +1245,8 @@ def main():
         except Exception:
             pass
     if not gpu_ok or not libs:
+        # (nothing kept: freeing is nothing)
+        cppzarr.gpu_release_buffers()
         print(f"reading into GPU memory  skipped ({why or 'no CuPy or PyTorch'})")
         print(f"writing from GPU memory  skipped ({why or 'no CuPy or PyTorch'})")
     else:
@@ -1564,6 +1566,25 @@ def test_gpu_write(tmp, rng, libs):
         if not np.array_equal(cppzarr.read_zarr(p), np.full(shape, 3, np.int16)):
             good = False
             print('  GPU write of data made on the current PyTorch stream differs')
+    # the buffers kept between calls freed (gpu_release_buffers): the reads and writes after make new ones
+    for lib in libs:
+        data = rng.integers(0, 1000, shape).astype(np.uint16)
+        p = os.path.join(tmp, f'gw_release_{lib}.zarr')
+        cppzarr.gpu_release_buffers()
+        cppzarr.write_zarr(p, to_gpu(lib, data, 0), zarr_format=3, chunks=[16, 16, 16], shards=[32, 32, 32])
+        cppzarr.gpu_release_buffers()
+        cppzarr.gpu_release_buffers()
+        if lib == 'cupy':
+            got = cppzarr.read_zarr(p, order='C', gpu=True).get()
+        else:
+            o = torch.empty(shape, dtype=torch.uint16, device='cuda')
+            cppzarr.read_zarr(p, order='C', out=o)
+            got = o.cpu().numpy()
+        cppzarr.gpu_release_buffers()
+        n += 1
+        if not np.array_equal(got, data) or not np.array_equal(cppzarr.read_zarr(p), data):
+            good = False
+            print('  GPU write or read after gpu_release_buffers differs:', lib)
     print(f"writing from GPU memory ({' and '.join(libs)}, {n} writes)  {'OK' if good else 'FAIL'}")
     return good
 

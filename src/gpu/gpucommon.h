@@ -74,6 +74,12 @@ struct WriteSlot {
 // The kernels and reusable buffers of one CUDA context
 struct Ctx {
     CUcontext ctx = nullptr;
+    // A small allocation and its buffer ID: once the context is reset (MATLAB's reset(gpuDevice),
+    // cudaDeviceReset) or destroyed, the allocation is gone or another's (the handle comes back
+    // the same), and the kernels and buffers here went with it (see context)
+    CUdeviceptr sentinel = 0;
+    unsigned long long sentinelId = 0;
+    bool stale = false;
     CUmodule mod = nullptr;
     CUfunction scatter32 = nullptr, scatter64 = nullptr, resolve = nullptr, fill = nullptr, check = nullptr;
     CUfunction gather32 = nullptr, gather64 = nullptr, pack = nullptr;
@@ -90,8 +96,12 @@ struct Fail : std::runtime_error { using std::runtime_error::runtime_error; };
 // Throws Fail (what: the driver's error) unless r is 0
 void ck(const Api* a, CUresult r, const char* what);
 
-// The context's kernels and buffers (loading its kernels the first time)
+// The context's kernels and buffers (loading its kernels the first time, and again after the
+// context was reset or destroyed); c must be current
 Ctx& context(const Api* a, CUcontext c);
+
+// Frees the buffers of every context's slots that no read or write is using (gpuReleaseBuffers)
+void releaseGpuBuffers(const Api* a);
 
 // A read's or a write's slot of the context, free until it is given back (busy = false, under c.m)
 Slot& takeSlot(Ctx &c);

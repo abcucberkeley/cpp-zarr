@@ -794,6 +794,11 @@ void gpuSetCufileLibrary(const std::string &path){
     setCufileLibrary(path);
 }
 
+void gpuReleaseBuffers(){
+    // (no GPU read or write has loaded the driver: nothing was kept)
+    if(const Api* a = apiIfLoaded()) releaseGpuBuffers(a);
+}
+
 uint8_t gpuReadZarr(std::vector<GpuRegion> &regionsIn, const bool cOrder, void* stream, const int threadsIn,
                     std::string &errString, const bool float16AsFloat32){
     std::string why;
