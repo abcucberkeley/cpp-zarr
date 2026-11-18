@@ -1369,6 +1369,24 @@ int main(int argc, char** argv){
             return ok;
         });
 
+        check("metadata files end their lines with LF alone on every platform (.zarray, zarr.json, a converted array's zarr.json)", [&](){
+            // (written in text mode, Windows would end them with CRLF; read here as bytes)
+            auto lfOnly = [](const std::string& p){
+                std::ifstream f(p, std::ios::binary);
+                const std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                const bool ok = !s.empty() && s.find('\r') == std::string::npos && s.back() == '\n';
+                if (!ok) std::fprintf(stderr, "    %s: %zu bytes, %s\n", p.c_str(), s.size(), s.find('\r') == std::string::npos ? "no CR" : "a CR");
+                return ok;
+            };
+            Made a = make("lf_v2", 2, {20, 10, 6}, {8, 8, 6}, {}, "F", "zstd", ".", "<u2");
+            Made b = make("lf_v3", 3, {20, 10, 6}, {16, 8, 6}, {8, 4, 3}, "C", "zstd", "/", "<f4");
+            bool ok = lfOnly(a.path + "/.zarray") && lfOnly(b.path + "/zarr.json");
+            zarr(a.path).convert_to_v3();
+            ok = ok && lfOnly(a.path + "/zarr.json") && !fileExists(a.path + "/.zarray") && readsBack(a);
+            for (const Made* x : {&a, &b}){ std::error_code ec; std::filesystem::remove_all(x->path, ec); }
+            return ok;
+        });
+
         check("blosc's shuffle and block size as a Zarr v3 array's codec gives them, byte shuffle and blosc's own blocks in v2 arrays", [&](){
             // (each case: the format, compressor settings, data type, chunk or shard shape and inner
             // chunk shape, and what every chunk's blosc header must say: its shuffle flags and block size)

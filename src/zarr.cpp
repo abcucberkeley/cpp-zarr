@@ -521,8 +521,9 @@ static void writeJsonFile(const std::string &folder, const std::string &name, co
     const std::string final(folder+"/"+name);
     if(!fileExists(final)) mkdirRecursive(folder.c_str());
     const std::string tmp(final+generateUUID());
+    // (binary, so that lines end with LF alone on Windows too, as on the other platforms)
     std::ofstream o;
-    openPath(o, tmp);
+    openPath(o, tmp, std::ios::out | std::ios::binary);
     if(!o.good()) throw std::string("cannotOpenZarray:"+tmp);
     o << std::setw(4) << meta << std::endl;
     o.close();
@@ -926,8 +927,9 @@ void zarr::write_jsonValues(){
     const std::string uuid = generateUUID();
     const std::string fnFull(fileName+"/.zarray"+uuid);
 
+    // (binary, as writeJsonFile writes)
     std::ofstream o;
-    openPath(o, fnFull);
+    openPath(o, fnFull, std::ios::out | std::ios::binary);
     if(!o.good()) throw std::string("cannotOpenZarray:"+fnFull);
     o << std::setw(4) << zarray << std::endl;
     o.close();

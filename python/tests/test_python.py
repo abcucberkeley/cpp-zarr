@@ -610,13 +610,20 @@ def main():
         except Exception as e:
             good = good and any(w in str(e) for w in ('Zarr v3', 'zarr_format=3', 'multiple'))
     good = good and np.array_equal(cppzarr.read_zarr(p3), exp)
+    # (metadata files end their lines with LF alone, on Windows too: read as bytes)
+    def lf_only(f):
+        with open(f, 'rb') as h:
+            b = h.read()
+        return len(b) > 0 and b'\r' not in b and b.endswith(b'\n')
+    good = good and lf_only(os.path.join(p3, 'zarr.json'))
     p2 = os.path.join(tmp, "v2_to_v3.zarr")
     cppzarr.write_zarr(p2, d, chunks=[16, 16, 8])
+    good = good and lf_only(os.path.join(p2, '.zarray'))
     with open(os.path.join(p2, '.zattrs'), 'w') as f:
         json.dump({'units': 'um'}, f)
     cppzarr.convert_to_v3(p2)
     meta = load_json(os.path.join(p2, 'zarr.json'))
-    good = good and meta['attributes'] == {'units': 'um'} and not os.path.exists(os.path.join(p2, '.zarray')) and \
+    good = good and lf_only(os.path.join(p2, 'zarr.json')) and meta['attributes'] == {'units': 'um'} and not os.path.exists(os.path.join(p2, '.zarray')) and \
         np.array_equal(cppzarr.read_zarr(p2), d) and cppzarr.read_zarr(p2).flags['F_CONTIGUOUS'] and same(zarr_read(p2), d)
     cppzarr.write_zarr(p2, d[:4, :4, :4], start_coords=[1, 1, 1], end_coords=[5, 5, 5])
     exp = d.copy()
