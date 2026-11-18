@@ -7,6 +7,7 @@ import sysconfig
 import pybind11
 import subprocess
 import shutil
+import tempfile
 
 # Determine OS and shared libraries
 system = platform.system()
@@ -19,7 +20,54 @@ elif system == "Darwin":
     shared_libraries.append("*.dylib")
 
 
-class BuildExt(build_ext):
+def prefix_map_flags():
+    # The module names no folder of the machine that built it, as the library does not (CMakeLists.txt): __FILE__ in
+    # pybind11's and Python's headers, and the debug information Python's own flags (-g) ask for, had put such folders
+    # in the 1.7.3 wheels' modules: C:\Users\<user>\AppData\Local\Temp\build-env-<id>\Lib\site-packages\pybind11\include/...
+    # and C:\Users\<user>\AppData\Local\pypa\cibuildwheel\Cache\nuget-cpython\python.<version>\tools\include/... in the
+    # Windows ones (13 in the cp312 module), /tmp/build-env-<id>/... in the Linux ones. GCC takes the last map that
+    # matches, so each folder comes after the folders that hold it (pybind11's is in the temp folder in cibuildwheel's
+    # builds). Each is given as named and as its real path (a Windows temp folder may be named in its short 8.3 form,
+    # macOS's is under /private), and on Windows with \ and with / (GCC there takes them as the same in a map; both are
+    # harmless). The same maps as cpp-tiff's setup.py gives its module; .github/scripts/module_prefix_maps.py gives the
+    # CI's build of the module these maps, from this function.
+    paths = sysconfig.get_paths()
+    folders = [(tempfile.gettempdir(), "tmp"),
+               (paths["include"], "python-include"),
+               (paths["platinclude"], "python-platinclude"),
+               (os.path.dirname(os.path.abspath(__file__)), "."),
+               (pybind11.get_include(), "pybind11-include")]
+    maps = []
+    for folder, name in folders:
+        for form in (folder, os.path.realpath(folder)):
+            form = form.rstrip("/\\")
+            for f in ((form, form.replace("\\", "/")) if system == "Windows" else (form,)):
+                if f and f not in [m[0] for m in maps]:
+                    maps.append((f, name))
+    # Shorter folders first: a folder that holds another is shorter than it
+    maps.sort(key=lambda m: len(m[0]))
+    return [f"-ffile-prefix-map={f}={name}" for f, name in maps]
+
+
+class PrefixMapBuildExt(build_ext):
+    # (on Windows the library is built with MinGW-w64 and its API passes C++ types, so the module is compiled with
+    # that MinGW's gcc and g++, on PATH, as the released wheels' modules were, not with MSVC, setuptools' default
+    # there, which could not link the library either; an option or config file that names a compiler still wins)
+    def initialize_options(self):
+        super().initialize_options()
+        if system == "Windows":
+            self.compiler = "mingw32"
+
+    # The maps are GCC's and Clang's options; MSVC, which an sdist may be built with, does not take them
+    def build_extensions(self):
+        if self.compiler.compiler_type != "msvc":
+            flags = prefix_map_flags()
+            for ext in self.extensions:
+                ext.extra_compile_args = list(ext.extra_compile_args or []) + flags
+        super().build_extensions()
+
+
+class BuildExt(PrefixMapBuildExt):
     def run(self):
         # Get the directory of the current file (setup.py)
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,15 +102,6 @@ class BuildExt(build_ext):
         super().run()
 
 
-class MinGWBuildExt(build_ext):
-    # (on Windows the library is built with MinGW-w64 and its API passes C++ types, so the module is compiled with
-    # that MinGW's gcc and g++, on PATH, as the released wheels' modules were, not with MSVC, setuptools' default
-    # there, which could not link the library either; an option or config file that names a compiler still wins)
-    def initialize_options(self):
-        super().initialize_options()
-        self.compiler = "mingw32"
-
-
 ext_modules = [
     Extension(
         "cppzarr.cppzarr",
@@ -93,7 +132,7 @@ setup(
     author_email='matthewmueller@berkeley.edu',
     packages=find_packages(),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": MinGWBuildExt} if system=="Windows" else {"build_ext": build_ext},
+    cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": PrefixMapBuildExt},
     install_requires=['numpy>=1.20'],
     # (reads into GPU memory: nvCOMP, which the library loads when it first reads on a GPU)
     extras_require={'gpu': ['nvidia-libnvcomp-cu12; platform_system != "Darwin"']},

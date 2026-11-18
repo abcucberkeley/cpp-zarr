@@ -99,10 +99,12 @@ jobs:
       - name: C++ tests
         run: ctest --test-dir build --output-on-failure
 
-      # Compiles the extension straight against the library built above, then
-      # runs the same test file cibuildwheel runs against the release wheels.
-      # On Linux and macOS it links like python/setup.py does (static libstdc++
-      # after the library, kept private to the module).
+      # Compiles the extension straight against the library built above, with
+      # python/setup.py's -ffile-prefix-map flags, checks that it names none of
+      # the folders those are for, then runs the same test file cibuildwheel runs
+      # against the release wheels. On Linux and macOS it links like
+      # python/setup.py does (static libstdc++ after the library, kept private to
+      # the module).
       - name: Python tests
         run: |
           EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
@@ -119,8 +121,14 @@ jobs:
               FLAGS="-I$PYINC -lpython$PYVER"
               cp install/bin/libcppZarr.dll python/cppzarr/ ;;
           esac
+          MAPLIST=$(python .github/scripts/module_prefix_maps.py python/setup.py | tr -d '\r')
+          MAPS=()
+          while IFS= read -r f; do
+            MAPS+=("$f")
+          done <<< "$MAPLIST"
           "${CXX:-g++}" -O2 -std=c++17 -shared python/cppzarr.cpp -o "python/cppzarr/cppzarr$EXT" \
-            -Iinstall/include -Linstall/lib -lcppZarr $FLAGS
+            -Iinstall/include -Linstall/lib -lcppZarr $FLAGS "${MAPS[@]}"
+          bash .github/scripts/check_module_paths.sh python/setup.py "python/cppzarr/cppzarr$EXT"
           if [ "$RUNNER_OS" = macOS ]; then
             bash .github/scripts/check_exports.sh install/lib/libcppZarr.dylib "python/cppzarr/cppzarr$EXT"
           fi
