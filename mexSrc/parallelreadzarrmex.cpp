@@ -154,6 +154,15 @@ void mexFunction(int nlhs, mxArray *plhs[],
     else plhs[0] = mxCreateNumericArray(dim.size(),dim.data(),mxClass, cplx ? mxCOMPLEX : mxREAL);
     void* zarrArr = viaBuffer ? malloc(readSize*bytes ? readSize*bytes : 1) : mxGetData(plhs[0]);
     if(!zarrArr) mexErrMsgIdAndTxt("zarr:readError","Out of memory");
+    // In huge pages where the system has them, as the library's own outputs are (adviseOutputHugePages):
+    // what the read fills, and the array that a buffer's values are widened or split into
+    adviseOutputHugePages(zarrArr, readSize*bytes);
+    if(viaBuffer){
+        adviseOutputHugePages(mxGetData(plhs[0]), readSize*mxGetElementSize(plhs[0]));
+#if !(MX_HAS_INTERLEAVED_COMPLEX)
+        if(cplx) adviseOutputHugePages(mxGetImagData(plhs[0]), readSize*mxGetElementSize(plhs[0]));
+#endif
+    }
     if(fill) fillElements(bytes, zarrArr, readSize, fillElem);
     else if(viaBuffer) memset(zarrArr, 0, readSize*bytes);
     err = parallelReadZarr(Zarr, zarrArr,startCoords,endCoords,readShape,bytes*8,useCtx,sparse);

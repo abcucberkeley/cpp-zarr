@@ -1723,7 +1723,7 @@ int main(int argc, char** argv){
             return ok;
         });
 
-        check("outputs a read makes of 32 MiB or more, filled with zeros or with another fill value, are asked to be backed by huge pages on Linux (MADV_HUGEPAGE, as NumPy asks for its arrays) unless CPPZARR_MADVISE_HUGEPAGE=0, smaller ones are not, and they read the same values", [&](){
+        check("outputs a read makes of 32 MiB or more, filled with zeros or with another fill value, are asked to be backed by huge pages on Linux (MADV_HUGEPAGE, as NumPy asks for its arrays) unless CPPZARR_MADVISE_HUGEPAGE=0, smaller ones are not, and they read the same values; the same of memory a caller makes, given to adviseOutputHugePages", [&](){
             const bool want = hugePagesWanted();
             bool ok = true;
             for (const char* fill : {"0", "7"}){
@@ -1747,6 +1747,20 @@ int main(int argc, char** argv){
                 std::error_code ec;
                 std::filesystem::remove_all(a.path, ec);
             }
+            // The same of memory a caller makes for a read's output, as the MATLAB read's mex file asks it
+            // (adviseOutputHugePages): 40 MiB asked, 16 MiB not
+            const uint64_t big = uint64_t(40) << 20, smallBytes = uint64_t(16) << 20;
+            void* p = std::malloc(big);
+            void* q = std::malloc(smallBytes);
+            adviseOutputHugePages(p, big);
+            adviseOutputHugePages(q, smallBytes);
+            const int hint = p ? hugePageHint((const uint8_t*)p + big/2) : -1, small = q ? hugePageHint((const uint8_t*)q + smallBytes/2) : -1;
+            std::printf("    (memory of 40 MiB given to adviseOutputHugePages: its mapping %s the hint; of 16 MiB: %s)\n",
+                        hint < 0 ? "not found: not known whether it carries" : hint ? "carries" : "does not carry",
+                        small < 0 ? "not known" : small ? "carries it" : "does not");
+            ok = ok && p && q && (hint < 0 || (hint == 1) == want) && small <= 0;
+            std::free(p);
+            std::free(q);
             return ok;
         });
 

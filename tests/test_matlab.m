@@ -669,6 +669,13 @@ function test_matlab(mexDir)
         fprintf('PASS  clear mex unloads the mex files on Windows, after conversions, and keeps the library\n');
     end
 
+    % On Linux, arrays of 32 MiB or more that reads make are asked to be backed by huge pages, as the
+    % library's own outputs are (hg among the VmFlags of the mapping holding them, /proc/self/smaps),
+    % unless CPPZARR_MADVISE_HUGEPAGE is 0 (unset, on Linux 4.6 and later); smaller ones are not
+    if isunix && ~ismac && isfolder('/sys/kernel/mm/transparent_hugepage')
+        checkHugePageHints(tmp);
+    end
+
     % Test arrays written by zarr-python 3 and TensorStore (tests/test_arrays): Zarr v3
     % arrays, and v2 arrays with codecs and fill values cpp-zarr does not write itself.
     % Full and region reads match what zarr-python reads, arrays cpp-zarr cannot read
@@ -689,6 +696,69 @@ function test_matlab(mexDir)
     checkGpuWrites(tmp);
 
     disp('MATLAB round-trip tests PASSED');
+end
+
+function checkHugePageHints(tmp)
+% MATLAB gives no array's address, so the mappings with the hint that a read leaves which were not there
+% before it are taken as its output's: one of 40 MiB less its partial huge pages at most for a uint16 array
+% of 40 MiB and for a float16 one read as single (read into a buffer of 20 MiB and widened into the array),
+% two for a complex single array of 40 MiB a part (read into a buffer of 80 MiB and split into them, with
+% MATLAB's separate complex API), none for a uint16 array of 16 MiB
+    hp = getenv('CPPZARR_MADVISE_HUGEPAGE');
+    if isempty(hp)
+        [~, rel] = system('uname -r');
+        v = sscanf(rel, '%d.%d');
+        want = numel(v) == 2 && (v(1) > 4 || (v(1) == 4 && v(2) >= 6));
+    else
+        want = str2double(hp) ~= 0;
+    end
+    mib = 2^20;
+    cases = {'uint16', uint16(randi(60000, 1024, 1024, 20)), {}, 40 * mib, 1
+             'float16', single(randi([-1000 1000], 1024, 1024, 10)) / 4, {'dtype', 'float16'}, 40 * mib, 1
+             'complex', complex(single(rand(1024, 1024, 10)), single(rand(1024, 1024, 10))), {}, 40 * mib, 2
+             'uint16_16MiB', uint16(randi(60000, 1024, 1024, 8)), {}, 16 * mib, 0};
+    for k = 1:size(cases, 1)
+        [name, v, opts, bytes, expect] = cases{k, :};
+        f = fullfile(tmp, ['hugepages_' name '.zarr']);
+        parallelWriteZarr(f, v, opts{:}, 'chunks', [256 256 8]);
+        before = hintedMappings();
+        b = parallelReadZarr(f);
+        after = hintedMappings();
+        [~, i] = setdiff(after.range, before.range);
+        fresh = sum(after.bytes(i) >= bytes - 4 * mib & after.bytes(i) <= bytes);
+        assert(isequal(b, v), 'the %s array read for the huge-page hint differs', name);
+        assert(fresh == expect * want, ...
+               'a read of a %s array of %d MiB left %d new mappings of its size with the huge-page hint, not %d', ...
+               name, bytes / mib, fresh, expect * want);
+        clear b
+        rmdir(f, 's');
+    end
+    if want
+        fprintf('PASS  huge-page hint on read outputs of 32 MiB or more\n');
+    else
+        fprintf('PASS  no huge-page hint on read outputs (CPPZARR_MADVISE_HUGEPAGE=0, or Linux before 4.6)\n');
+    end
+end
+
+function m = hintedMappings()
+% This process's mappings with the huge-page hint (hg among their VmFlags, /proc/self/smaps): each one's
+% address range, as text, and its size in bytes
+    txt = splitlines(fileread('/proc/self/smaps'));
+    m = struct('range', {{}}, 'bytes', []);
+    range = '';
+    bytes = 0;
+    for i = 1:numel(txt)
+        t = regexp(txt{i}, '^([0-9a-f]+-[0-9a-f]+) ', 'tokens', 'once');
+        if ~isempty(t)
+            range = t{1};
+        elseif startsWith(txt{i}, 'Size:')
+            % (the size in kB, as addresses past flintmax would not be exact as doubles)
+            bytes = sscanf(txt{i}(6:end), '%f') * 1024;
+        elseif startsWith(txt{i}, 'VmFlags:') && any(strcmp(strsplit(strtrim(txt{i}(9:end))), 'hg'))
+            m.range{end + 1} = range;
+            m.bytes(end + 1) = bytes;
+        end
+    end
 end
 
 function checkGpuReads(tmp)

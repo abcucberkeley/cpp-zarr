@@ -342,6 +342,8 @@ static void czSplitComplex(const T* src, T* re, T* im, const uint64_t n){
 void splitComplex(const float* src, float* re, float* im, const uint64_t n){ czSplitComplex(src, re, im, n); }
 void splitComplex(const double* src, double* re, double* im, const uint64_t n){ czSplitComplex(src, re, im, n); }
 
+void adviseOutputHugePages(void* p, const uint64_t n){ adviseHugePages(p, n); }
+
 // Double to float16 directly, as NumPy converts (npy_doublebits_to_halfbits), with
 // no rounding to float first
 uint16_t doubleToHalf(double v){

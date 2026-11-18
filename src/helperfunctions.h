@@ -127,6 +127,12 @@ void splitComplex(const double* src, double* re, double* im, const uint64_t n);
 // OpenMP runtime, whose threads, once started, kept the mex file loaded after MATLAB released it, and the last
 // of them to end unloaded it, holding the loader lock, which hung MATLAB as it exited.)
 
+// Memory of n bytes that the caller is about to fill, an output it makes for a read (as the mex files make
+// MATLAB's arrays), asked to be backed by huge pages as the library asks for the outputs it makes itself: on
+// Linux, outputs of 32 MiB or more, on their whole huge pages (madvise MADV_HUGEPAGE), unless
+// CPPZARR_MADVISE_HUGEPAGE is 0 (unset, on Linux 4.6 and later). Elsewhere it does nothing.
+void adviseOutputHugePages(void* p, const uint64_t n);
+
 // Parse a zarr fill_value string for memset-style fills. Returns 0 for anything
 // unparsable or outside int range (e.g. the int64 min/max strings that
 // Infinity/-Infinity fill values normalize to), instead of throwing like stoi.
