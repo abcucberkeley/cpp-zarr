@@ -130,6 +130,13 @@ setup(
     url='https://github.com/abcucberkeley/cpp-zarr',
     author='Matthew Mueller',
     author_email='matthewmueller@berkeley.edu',
+    # (the license as an SPDX expression, which setuptools 77 and later write as License-Expression: given as license=,
+    # setuptools 84 writes the older License field instead. And the license files, which the wheel carries in its
+    # .dist-info/licenses folder with their paths: cpp-zarr's own, and those of the works built into the library and the
+    # module or bundled in the wheels, which THIRD_PARTY_NOTICES.md lists. They are copies of the repository's top-level
+    # files, kept here because setuptools takes no file outside the project's folder; CI checks that they match)
+    license_expression="BSD-3-Clause",
+    license_files=["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/**/*"],
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": PrefixMapBuildExt},

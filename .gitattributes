@@ -1,0 +1,9 @@
+# The license files stay byte for byte as committed (the texts under licenses/ as their sources ship them), with
+# no line-ending conversion on any checkout: the Windows wheels and the windows/ MATLAB folder are built from a
+# Windows clone
+/LICENSE -text
+/THIRD_PARTY_NOTICES.md -text
+/licenses/** -text
+/python/LICENSE -text
+/python/THIRD_PARTY_NOTICES.md -text
+/python/licenses/** -text

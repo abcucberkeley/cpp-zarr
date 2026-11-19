@@ -1,6 +1,7 @@
 [build-system]
 requires = [
-    "setuptools>=42",
+    # (77: the first that writes License-Expression and the .dist-info/licenses folder, see setup.py)
+    "setuptools>=77",
     "pybind11>=2.10.0",
     # Linux and macOS build the native library with CMake (see setup.py);
     # Windows links a prebuilt library, so it doesn't need CMake in the build env.

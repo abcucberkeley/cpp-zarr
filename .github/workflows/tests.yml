@@ -34,6 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The wheels carry the license files from python/ (setuptools takes none from
+      # outside the project's folder), copies of the top-level ones: they must match
+      - name: License files match their python/ copies
+        if: runner.os == 'Linux'
+        run: cmp LICENSE python/LICENSE && cmp THIRD_PARTY_NOTICES.md python/THIRD_PARTY_NOTICES.md && diff -r licenses python/licenses
+
       # The library's build flags and OpenMP setup are GCC-only, so Windows uses
       # MinGW. The Python tests use MSYS2's Python, so they share one toolchain.
       # MSYS2 packages GCC's OpenMP runtime (libgomp) separately from gcc.
